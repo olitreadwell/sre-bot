@@ -165,7 +165,7 @@ dev = [
     "requests-mock==1.12.1",
     "boto3_stubs==1.42.54",
     "checkov",
-    "setuptools==78.1.1",
+    "setuptools==83.0.0",
     "moto[dynamodb]>=5.2.2",
 ]
 
