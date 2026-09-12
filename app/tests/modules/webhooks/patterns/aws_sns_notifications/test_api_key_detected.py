@@ -5,7 +5,11 @@ from modules.webhooks.patterns.aws_sns_notification import api_key_detected
 
 
 def mock_api_key_detected():
-    NOTIFY_TEST_KEY = os.getenv("NOTIFY_TEST_KEY", "api-key-blah")
+    # os.getenv(key, default) only falls back when the var is unset. On a
+    # fork PR, GitHub Actions does not forward repo secrets, so this var is
+    # present but set to an empty string, not unset. `or` catches that case
+    # too, so the test still uses the intended placeholder key.
+    NOTIFY_TEST_KEY = os.getenv("NOTIFY_TEST_KEY") or "api-key-blah"
     return MagicMock(
         Type="Notification",
         MessageId="1e5f5647g-adb5-5d6f-ab5e-c2e508881361",
