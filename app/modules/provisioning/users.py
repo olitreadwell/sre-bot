@@ -1,21 +1,42 @@
 """Module for getting users from integrations."""
 
+from typing import Any
+
 from structlog import get_logger
 
-from integrations.aws import identity_store
-from integrations.google_workspace import google_directory
+from infrastructure.directory import get_directory_provider
+from infrastructure.directory.models import DirectoryUser
+from packages.aws_platform.adapters.identity_center import build_identity_center_adapter
 from utils import filters
 
 logger = get_logger()
 
 
+class DirectoryUsersUnavailableError(Exception):
+    """Raised when the directory cannot supply the user list."""
+
+    def __init__(self, message: str | None, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+
+
 def get_users_from_integration(integration_source, **kwargs):
+    """Return the users of an integration source.
+
+    The `google_directory` source yields canonical `DirectoryUser` values for
+    the full directory (no limit); `aws_identity_center` still yields the raw
+    Identity Store user dicts returned by the adapter.
+
+    Raises:
+        DirectoryUsersUnavailableError: when the directory listing fails.
+    """
     log = logger.bind(
         integration=integration_source,
         operation="get_users_from_integration",
     )
     processing_filters = kwargs.get("processing_filters", [])
-    users = []
+    users: list[DirectoryUser] | list[dict[str, Any]] = []
 
     match integration_source:
         case "google_directory":
@@ -23,13 +44,29 @@ def get_users_from_integration(integration_source, **kwargs):
                 "get_users_from_integration_started",
                 service="Google Workspace",
             )
-            users = google_directory.list_users()
+            result = get_directory_provider().list_users()
+            if not result.is_success:
+                log.error(
+                    "list_users_failed",
+                    error_code=result.error_code,
+                    error=result.message,
+                )
+                raise DirectoryUsersUnavailableError(result.message, result.error_code)
+            users = result.data or []
         case "aws_identity_center":
             log.info(
                 "get_users_from_integration_started",
                 service="AWS Identity Center",
             )
-            users = identity_store.list_users()
+            aws_result = build_identity_center_adapter().list_users()
+            if not aws_result.is_success:
+                log.error(
+                    "list_users_failed",
+                    error_code=aws_result.error_code,
+                    error=aws_result.message,
+                )
+                raise DirectoryUsersUnavailableError(aws_result.message, aws_result.error_code)
+            users = aws_result.data or []
         case _:
             return users
 

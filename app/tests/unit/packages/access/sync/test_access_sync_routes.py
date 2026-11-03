@@ -3,22 +3,17 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Response
 from fastapi.routing import APIRoute
-from fastapi.testclient import TestClient
 
-from infrastructure.idempotency import IdempotencySettings, InMemoryIdempotencyStore
-from infrastructure.operations import OperationResult, OperationStatus
-from infrastructure.security import get_current_user
+from contracts.coordination import LeaseStore, ReadFailurePolicy
+from contracts.operations import OperationResult, OperationStatus
+from infrastructure.coordination import InMemoryConditionalWriteStore
 from infrastructure.security.models import AuthPrincipalSource, User
 from packages.access.sync.domain import SyncOutcome
 from packages.access.sync.interactions.http import router, sync_endpoint
 from packages.access.sync.interactions.ingress import EnqueuedJob
 from packages.access.sync.job_runner import run_user_sync_job
-from packages.access.sync.providers import (
-    get_access_sync_coordinator,
-    get_access_sync_settings,
-)
 from packages.access.sync.schemas import UserSyncJobAcceptedResponse, UserSyncRequest
 
 
@@ -30,7 +25,7 @@ def _get_route(path: str, method: str) -> APIRoute:
 
 
 class _FakeCoordinator:
-    """Minimal stub that satisfies the access sync application service port."""
+    """Minimal stub that satisfies the ``_AccessSynchronizer`` interface."""
 
     def __init__(self, result: OperationResult) -> None:
         self._result = result
@@ -54,21 +49,16 @@ class _FakeCoordinator:
 
 
 class _Settings:
-    """Minimal settings stub satisfying the _AccessSyncSettingsPort protocol."""
+    """Minimal settings stub satisfying the _AccessSyncRouteSettings protocol."""
 
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = enabled
+    def __init__(self) -> None:
         self.job_ttl_seconds = 86400
         self.lock_stale_seconds = 14400
 
 
-def _lock_store() -> InMemoryIdempotencyStore:
-    return InMemoryIdempotencyStore(
-        idempotency_settings=IdempotencySettings(
-            IDEMPOTENCY_TTL_SECONDS=86400,
-            IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS=14400,
-        )
-    )
+def _lock_store() -> LeaseStore:
+    store = InMemoryConditionalWriteStore(record_ttl_seconds=86400, in_progress_ttl_seconds=14400)
+    return LeaseStore(store, read_failure_policy=ReadFailurePolicy.FAIL_CLOSED)
 
 
 def _make_request() -> UserSyncRequest:
@@ -123,7 +113,7 @@ def test_sync_endpoint_user_sync_enqueues_job_and_returns_202():
             _make_request(),
             response=response,
             coordinator=_FakeCoordinator(OperationResult.success()),
-            settings=_Settings(enabled=True),
+            settings=_Settings(),
             current_user=_make_user(),
         )
 
@@ -160,7 +150,7 @@ def test_sync_endpoint_user_sync_returns_existing_job_when_lock_held():
         ),
         patch(
             "packages.access.sync.interactions.ingress.acquire_lock",
-            return_value=False,
+            return_value=None,
         ),
         patch(
             "packages.access.sync.interactions.ingress.current_holder",
@@ -175,7 +165,7 @@ def test_sync_endpoint_user_sync_returns_existing_job_when_lock_held():
             _make_request(),
             response=response,
             coordinator=_FakeCoordinator(OperationResult.success()),
-            settings=_Settings(enabled=True),
+            settings=_Settings(),
             current_user=_make_user(),
         )
 
@@ -186,64 +176,9 @@ def test_sync_endpoint_user_sync_returns_existing_job_when_lock_held():
 
 
 @pytest.mark.unit
-def test_sync_endpoint_returns_503_when_disabled():
-    """Sync endpoint should return 503 when the feature flag is disabled."""
-
-    with (
-        patch(
-            "packages.access.sync.interactions.http.get_access_sync_job_status_store",
-            return_value=MagicMock(),
-        ),
-        pytest.raises(HTTPException) as exc_info,
-    ):
-        sync_endpoint(
-            _make_request(),
-            response=Response(),
-            coordinator=_FakeCoordinator(OperationResult.success()),
-            settings=_Settings(enabled=False),
-            current_user=_make_user(),
-        )
-
-    assert exc_info.value.status_code == 503
-
-
-@pytest.mark.unit
-def test_sync_endpoint_returns_503_without_coordinator_dependency_assembly():
-    app = FastAPI()
-    app.include_router(router)
-
-    coordinator_provider_called = False
-
-    def _coordinator_provider() -> _FakeCoordinator:
-        nonlocal coordinator_provider_called
-        coordinator_provider_called = True
-        raise AssertionError("coordinator dependency should not be assembled")
-
-    app.dependency_overrides[get_access_sync_settings] = lambda: _Settings(enabled=False)
-    app.dependency_overrides[get_access_sync_coordinator] = _coordinator_provider
-    app.dependency_overrides[get_current_user] = _make_user
-
-    client = TestClient(app)
-    response = client.post(
-        "/access/sync-runs",
-        json={
-            "sync_type": "user",
-            "user_email": "user@example.com",
-            "platform": "aws",
-            "dry_run": False,
-            "request_id": "req-1",
-        },
-    )
-
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Access Sync is not enabled"
-    assert coordinator_provider_called is False
-
-
-@pytest.mark.unit
 def test_access_sync_routes_expose_explicit_openapi_metadata() -> None:
     cases = [
-        ("/access/sync-runs", "POST", 202, {503}),
+        ("/access/sync-runs", "POST", 202, {500}),
         ("/access/sync-runs/{job_id}", "GET", 200, {404}),
     ]
 
@@ -282,6 +217,7 @@ def test_run_user_sync_job_stores_completed_outcome():
         coordinator=coordinator,
         job_status_store=fake_job_status_store,
         lock_store=lock_store,
+        claim_token="claim-token-1",
         job_id="job-1",
         user_email="user@example.com",
         platform="aws",
@@ -301,7 +237,7 @@ def test_run_user_sync_job_stores_completed_outcome():
     assert stored["actions_applied"] == ["provision_user"]
     assert stored["user_email"] == "user@example.com"
 
-    lock_store.release.assert_called_once_with("access_sync:user_lock:aws:user@example.com")
+    lock_store.release.assert_called_once_with("access_sync:user_lock:aws:user@example.com", "claim-token-1")
 
 
 @pytest.mark.unit
@@ -321,6 +257,7 @@ def test_run_user_sync_job_stores_failed_outcome_on_coordinator_error():
         coordinator=coordinator,
         job_status_store=fake_job_status_store,
         lock_store=lock_store,
+        claim_token="claim-token-1",
         job_id="job-2",
         user_email="user@example.com",
         platform="aws",
@@ -338,7 +275,7 @@ def test_run_user_sync_job_stores_failed_outcome_on_coordinator_error():
     assert stored["status"] == "failed"
     assert "error" in stored
 
-    lock_store.release.assert_called_once_with("access_sync:user_lock:aws:user@example.com")
+    lock_store.release.assert_called_once_with("access_sync:user_lock:aws:user@example.com", "claim-token-1")
 
 
 @pytest.mark.unit
@@ -373,7 +310,7 @@ def test_sync_endpoint_passes_lock_store_to_ingress_enqueue():
             _make_request(),
             response=Response(),
             coordinator=_FakeCoordinator(OperationResult.success()),
-            settings=_Settings(enabled=True),
+            settings=_Settings(),
             current_user=_make_user(),
         )
 
@@ -393,6 +330,7 @@ def test_run_user_sync_job_stores_failed_outcome_on_exception():
         coordinator=coordinator,
         job_status_store=fake_job_status_store,
         lock_store=lock_store,
+        claim_token="claim-token-1",
         job_id="job-3",
         user_email="user@example.com",
         platform="aws",
@@ -421,6 +359,7 @@ def test_run_user_sync_job_sanitizes_error_to_sync_failed_on_exception():
         coordinator=coordinator,
         job_status_store=fake_job_status_store,
         lock_store=lock_store,
+        claim_token="claim-token-1",
         job_id="job-4",
         user_email="user@example.com",
         platform="aws",

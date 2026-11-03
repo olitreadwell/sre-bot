@@ -6,21 +6,19 @@ Tests verify that the platform provider automatically registers root Slack comma
 Follows AAA pattern and factory fixture conventions.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from infrastructure.configuration.infrastructure.platforms import (
-    SlackPlatformSettings,
-)
+from contracts.slack.models import CommandPayload, CommandResponse
 from integrations.slack.formatter import SlackBlockKitFormatter
-from integrations.slack.models import CommandPayload, CommandResponse
 from integrations.slack.provider import SlackPlatformProvider
 
 
 @pytest.fixture
 def make_slack_settings():
-    """Factory for creating Slack settings with customizable values."""
+    """Factory for a Slack settings stub carrying the attributes the provider reads."""
 
     def _make(
         enabled: bool = True,
@@ -28,11 +26,11 @@ def make_slack_settings():
         app_token: str = "xapp-test",
         bot_token: str = "xoxb-test",
     ):
-        return SlackPlatformSettings(
-            ENABLED=enabled,
-            SOCKET_MODE=socket_mode,
-            APP_TOKEN=app_token,
-            BOT_TOKEN=bot_token,
+        return SimpleNamespace(
+            enabled=enabled,
+            socket_mode=socket_mode,
+            app_token=app_token,
+            bot_token=bot_token,
         )
 
     return _make
@@ -56,9 +54,10 @@ def slack_provider(make_slack_settings, monkeypatch):
             return decorator
 
     class FakeSocketModeHandler:
-        def __init__(self, app, token):
+        def __init__(self, app, token, logger=None):
             self.app = app
             self.token = token
+            self.logger = logger
 
     monkeypatch.setattr("integrations.slack.provider.App", FakeApp)
     monkeypatch.setattr(

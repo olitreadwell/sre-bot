@@ -9,9 +9,10 @@ Exports the FastAPI router for registration in the main application.
 
 from pathlib import Path
 
+from contracts.i18n.resources import I18nResourceRegistrar, I18nResourceSpec
+from contracts.plugins.namespace import hookimpl
+from contracts.slack.registrar import SlackCommandRegistrar
 from infrastructure.events import get_event_dispatcher
-from infrastructure.i18n.resources import I18nResourceSpec
-from infrastructure.plugins import hookimpl
 from packages.access.common.events import REQUEST_APPROVED
 from packages.access.common.providers import get_access_runtime_config
 from packages.access.sync.interactions import slack
@@ -23,9 +24,9 @@ from packages.access.sync.providers import (
 
 
 @hookimpl
-def register_slack_commands(provider) -> None:
+def register_slack_commands(registrar: SlackCommandRegistrar) -> None:
     """Register access-sync Slack commands."""
-    slack.register_commands(provider)
+    slack.register_commands(registrar)
 
 
 def on_access_request_approved(event) -> None:
@@ -54,29 +55,19 @@ def _run_reconciliation_job() -> None:
 
 @hookimpl
 def startup_warmup(logger) -> None:
-    """Log effective Access Sync settings at startup.
+    """Log effective Access Sync settings and warm the providers at startup.
 
-    Also eagerly initializes the coordinator and all providers when the feature
-    is enabled, so the first sync request is not delayed by config loading,
-    adapter construction, and directory-provider wiring.
-
-    For enabled paths, startup failures are fatal and must propagate so
+    Eagerly initializes the coordinator and all providers so the first sync
+    request is not delayed by config loading, adapter construction, and
+    directory-provider wiring. Startup failures are fatal and propagate so
     misconfiguration is detected before traffic.
     """
     settings = get_access_sync_settings()
     logger.info(
         "access_sync_settings_loaded",
-        enabled=settings.enabled,
         reconciliation_enabled=settings.reconciliation_enabled,
         reconciliation_schedule=settings.reconciliation_schedule,
     )
-    if not settings.enabled:
-        logger.warning(
-            "access_sync_disabled",
-            hint="Set ACCESS_SYNC_ENABLED=true to enable the feature.",
-        )
-        return
-
     # Validate runtime config and provider assembly before serving traffic.
     get_access_runtime_config()
     _register_request_handlers()
@@ -94,7 +85,7 @@ def register_routes(app):
 def register_background_jobs(registry) -> None:
     """Register reconciliation schedule through the feature job registry."""
     settings = get_access_sync_settings()
-    if not settings.enabled or not settings.reconciliation_enabled:
+    if not settings.reconciliation_enabled:
         return
 
     registry.register_daily(
@@ -105,7 +96,7 @@ def register_background_jobs(registry) -> None:
 
 
 @hookimpl
-def register_i18n_resources(registry) -> None:
+def register_i18n_resources(registry: I18nResourceRegistrar) -> None:
     """Register access sync translation resource locations."""
     package_root = Path(__file__).parent
     locales_path = package_root / "locales"

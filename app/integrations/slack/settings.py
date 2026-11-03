@@ -1,67 +1,124 @@
-"""Vendor settings for Slack runtime credentials and delivery mode.
+"""Slack vendor settings slice: the [slack] table of the configuration files.
 
-Exposes `SlackSettings` and the cached `get_slack_settings()` provider.
+Exposes `SlackSettings`, its tenant entry `SlackTenant`, and the cached `get_slack_settings()` provider.
 
-Validation behavior mirrors Slack delivery mode requirements:
-- HTTP Events mode (`SLACK_SOCKET_MODE=false`) fails fast at boot when
-    `SLACK_SIGNING_SECRET` is missing.
-- Socket Mode logs an informational notice when `SLACK_SIGNING_SECRET` is not
-    set, because Socket Mode request authenticity is handled by the connection
-    handshake rather than HTTP request-signature verification.
+Non-secret values (per-call timeout, retry budget, error-code catalogues) come from
+[slack]; the workspace this instance works with from [slack.tenant] (production.toml
+and local.toml each name theirs; ci.toml none). The tokens and the signing secret are
+read only from the environment as SLACK__<FIELD>, as a single-workspace Bolt app is
+configured (decisions/configuration.md). A present tenant entry needs the bot token,
+and any secret set without a tenant entry fails, so Slack is never half configured.
+The tenant entry is the expected tenant; checking each request against it, and the
+optional enterprise id, are TASK-157's.
 
-Vendor credentials and transport settings only (tokens, secrets, per-call
-timeout, retry budget, delivery mode, error-code catalogues). Feature-domain
-configuration (channel IDs, user-group IDs) lives with the consuming feature.
+Whether and how the transport runs is the [slack_transport] slice
+(server/slack/settings.py). The rules that join the two (the transport switched on
+needs the tenant entry, the bot token and its delivery mode's credential) run in the
+configuration phase (server/configuration/host_configuration.py), not here.
+
+Feature-domain configuration (channel IDs, user-group IDs) lives with the consuming feature.
 """
-
-from __future__ import annotations
 
 from functools import lru_cache
 
-import structlog
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import SettingsConfigDict
 
-logger = structlog.get_logger(__name__)
+from contracts.configuration import ConfigurationSlice, env_only
+
+_SECRETS = ("bot_token", "user_token", "app_token", "signing_secret")
 
 
-class SlackSettings(BaseSettings):
-    """Vendor credential, transport, and classification settings for Slack."""
+class SlackTenant(BaseModel):
+    """The Slack tenant this instance works with: the expected tenant, in Slack's terms."""
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        case_sensitive=True,
-        extra="ignore",
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    team_id: str = Field(description="Slack workspace (team) id, as auth.test returns it.")
+
+    @field_validator("team_id")
+    @classmethod
+    def _strip_and_reject_blank(cls, value: str) -> str:
+        # The id is opaque (Slack documents no format), so only blankness is checked.
+        value = value.strip()
+        if not value:
+            raise ValueError("team_id must not be blank")
+        return value
+
+    @property
+    def tenant_id(self) -> str:
+        """Return Slack's tenant id for this entry: the workspace (team) id."""
+        return self.team_id
+
+
+class SlackSettings(ConfigurationSlice):
+    """Vendor credential, tenant and classification settings for Slack.
+
+    Keys of [slack]:
+        request_timeout_seconds, retry_max_attempts, transient_retry_after_seconds,
+        unauthorized_errors, not_found_errors, transient_errors.
+        [slack.tenant] team_id: the workspace this instance works with. Default: none.
+
+    Environment only:
+        SLACK__BOT_TOKEN, SLACK__USER_TOKEN, SLACK__APP_TOKEN, SLACK__SIGNING_SECRET.
+        An empty value counts as unset.
+    """
+
+    model_config = SettingsConfigDict(toml_table_header=("slack",), env_prefix="SLACK__")
+
+    tenant: SlackTenant | None = Field(default=None, description="The Slack workspace this instance works with.")
+
+    bot_token: SecretStr = env_only("Bot token (xoxb-) the app acts with.", "codespaces", default=SecretStr(""))
+    user_token: SecretStr = env_only("User token (xoxp-) for the calls a bot token cannot make.", "local", default=SecretStr(""))
+    app_token: SecretStr | None = env_only("App-level token (xapp-) Socket Mode connects with.", "codespaces", default=None)
+    signing_secret: SecretStr | None = env_only("Signing secret HTTP Events mode verifies requests with.", "local", default=None)
+
+    request_timeout_seconds: int = 10
+    retry_max_attempts: int = 2
+    transient_retry_after_seconds: int = Field(
+        default=30,
+        description="Retry hint attached to transient classifications when Slack sends no Retry-After header, in seconds.",
     )
 
-    ENABLED: bool = Field(default=False, alias="SLACK_ENABLED")
-    SOCKET_MODE: bool = Field(default=True, alias="SLACK_SOCKET_MODE")
+    unauthorized_errors: list[str] = Field(
+        default=[
+            "not_authed",
+            "invalid_auth",
+            "account_inactive",
+            "token_revoked",
+            "token_expired",
+            "missing_scope",
+            "no_permission",
+            "not_allowed_token_type",
+            "access_denied",
+            "permission_denied",
+            "ekm_access_denied",
+            "team_access_not_granted",
+        ],
+        description="Slack Web API error codes classified as UNAUTHORIZED.",
+    )
+    not_found_errors: list[str] = Field(
+        default=["channel_not_found", "user_not_found", "users_not_found", "message_not_found", "no_such_subteam"],
+        description="Slack Web API error codes classified as NOT_FOUND.",
+    )
+    transient_errors: list[str] = Field(
+        default=["ratelimited", "internal_error", "fatal_error", "service_unavailable", "request_timeout"],
+        description="Slack Web API error codes classified as TRANSIENT_ERROR.",
+    )
 
-    BOT_TOKEN: str = Field(default="", alias="SLACK_BOT_TOKEN")
-    USER_TOKEN: str = Field(default="", alias="SLACK_USER_TOKEN", repr=False)
-    APP_TOKEN: str | None = Field(default=None, alias="SLACK_APP_TOKEN")
-    SIGNING_SECRET: str | None = Field(default=None, alias="SLACK_SIGNING_SECRET")
-
-    REQUEST_TIMEOUT_SECONDS: int = Field(default=10, alias="SLACK_REQUEST_TIMEOUT_SECONDS")
-    RETRY_MAX_ATTEMPTS: int = Field(default=2, alias="SLACK_RETRY_MAX_ATTEMPTS")
+    @field_validator("app_token", "signing_secret", mode="before")
+    @classmethod
+    def _empty_secret_is_absent(cls, value: object) -> object:
+        return None if value == "" else value
 
     @model_validator(mode="after")
-    def _validate_transport_credentials(self) -> SlackSettings:
-        if not self.ENABLED:
-            return self
-        if self.SOCKET_MODE and not self.APP_TOKEN:
-            raise ValueError("SLACK_APP_TOKEN is required when SLACK_SOCKET_MODE=true and SLACK_ENABLED=true")
-        if not self.SOCKET_MODE and not self.SIGNING_SECRET:
-            raise ValueError("SLACK_SIGNING_SECRET is required when SLACK_SOCKET_MODE=false and SLACK_ENABLED=true")
-        if self.SOCKET_MODE and not self.SIGNING_SECRET:
-            logger.info(
-                "slack_signing_secret_not_set_in_socket_mode",
-                detail=(
-                    "SLACK_SIGNING_SECRET is not set. Socket Mode does not need it for request authenticity "
-                    "(the connection handshake carries that), but it must be configured before switching to "
-                    "HTTP Events mode (SLACK_SOCKET_MODE=false), which fails boot without it."
-                ),
-            )
+    def _tenant_and_secrets_go_together(self) -> SlackSettings:
+        if self.tenant is not None and not self.bot_token:
+            raise ValueError("SLACK__BOT_TOKEN is required when [slack.tenant] is set")
+        if self.tenant is None:
+            for field in _SECRETS:
+                if getattr(self, field):
+                    raise ValueError(f"SLACK__{field.upper()} is set but [slack.tenant] team_id is not")
         return self
 
 

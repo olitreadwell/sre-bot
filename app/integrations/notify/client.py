@@ -8,12 +8,9 @@ import jwt
 import requests
 import structlog
 
-from infrastructure.configuration.app import get_app_settings
-from infrastructure.configuration.integrations.notify import get_notify_settings
+from integrations.notify.settings import get_notify_settings
 
 logger = structlog.get_logger()
-settings = get_app_settings()
-notify_settings = get_notify_settings()
 
 
 # generate the epoch seconds for the jwt token
@@ -61,20 +58,20 @@ def create_jwt_token(secret, client_id):
 
 def create_authorization_header():
     """Function to create the authorization header for the Notify API"""
-    # get the client_id and secret from the environment variables
-    client_id = notify_settings.NOTIFY_SRE_USER_NAME
-    secret = notify_settings.NOTIFY_SRE_CLIENT_SECRET
+    settings = get_notify_settings()
+    client_id = settings.sre_user_name.get_secret_value()
+    secret = settings.sre_client_secret.get_secret_value()
 
     # If the client_id or secret is missing, raise an error
     if not client_id:
-        error = "NOTIFY_SRE_USER_NAME is missing"
+        error = "NOTIFY__SRE_USER_NAME is missing"
         logger.error(
             "authorization_header_creation_failed",
             error=error,
         )
         raise ValueError(error)
     if not secret:
-        error = "NOTIFY_SRE_CLIENT_SECRET is missing"
+        error = "NOTIFY__SRE_CLIENT_SECRET is missing"
         logger.error(
             "authorization_header_creation_failed",
             error=error,
@@ -93,7 +90,7 @@ def post_event(url, payload):
     header = {header_key: header_value, "Content-Type": "application/json"}
 
     # Post the response
-    response = requests.post(url, data=json.dumps(payload), headers=header, timeout=60)
+    response = requests.post(url, data=json.dumps(payload), headers=header, timeout=get_notify_settings().timeout_seconds)
     return response
 
 
@@ -111,19 +108,12 @@ def revoke_api_key(api_key: str, api_type: str, github_repo: str, source: str) -
         github_repo=github_repo,
         source=source,
     )
-    # get the url and jwt_token
-
-    if settings.ENVIRONMENT != "production":
-        log.info("revoke_api_key_skipped", api_key=api_key)
-        return "error"
-    url = notify_settings.NOTIFY_API_URL
-
-    if url is None:
-        log.error("revoke_api_key_error", error="NOTIFY_API_URL is missing")
+    tenant = get_notify_settings().tenant
+    if tenant is None:
+        log.warning("revoke_api_key_not_configured")
         return "error"
 
-    # append the revoke-endpoint to the url
-    url = url + "/sre-tools/api-key-revoke"
+    url = tenant.api_url.rstrip("/") + "/sre-tools/api-key-revoke"
 
     # generate the payload
     payload = {

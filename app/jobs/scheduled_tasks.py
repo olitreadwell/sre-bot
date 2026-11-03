@@ -7,21 +7,19 @@ from typing import Any
 import schedule
 from structlog import get_logger
 
-from infrastructure.idempotency import get_lease_store, run_if_leased
-from infrastructure.plugins.manager import get_plugin_manager
+from contracts.scheduler.registry import BackgroundJobRegistry
+from contracts.services import ServiceScopeOpener
+from features.incident.drive.adapters import google_drive as incident_drive
+from infrastructure.coordination import get_lease_store, run_if_leased
 from integrations import maxmind, opsgenie
-from integrations.aws import identity_store
-from integrations.google_workspace import google_drive
-from jobs.models import BackgroundJobRegistry
+from integrations.slack.client import get_slack_web_client
+from integrations.slack.settings import get_slack_settings
 from jobs.settings import get_scheduler_settings
 from modules.aws import identity_center, spending
 from modules.incident.notify_stale_incident_channels import (
     notify_stale_incident_channels,
 )
-from packages.access.sync.providers import (
-    get_access_runtime_config,
-    get_access_sync_coordinator,
-)
+from packages.aws_platform.adapters.identity_center import build_identity_center_adapter
 
 logger = get_logger()
 schedule_lib = schedule
@@ -29,6 +27,14 @@ schedule_lib = schedule
 
 class _ScheduleBackgroundJobRegistry(BackgroundJobRegistry):
     """Adapter that binds feature jobs to the schedule library."""
+
+    def __init__(self, service_scopes: ServiceScopeOpener) -> None:
+        self._service_scopes = service_scopes
+
+    @property
+    def service_scopes(self) -> ServiceScopeOpener:
+        """The service scope opener jobs use to resolve contracts per run."""
+        return self._service_scopes
 
     def register_daily(
         self,
@@ -81,7 +87,7 @@ def safe_run(job: Callable[..., Any]) -> Callable[..., None]:
 
 def _tier2(name: str, job: Callable[..., None]) -> Callable[..., None]:
     """Wrap a singleton Tier-2 job with lease acquisition/release."""
-    ttl_seconds = get_scheduler_settings().DEFAULT_TIER2_LEASE_TTL_SECONDS
+    ttl_seconds = get_scheduler_settings().default_tier2_lease_ttl_seconds
     lock_store = get_lease_store(ttl_seconds)
 
     def wrapped(*args: Any, **kwargs: Any) -> None:
@@ -90,8 +96,14 @@ def _tier2(name: str, job: Callable[..., None]) -> Callable[..., None]:
     return wrapped
 
 
-def init(bot):
-    """Initialize the scheduled tasks."""
+def init(register_plugin_jobs: Callable[[BackgroundJobRegistry], None], service_scopes: ServiceScopeOpener) -> None:
+    """Initialize the scheduled tasks.
+
+    Args:
+        register_plugin_jobs: Called once with the scheduler registry so feature
+            plugins register their recurring jobs.
+        service_scopes: Opener the registry exposes so jobs open a service scope per run.
+    """
     logger.info("initializing_scheduled_tasks", module="scheduled_tasks", function="init")
 
     schedule.every(5).minutes.do(safe_run(scheduler_heartbeat))
@@ -99,19 +111,26 @@ def init(bot):
 
     # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
     schedule.every(2).hours.do(safe_run(_tier2("scheduler:provision_aws_identity_center", provision_aws_identity_center)))
-    # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
-    schedule.every().day.at("16:00").do(
-        safe_run(_tier2("scheduler:notify_stale_incident_channels", notify_stale_incident_channels)),
-        client=bot.client,
-    )
+    # A vendor's tenant entry enables its client (decisions/configuration.md).
+    if get_slack_settings().tenant is not None:
+        # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
+        schedule.every().day.at("16:00").do(
+            safe_run(_tier2("scheduler:notify_stale_incident_channels", notify_stale_incident_channels_job)),
+        )
+    else:
+        logger.info("scheduled_job_skipped", job_name="notify_stale_incident_channels", reason="slack_not_configured")
     # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
     schedule.every().day.at("00:00").do(
-        safe_run(_tier2("scheduler:spending_generate_spending_data", spending.generate_spending_data)),
-        logger=logger,
+        safe_run(_tier2("scheduler:spending_generate_spending_data", spending.execute_spending_data_update_job)),
     )
 
-    registry = _ScheduleBackgroundJobRegistry()
-    get_plugin_manager().hook.register_background_jobs(registry=registry)
+    registry = _ScheduleBackgroundJobRegistry(service_scopes)
+    register_plugin_jobs(registry)
+
+
+def notify_stale_incident_channels_job() -> None:
+    """Run the legacy stale-channel notice on the outbound Slack Web API client, built per run."""
+    notify_stale_incident_channels(client=get_slack_web_client())
 
 
 def scheduler_heartbeat():
@@ -122,13 +141,24 @@ def integration_healthchecks():
     """Run integration healthchecks."""
     logger.info("running_integration_healthchecks", module="scheduled_tasks", time=time.ctime())
     healthchecks: dict[str, Callable[[], bool]] = {
-        "google_drive": google_drive.healthcheck,
-        "maxmind": maxmind.healthcheck,
+        "google_drive": incident_drive.incident_drive_healthcheck,
+        "maxmind": lambda: maxmind.get_maxmind_client().healthcheck().is_success,
         "opsgenie": opsgenie.healthcheck,
-        "aws": identity_store.healthcheck,
+        "aws": lambda: build_identity_center_adapter().healthcheck().is_success,
     }
     for key, healthcheck in healthchecks.items():
-        if not healthcheck():
+        try:
+            healthy = healthcheck()
+        except Exception as exc:
+            logger.error(
+                "integration_healthcheck_result",
+                module="scheduled_tasks",
+                integration=key,
+                result="unhealthy",
+                error=str(exc),
+            )
+            continue
+        if not healthy:
             logger.error(
                 "integration_healthcheck_result",
                 module="scheduled_tasks",
@@ -177,12 +207,3 @@ def run_continuously(interval=1):
     continuous_thread = ScheduleThread()
     continuous_thread.start()
     return cease_continuous_run
-
-
-def reconcile_access_sync() -> None:
-    """Run full-platform Access Sync batch sync for all registered platforms."""
-    logger.info("reconcile_access_sync_started", module="scheduled_tasks")
-    coordinator = get_access_sync_coordinator()
-    runtime_config = get_access_runtime_config()
-    for platform in runtime_config.platforms:
-        coordinator.sync_platform(platform=platform, dry_run=False)

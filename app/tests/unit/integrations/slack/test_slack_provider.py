@@ -1,13 +1,15 @@
 """Unit tests for SlackPlatformProvider."""
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 
 import integrations.slack.provider as provider_module
-from infrastructure.operations import OperationStatus
+from contracts.operations import OperationStatus
+from contracts.slack.models import CommandPayload, CommandResponse
+from infrastructure.logging.formatters import SLACK_SOCKET_MODE_LOGGER
 from integrations.slack.formatter import SlackBlockKitFormatter
-from integrations.slack.models import CommandPayload, CommandResponse
 from integrations.slack.provider import SlackPlatformProvider
 
 
@@ -19,9 +21,10 @@ def mock_slack_bolt(monkeypatch):
             self.client = object()
 
     class FakeSocketModeHandler:
-        def __init__(self, app, token):
+        def __init__(self, app, token, logger=None):
             self.app = app
             self.token = token
+            self.logger = logger
 
         def connect(self):
             return None
@@ -221,9 +224,23 @@ class TestInitializeApp:
         assert result.data["initialized"] is True
         assert result.data["socket_mode"] is True
 
-    def test_initialize_app_disabled_provider(self, slack_settings_disabled, mock_slack_bolt):
-        """Test initialization when provider is disabled."""
-        provider = SlackPlatformProvider(settings=slack_settings_disabled)
+    def test_initialize_app_routes_socket_mode_logs_to_dedicated_logger(self, slack_settings, mock_slack_bolt):
+        """Socket Mode handler logs through ``slack_sdk.socket_mode``, not Bolt's app logger.
+
+        The fake handler records the ``logger`` argument; a dedicated name lets the logging
+        pipeline downgrade transient websocket errors without touching listener errors.
+        """
+        provider = SlackPlatformProvider(settings=slack_settings)
+
+        assert provider.initialize_app().is_success
+
+        handler = provider.socket_mode_handler
+        assert handler is not None
+        assert handler.logger is logging.getLogger(SLACK_SOCKET_MODE_LOGGER)
+
+    def test_initialize_app_disabled_provider(self, slack_settings, mock_slack_bolt):
+        """With the transport switched off, initialization is skipped."""
+        provider = SlackPlatformProvider(settings=slack_settings, enabled=False)
 
         result = provider.initialize_app()
 
@@ -234,10 +251,8 @@ class TestInitializeApp:
     def test_initialize_app_missing_app_token(self):
         """Test initialization with missing APP_TOKEN in Socket Mode."""
         settings = MagicMock()
-        settings.ENABLED = True
-        settings.SOCKET_MODE = True
-        settings.APP_TOKEN = None
-        settings.BOT_TOKEN = "xoxb-test"
+        settings.app_token = None
+        settings.bot_token = "xoxb-test"
 
         provider = SlackPlatformProvider(settings=settings)
         result = provider.initialize_app()
@@ -248,10 +263,8 @@ class TestInitializeApp:
     def test_initialize_app_missing_bot_token(self):
         """Test initialization with missing BOT_TOKEN."""
         settings = MagicMock()
-        settings.ENABLED = True
-        settings.SOCKET_MODE = True
-        settings.APP_TOKEN = "xapp-test"
-        settings.BOT_TOKEN = None
+        settings.app_token = "xapp-test"
+        settings.bot_token = None
         provider = SlackPlatformProvider(settings=settings)
         result = provider.initialize_app()
 
@@ -260,7 +273,7 @@ class TestInitializeApp:
 
     def test_initialize_app_without_socket_mode(self, slack_settings_http_mode, mock_slack_bolt):
         """Test initialization without Socket Mode."""
-        provider = SlackPlatformProvider(settings=slack_settings_http_mode)
+        provider = SlackPlatformProvider(settings=slack_settings_http_mode, socket_mode=False)
 
         result = provider.initialize_app()
 
@@ -281,45 +294,22 @@ class TestInitializeApp:
 class TestSlackProviderFactory:
     """Test get_slack_provider assembly behavior."""
 
-    def test_should_read_command_prefix_from_transport_settings(self, monkeypatch):
-        """Factory should pass transport COMMAND_PREFIX into provider construction."""
+    def test_passes_the_host_transport_values_into_the_provider(self, monkeypatch):
+        """The factory builds the provider from the values the host passes, reading no transport slice."""
         captured: dict[str, object] = {}
 
         class FakeConstructedProvider:
-            def __init__(self, *, settings, formatter, command_prefix):
-                captured["settings"] = settings
-                captured["formatter"] = formatter
-                captured["command_prefix"] = command_prefix
-
-        class FakeTransportSettings:
-            COMMAND_PREFIX = "dev-"
+            def __init__(self, *, settings, formatter, command_prefix, enabled, socket_mode):
+                captured.update(command_prefix=command_prefix, enabled=enabled, socket_mode=socket_mode)
 
         provider_module.get_slack_provider.cache_clear()
         try:
-            monkeypatch.setattr(
-                provider_module,
-                "SlackPlatformProvider",
-                FakeConstructedProvider,
-            )
-            monkeypatch.setattr(
-                provider_module,
-                "get_slack_settings",
-                lambda: object(),
-            )
-            monkeypatch.setattr(
-                provider_module,
-                "get_slack_transport_settings",
-                lambda: FakeTransportSettings(),
-                raising=False,
-            )
-            monkeypatch.setattr(
-                provider_module,
-                "SlackBlockKitFormatter",
-                lambda: object(),
-            )
+            monkeypatch.setattr(provider_module, "SlackPlatformProvider", FakeConstructedProvider)
+            monkeypatch.setattr(provider_module, "get_slack_settings", lambda: object())
+            monkeypatch.setattr(provider_module, "SlackBlockKitFormatter", lambda: object())
 
-            provider_module.get_slack_provider()
+            provider_module.get_slack_provider(enabled=True, socket_mode=False, command_prefix="dev-")
         finally:
             provider_module.get_slack_provider.cache_clear()
 
-        assert captured["command_prefix"] == "dev-"
+        assert captured == {"command_prefix": "dev-", "enabled": True, "socket_mode": False}

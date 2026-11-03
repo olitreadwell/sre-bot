@@ -5,12 +5,12 @@ approved requests are advanced to ``completed`` or ``failed`` once the sync
 provider reports back.
 
 Slack command and interaction registration are deferred to a later iteration
-pending implementation of a ``register_slack_commands(provider)`` hookimpl
+pending implementation of a ``register_slack_commands(registrar)`` hookimpl
 per ADR-0059 Standard 3.
 """
 
+from contracts.plugins.namespace import hookimpl
 from infrastructure.events import get_event_dispatcher
-from infrastructure.plugins import hookimpl
 from packages.access.common.events import SYNC_COMPLETED, SYNC_FAILED
 from packages.access.common.providers import get_access_runtime_config
 from packages.access.request.interactions.http import router as access_requests_router
@@ -51,19 +51,10 @@ def startup_warmup(logger) -> None:
     settings = get_access_request_settings()
     logger.info(
         "access_requests_settings_loaded",
-        enabled=settings.enabled,
-        manager_group_slug=settings.manager_group_slug,
         fallback_approver_slug=settings.fallback_approver_slug,
         min_approver_count=settings.min_approver_count,
         request_ttl_hours=settings.request_ttl_hours,
     )
-    if not settings.enabled:
-        logger.warning(
-            "access_requests_disabled",
-            hint="Set ACCESS_REQUESTS_ENABLED=true to enable the feature.",
-        )
-        return
-
     # Fail fast on misconfigured runtime config or provider wiring.
     get_access_runtime_config()
     _register_sync_event_handlers()

@@ -1,7 +1,6 @@
 """Integration tests for server.lifespan module."""
 
 import sys
-import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,9 +10,7 @@ from server.lifespan import (
     _get_logger_from_app,
     _initialize_directory_provider,
     _is_test_environment,
-    _list_configs_from_sections,
     _register_legacy_handlers,
-    _start_scheduled_tasks,
     _stop_scheduled_tasks,
 )
 
@@ -52,65 +49,17 @@ def test_lifespan_is_test_environment_detects_non_pytest():
 
 
 @pytest.mark.integration
-def test_lifespan_get_logger_returns_logger(mock_settings):
-    """Test that _get_logger returns a configured logger."""
-    # Arrange
+def test_lifespan_get_logger_returns_logger():
+    """The lifespan logger is a structlog logger from the pipeline the configuration phase configured."""
+    logger = _get_logger_from_app()
 
-    # Act
-    logger = _get_logger_from_app(mock_settings)
-
-    # Assert
     assert logger is not None
 
 
 @pytest.mark.integration
-def test_lifespan_list_configs_logs_settings(mock_settings):
-    """Test that _list_configs logs configuration settings."""
-    # Arrange
-    mock_logger = MagicMock()
-    mock_server_settings = MagicMock()
-    mock_server_settings.model_dump.return_value = {"PORT": 8080}
-    mock_directory_settings = MagicMock()
-    mock_directory_settings.model_dump.return_value = {"require_startup_warmup": True}
-    mock_sre_ops_settings = MagicMock()
-    mock_sre_ops_settings.model_dump.return_value = {"SRE_OPS_CHANNEL_ID": ""}
-
-    # Act
-    _list_configs_from_sections(
-        mock_settings,
-        mock_server_settings,
-        mock_directory_settings,
-        mock_sre_ops_settings,
-        mock_logger,
-    )
-
-    # Assert
-    mock_logger.info.assert_called()
-    first_call = mock_logger.info.call_args_list[0]
-    assert first_call.args[0] == "configuration_initialized"
-
-    base_settings = first_call.kwargs["base_settings"]
-    assert all("PREFIX" not in entry for entry in base_settings)
-
-
-@pytest.mark.integration
-@patch("server.lifespan.configure_logging")
-def test_lifespan_get_logger_configures_logging(mock_configure_logging, mock_settings):
-    """Test that _get_logger calls configure_logging with settings."""
-    # Arrange
-    mock_logger = MagicMock()
-    mock_configure_logging.return_value = mock_logger
-
-    # Act
-    logger = _get_logger_from_app(mock_settings)
-
-    # Assert
-    # _get_logger_from_app now passes both settings and logging_settings to configure_logging
-    assert mock_configure_logging.call_count == 1
-    call_kwargs = mock_configure_logging.call_args.kwargs
-    assert call_kwargs["settings"] == mock_settings
-    assert "logging_settings" in call_kwargs
-    assert logger == mock_logger
+def test_lifespan_does_not_configure_logging():
+    """Logging is configured once, by the app factory's configuration phase; lifespan only reads the logger."""
+    assert not hasattr(lifespan_module, "configure_logging")
 
 
 @pytest.mark.integration
@@ -124,7 +73,6 @@ def test_lifespan_register_legacy_handlers_calls_register(mock_bot):
         patch("server.lifespan.atip") as mock_atip,
         patch("server.lifespan.aws") as mock_aws,
         patch("server.lifespan.secret") as mock_secret,
-        patch("server.lifespan.sre") as mock_sre,
         patch("server.lifespan.webhook_helper") as mock_webhook,
         patch("server.lifespan.incident") as mock_incident,
         patch("server.lifespan.incident_helper") as mock_incident_helper,
@@ -137,7 +85,6 @@ def test_lifespan_register_legacy_handlers_calls_register(mock_bot):
         mock_atip.register.assert_called_once_with(mock_bot)
         mock_aws.register.assert_called_once_with(mock_bot)
         mock_secret.register.assert_called_once_with(mock_bot)
-        mock_sre.register.assert_called_once_with(mock_bot)
         mock_webhook.register.assert_called_once_with(mock_bot)
         mock_incident.register.assert_called_once_with(mock_bot)
         mock_incident_helper.register.assert_called_once_with(mock_bot)
@@ -165,52 +112,6 @@ def test_lifespan_stop_scheduled_tasks_sets_event():
 
     # Assert
     mock_event.set.assert_called_once()
-
-
-@pytest.mark.integration
-def test_lifespan_start_scheduled_tasks_runs_when_environment_is_prod(mock_settings, mock_bot, monkeypatch):
-    """Test that _start_scheduled_tasks starts when ENVIRONMENT is production."""
-    # Arrange
-    mock_logger = MagicMock()
-    mock_settings.ENVIRONMENT = "production"
-    init_mock = MagicMock()
-    stop_event = threading.Event()
-    run_mock = MagicMock(return_value=stop_event)
-    monkeypatch.setattr("server.lifespan.scheduled_tasks.init", init_mock)
-    monkeypatch.setattr("server.lifespan.scheduled_tasks.run_continuously", run_mock)
-
-    # Act
-    result = _start_scheduled_tasks(mock_bot, mock_settings, mock_logger)
-
-    # Assert
-    assert result is stop_event
-    init_mock.assert_called_once_with(mock_bot)
-    run_mock.assert_called_once()
-    mock_logger.info.assert_called_with("scheduled_tasks_started")
-
-
-@pytest.mark.integration
-def test_lifespan_start_scheduled_tasks_skips_when_environment_is_not_production(mock_settings, mock_bot, monkeypatch):
-    """Test that _start_scheduled_tasks skips when ENVIRONMENT is non-production."""
-    # Arrange
-    mock_logger = MagicMock()
-    mock_settings.ENVIRONMENT = "local"
-    init_mock = MagicMock()
-    run_mock = MagicMock()
-    monkeypatch.setattr("server.lifespan.scheduled_tasks.init", init_mock)
-    monkeypatch.setattr("server.lifespan.scheduled_tasks.run_continuously", run_mock)
-
-    # Act
-    result = _start_scheduled_tasks(mock_bot, mock_settings, mock_logger)
-
-    # Assert
-    assert result is None
-    init_mock.assert_not_called()
-    run_mock.assert_not_called()
-    mock_logger.info.assert_called_with(
-        "scheduled_tasks_skipped",
-        reason="environment_is_not_production",
-    )
 
 
 @pytest.mark.integration

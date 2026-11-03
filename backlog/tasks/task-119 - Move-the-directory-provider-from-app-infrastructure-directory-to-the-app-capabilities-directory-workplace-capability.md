@@ -1,0 +1,72 @@
+---
+id: TASK-119
+title: >-
+  Move the directory provider from app/infrastructure/directory/ to the
+  app/capabilities/directory/ workplace capability
+status: To Do
+assignee: []
+created_date: 2026-09-24 20:00
+updated_date: '2026-10-28T14:15:00Z'
+labels:
+  - plugin-architecture
+  - capabilities
+  - workplace-systems
+milestone: m-7
+dependencies:
+  - TASK-106
+  - TASK-110
+  - TASK-114
+references:
+  - decisions/workplace-systems.md
+  - decisions/plugin-architecture.md
+  - decisions/feature-packages.md
+  - decisions/cloud-portability.md
+  - https://github.com/cds-snc/sre-bot/issues/1662
+priority: medium
+type: task
+ordinal: 261000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+decisions/workplace-systems.md and plugin-architecture.md: workplace systems (directory, documents, files, spreadsheets, calendar, mail) are capabilities, not infrastructure. infrastructure/ is hosting-only. Their public surface is api.py (the Protocol, domain types and provider function) plus an optional hookspecs module; everything else is private. The Google implementation becomes adapters/google.py, the only file importing app.integrations.google_workspace.
+
+Today app/infrastructure/directory/ exposes a vendor-neutral Protocol with a single Google implementation behind a cached factory, re-exported through a barrel __init__.py.
+The Access Sync suite hand-rolls an inline DirectoryProvider double; the shared fake built here replaces it. This takes over the directory part of TASK-27.3.
+Scope:
+- move the package into the feature-packages shape (api.py, adapters/, settings.py, README.md with its classification and named feature consumers, and a fake);
+- repoint every consumer to api.py;
+- delete app/infrastructure/directory/ with no re-export.
+Behaviour-preserving. migration.md rule 6: the capability is not widened to reproduce legacy conventions, and legacy modules keep calling what they call today until their surface is rebuilt, except for import-path changes.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 Consumers import only app/capabilities/directory/api.py; only its adapters/ import app.integrations
+- [ ] #2 An in-memory fake of the api.py Protocol lives in the package and is exercised by tests, as the cloud-portability.md fake contract requires for externally facing capability Protocols
+- [ ] #3 app/infrastructure/directory/ is deleted with no re-export; grep finds no import of the old path, including mock patch strings
+- [ ] #4 ruff, mypy (no new errors in touched files), lint-imports and pytest tests --ignore=tests/smoke pass
+- [ ] #5 The adapter and the in_memory.py fake explicitly subclass the api.py Protocol; the DirectoryProvider line is removed from app/bin/baselines/fake_coverage.txt and make check-fake-coverage passes
+- [ ] #6 app/capabilities/directory/ matches the feature-packages layout for a capability (the TASK-114 shape check is green); its README states the classification, its purpose (the people directory) and at least two feature consumers (decisions/workplace-systems.md Checks, 2026-10-26)
+<!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-10-20 23:28
+
+---
+
+2026-10-20 (TASK-111 planning): TASK-111 moves this slice's values into the configuration files under a table whose name does not depend on the module path, so this move relocates the settings class only; the files and env names stay as they are.
+
+---
+
+created: 2026-10-28T14:15:00Z
+
+---
+
+2026-10-28: TASK-174 (Entra directory adapter, unscheduled) depends on this move; adapters/ is where it lands, and get_directory_provider becomes per-IdP resolution there.
+
+---
+<!-- COMMENTS:END -->

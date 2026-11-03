@@ -13,8 +13,8 @@ import contextlib
 
 import httpx
 
-from infrastructure.operations.result import OperationResult
-from infrastructure.operations.status import OperationStatus
+from contracts.operations.result import OperationResult
+from contracts.operations.status import OperationStatus
 from integrations.openai.settings import OpenAISettings, get_openai_settings
 
 
@@ -25,12 +25,12 @@ def build_openai_client(settings: OpenAISettings | None = None) -> httpx.AsyncCl
     """
     settings = settings or get_openai_settings()
     return httpx.AsyncClient(
-        base_url=settings.BASE_URL,
+        base_url=settings.base_url,
         headers={
-            "Authorization": f"Bearer {settings.API_KEY.get_secret_value()}",
+            "Authorization": f"Bearer {settings.api_key.get_secret_value()}",
             "Content-Type": "application/json",
         },
-        timeout=settings.TIMEOUT_SECONDS,
+        timeout=settings.timeout_seconds,
     )
 
 
@@ -48,21 +48,18 @@ def classify_openai_error(exc: Exception) -> OperationResult:
                 OperationStatus.PERMANENT_ERROR,
                 "OpenAI authentication failed",
                 error_code="UNAUTHORIZED",
-                provider="openai",
             )
         if status_code == 403:
             return OperationResult.error(
                 OperationStatus.PERMANENT_ERROR,
                 "OpenAI API access forbidden",
                 error_code="FORBIDDEN",
-                provider="openai",
             )
         if status_code == 404:
             return OperationResult.error(
                 OperationStatus.NOT_FOUND,
                 "OpenAI resource not found",
                 error_code="NOT_FOUND",
-                provider="openai",
             )
         if status_code == 429:
             retry_after = 60
@@ -75,20 +72,17 @@ def classify_openai_error(exc: Exception) -> OperationResult:
                 "OpenAI API rate limited",
                 error_code="RATE_LIMITED",
                 retry_after=retry_after,
-                provider="openai",
             )
         if 500 <= status_code < 600:
             return OperationResult.error(
                 OperationStatus.TRANSIENT_ERROR,
                 f"OpenAI API server error ({status_code})",
                 error_code="SERVER_ERROR",
-                provider="openai",
             )
         return OperationResult.error(
             OperationStatus.PERMANENT_ERROR,
             f"OpenAI API client error ({status_code})",
             error_code="HTTP_ERROR",
-            provider="openai",
         )
 
     if isinstance(exc, httpx.TimeoutException):
@@ -96,7 +90,6 @@ def classify_openai_error(exc: Exception) -> OperationResult:
             OperationStatus.TRANSIENT_ERROR,
             "OpenAI API request timed out",
             error_code="TIMEOUT",
-            provider="openai",
         )
 
     if isinstance(exc, httpx.HTTPError):
@@ -104,7 +97,6 @@ def classify_openai_error(exc: Exception) -> OperationResult:
             OperationStatus.TRANSIENT_ERROR,
             "OpenAI API request failed",
             error_code="CONNECTION_ERROR",
-            provider="openai",
         )
 
     raise exc

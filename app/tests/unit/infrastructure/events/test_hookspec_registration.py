@@ -5,9 +5,10 @@ from unittest.mock import MagicMock
 import pluggy
 import pytest
 
+from contracts.plugins.hookspecs import FeatureLifecycleSpecs
+from contracts.plugins.namespace import PLUGIN_NAMESPACE, hookimpl
 from infrastructure.events.service import EventDispatcher
-from infrastructure.plugins.manager import register_feature_integrations
-from infrastructure.plugins.specs import FeatureLifecycleSpecs
+from server.plugins.manager import register_feature_integrations
 
 pytestmark = pytest.mark.unit
 
@@ -17,10 +18,9 @@ def test_register_event_handlers_hookspec_exists() -> None:
 
 
 def test_hookimpl_receives_dispatcher() -> None:
-    pm = pluggy.PluginManager("sre_bot")
+    pm = pluggy.PluginManager(PLUGIN_NAMESPACE)
     pm.add_hookspecs(FeatureLifecycleSpecs)
     observed: dict[str, object] = {}
-    hookimpl = pluggy.HookimplMarker("sre_bot")
 
     class Plugin:
         @hookimpl
@@ -37,14 +37,17 @@ def test_hookimpl_receives_dispatcher() -> None:
 
 
 def test_hookspec_called_during_feature_integration(monkeypatch) -> None:
-    mocked_hook = MagicMock()
-    fake_pm = MagicMock()
-    fake_pm.hook.register_event_handlers = mocked_hook
+    pm = pluggy.PluginManager(PLUGIN_NAMESPACE)
+    pm.add_hookspecs(FeatureLifecycleSpecs)
+    observed: list[object] = []
 
-    monkeypatch.setattr(
-        "infrastructure.plugins.manager.get_plugin_manager",
-        lambda: fake_pm,
-    )
+    class Plugin:
+        @hookimpl
+        def register_event_handlers(self, dispatcher: EventDispatcher) -> None:
+            observed.append(dispatcher)
+
+    pm.register(Plugin(), name="events_plugin")
+    monkeypatch.setattr("server.plugins.manager.get_plugin_manager", lambda: pm)
 
     dispatcher = EventDispatcher()
     register_feature_integrations(
@@ -53,4 +56,4 @@ def test_hookspec_called_during_feature_integration(monkeypatch) -> None:
         event_dispatcher=dispatcher,
     )
 
-    mocked_hook.assert_called_once_with(dispatcher=dispatcher)
+    assert observed == [dispatcher]

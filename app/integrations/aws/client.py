@@ -1,90 +1,185 @@
-from functools import wraps
-from typing import Any, cast
+"""AWS vendor client.
 
-import boto3  # type: ignore
-import structlog
-from botocore.client import BaseClient  # type: ignore
-from botocore.config import Config  # type: ignore
-from botocore.credentials import (  # type: ignore
-    DeferredRefreshableCredentials,
-    create_assume_role_refresher,
-)
-from botocore.exceptions import BotoCoreError, ClientError  # type: ignore
+Provides the typed boto3 client factory and the shared error classification
+per decisions/outbound-clients.md: clients raise typed SDK exceptions; adapters
+classify them. Every client carries SDK-native standard retries and explicit
+per-attempt timeouts fixed once at construction, AssumeRole goes through the
+public STS API. The region and the dynamodb-local endpoint are the SDK's to
+resolve (AWS_DEFAULT_REGION or the shared config file, AWS_ENDPOINT_URL_DYNAMODB),
+so the factory names neither. Clients are built per call and never cached, so assumed credentials never
+need refreshing.
+"""
 
-from infrastructure.configuration.app import get_app_settings
-from infrastructure.configuration.integrations.aws import get_aws_settings
-from infrastructure.operations.status import OperationStatus
+from typing import TYPE_CHECKING, Any, Literal, overload
 
-logger = structlog.get_logger()
-settings = get_aws_settings()
-app_settings = get_app_settings()
-SYSTEM_ADMIN_PERMISSIONS = settings.SYSTEM_ADMIN_PERMISSIONS
-VIEW_ONLY_PERMISSIONS = settings.VIEW_ONLY_PERMISSIONS
-AWS_REGION = settings.AWS_REGION
-THROTTLING_ERRS = settings.THROTTLING_ERRS
-RESOURCE_NOT_FOUND_ERRS = settings.RESOURCE_NOT_FOUND_ERRS
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+
+from contracts.operations.status import OperationStatus
+from integrations.aws.settings import AWSSettings, get_aws_settings
+
+if TYPE_CHECKING:
+    from types_boto3_ce.client import CostExplorerClient
+    from types_boto3_config.client import ConfigServiceClient
+    from types_boto3_dynamodb.client import DynamoDBClient
+    from types_boto3_guardduty.client import GuardDutyClient
+    from types_boto3_identitystore.client import IdentityStoreClient
+    from types_boto3_lambda.client import LambdaClient
+    from types_boto3_organizations.client import OrganizationsClient
+    from types_boto3_securityhub.client import SecurityHubClient
+    from types_boto3_sso_admin.client import SSOAdminClient
+    from types_boto3_sts.client import STSClient
+    from types_boto3_sts.type_defs import CredentialsTypeDef
+
+type AwsServiceName = Literal[
+    "dynamodb",
+    "identitystore",
+    "organizations",
+    "sso-admin",
+    "ce",
+    "config",
+    "guardduty",
+    "securityhub",
+    "lambda",
+    "sts",
+]
+
+_DEFAULT_SESSION_NAME = "sre-bot"
+
+
+@overload
+def get_aws_client(
+    service_name: Literal["dynamodb"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> DynamoDBClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["identitystore"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> IdentityStoreClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["organizations"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> OrganizationsClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["sso-admin"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> SSOAdminClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["ce"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> CostExplorerClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["config"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> ConfigServiceClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["guardduty"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> GuardDutyClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["securityhub"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> SecurityHubClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["lambda"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> LambdaClient: ...
+@overload
+def get_aws_client(
+    service_name: Literal["sts"],
+    *,
+    role_arn: str | None = None,
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> STSClient: ...
 
 
 def get_aws_client(
-    service_name: str,
-    session_config: dict[str, Any] | None = None,
-    client_config: dict[str, Any] | None = None,
+    service_name: AwsServiceName,
+    *,
     role_arn: str | None = None,
-    session_name: str = "DefaultSession",
-) -> BaseClient:
-    """Construct a boto3 client with standardized retry/timeouts and endpoint gating.
+    session_name: str = _DEFAULT_SESSION_NAME,
+    retries: bool = True,
+) -> Any:
+    """Build a boto3 client with the standard retry and timeout policy.
 
-    For DynamoDB in local-style environments, this applies the dynamodb-local
-    endpoint override used across the integrations package.
+    ``role_arn`` assumes that role eagerly through STS before the client is
+    built. ``retries=False`` makes exactly one attempt, for writes that are not
+    safe to replay. The region and any endpoint override come from the SDK's own
+    resolution; with no region configured anywhere, botocore raises
+    ``NoRegionError``. Failures raise SDK exceptions; adapters classify them with
+    ``classify_aws_error``.
     """
-    region_name = getattr(settings, "AWS_REGION", "ca-central-1")
-    retry_mode = getattr(settings, "RETRY_MODE", "standard")
-    retry_max_attempts = getattr(settings, "RETRY_MAX_ATTEMPTS", 3)
-    connect_timeout = getattr(settings, "CONNECT_TIMEOUT_SECONDS", 10)
-    read_timeout = getattr(settings, "READ_TIMEOUT_SECONDS", 10)
+    settings = get_aws_settings()
+    session = _session_for(settings, role_arn, session_name)
+    return session.client(service_name, config=_build_config(settings, retries=retries))
 
-    merged_session_config: dict[str, Any] = {"region_name": region_name}
-    if session_config:
-        merged_session_config.update(session_config)
 
-    merged_client_config: dict[str, Any] = {"region_name": region_name}
-    if client_config:
-        merged_client_config.update(client_config)
+def _build_config(settings: AWSSettings, *, retries: bool) -> Config:
+    """Botocore config with explicit retry mode, attempt budget and timeouts."""
+    max_attempts = settings.retry_max_attempts if retries else 0
+    return Config(
+        retries={"mode": settings.retry_mode, "max_attempts": max_attempts},
+        connect_timeout=settings.connect_timeout_seconds,
+        read_timeout=settings.read_timeout_seconds,
+    )
 
-    if "config" not in merged_client_config:
-        retries: dict[str, Any] = {"mode": retry_mode}
-        if retry_max_attempts is not None:
-            retries["max_attempts"] = retry_max_attempts
-        merged_client_config["config"] = Config(
-            retries=cast(Any, retries),
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-        )
 
-    environment = getattr(app_settings, "ENVIRONMENT", None)
-    if service_name == "dynamodb" and environment in ("local", "dev", "ci"):
-        merged_client_config["endpoint_url"] = "http://dynamodb-local:8000"
+def _session_for(settings: AWSSettings, role_arn: str | None, session_name: str) -> boto3.Session:
+    """Ambient-credential session, or one holding credentials assumed for ``role_arn``."""
+    ambient = boto3.Session()
+    if not role_arn:
+        return ambient
 
-    if role_arn:
-        # Defer the actual AssumeRole call until the client's first real
-        # request needs credentials, instead of assuming the role eagerly at
-        # client-construction time (matches the previous facade's lazy
-        # per-call session/credential behavior).
-        session = boto3.Session(**merged_session_config)
-        sts_client = session.client("sts")
-        refresher = create_assume_role_refresher(sts_client, {"RoleArn": role_arn, "RoleSessionName": session_name})
-        # Reaches into botocore's internal session to install lazily-refreshed
-        # credentials; no public boto3 API exposes this hook.
-        session._session._credentials = DeferredRefreshableCredentials(  # type: ignore[attr-defined]
-            method="assume-role",
-            refresh_using=refresher,
-        )
-    else:
-        session = boto3.Session(**merged_session_config)
+    sts: STSClient = ambient.client("sts", config=_build_config(settings, retries=True))
+    credentials = _assume_role_credentials(sts, role_arn, session_name)
+    return boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+    )
 
-    # boto3 stubs expose per-service overloads; runtime selection by str needs
-    # the generic BaseClient return type.
-    return cast(BaseClient, session.client(service_name, **merged_client_config))  # type: ignore[call-overload,no-any-return]
+
+def _assume_role_credentials(sts: STSClient, role_arn: str, session_name: str) -> CredentialsTypeDef:
+    """Exchange ``role_arn`` for temporary credentials through the public STS API."""
+    response = sts.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
+    return response["Credentials"]
 
 
 def classify_aws_error(exc: Exception) -> tuple[OperationStatus, str | None, int | None]:
@@ -101,233 +196,15 @@ def classify_aws_error(exc: Exception) -> tuple[OperationStatus, str | None, int
     if not isinstance(code, str) or not code:
         raise exc
 
-    not_found_codes = set(getattr(settings, "NOT_FOUND_CODES", ["ResourceNotFoundException"]))
-    unauthorized_codes = set(
-        getattr(
-            settings,
-            "UNAUTHORIZED_CODES",
-            ["AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException"],
-        )
-    )
-    transient_codes = set(
-        getattr(
-            settings,
-            "TRANSIENT_CODES",
-            [
-                "Throttling",
-                "ThrottlingException",
-                "RequestLimitExceeded",
-                "ProvisionedThroughputExceededException",
-            ],
-        )
-    )
-
-    if code in not_found_codes:
+    settings = get_aws_settings()
+    if code in settings.not_found_codes:
         return OperationStatus.NOT_FOUND, code, None
-    if code in unauthorized_codes:
+    if code in settings.unauthorized_codes:
         return OperationStatus.UNAUTHORIZED, code, None
-    if code in transient_codes:
-        return OperationStatus.TRANSIENT_ERROR, code, 60
-    if code == "ConditionalCheckFailedException":
+    if code in settings.transient_codes:
+        return OperationStatus.TRANSIENT_ERROR, code, settings.transient_retry_after_seconds
+    if code in ("ConditionalCheckFailedException", "ConflictException"):
+        # DynamoDB conditional writes and Identity Store "already exists" conflicts are final outcomes.
         return OperationStatus.PERMANENT_ERROR, code, None
 
     raise exc
-
-
-def handle_aws_api_errors(func):
-    """Decorator to handle AWS API errors.
-
-    Args:
-        func (function): The function to decorate.
-
-    Returns:
-        The decorated function with error handling.
-    """
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except BotoCoreError as e:
-            log = logger.bind(module=func.__module__, function=func.__name__)
-            log.error(
-                "boto_core_error",
-                error=str(e),
-            )
-        except ClientError as e:
-            log = logger.bind(
-                module=func.__module__,
-                function=func.__name__,
-                error_code=e.response["Error"]["Code"],
-            )
-            if e.response["Error"]["Code"] in THROTTLING_ERRS:
-                log.info(
-                    "aws_throttling_error",
-                    error=str(e),
-                )
-            elif e.response["Error"]["Code"] in RESOURCE_NOT_FOUND_ERRS:
-                log.warning(
-                    "aws_resource_not_found",
-                    error=str(e),
-                )
-            else:
-                log.error(
-                    "aws_client_error",
-                    error=str(e),
-                )
-        except Exception as e:  # Catch-all for any other types of exceptions
-            log = logger.bind(module=func.__module__, function=func.__name__)
-            log.error(
-                "unexpected_error",
-                error=str(e),
-            )
-        return False
-
-    return wrapper
-
-
-@handle_aws_api_errors
-def assume_role_session(role_arn, session_name="DefaultSession"):
-    """Assume an IAM role and return a session with temporary credentials.
-
-    Args:
-        role_arn (str): The ARN of the IAM role to assume.
-        session_name (str): An identifier for the assumed role session.
-
-    Returns:
-        boto3.Session: A session with temporary credentials.
-    """
-    sts_client = boto3.client("sts")
-    assumed_role = sts_client.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
-    credentials = assumed_role["Credentials"]
-
-    return boto3.Session(
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"],
-    )
-
-
-@handle_aws_api_errors
-def get_aws_service_client(
-    service_name,
-    role_arn=None,
-    session_name="DefaultSession",
-    session_config=None,
-    client_config=None,
-):
-    """Get an AWS service client. If a role_arn is provided in the config, assume the role to get temporary credentials.
-
-    Args:
-        service_name (str): The name of the AWS service.
-        **config: Additional keyword arguments for the service client.
-
-    Returns:
-        botocore.client.BaseClient: The service client.
-    """
-    if session_config is None:
-        session_config = {}
-    if client_config is None:
-        client_config = {}
-
-    session = assume_role_session(role_arn, session_name) if role_arn else boto3.Session(**session_config)
-    return session.client(service_name, **client_config)
-
-
-def execute_aws_api_call(
-    service_name,
-    method,
-    paginated=False,
-    keys=None,
-    role_arn=None,
-    session_config=None,
-    client_config=None,
-    **kwargs,
-):
-    """Execute an AWS API call.
-
-    Args:
-        service_name (str): The name of the AWS service.
-        method (str): The method to call on the service client.
-        paginate (bool, optional): Whether to paginate the API call.
-        role_arn (str, optional): The ARN of the IAM role to assume. If not provided as an argument, it will be taken from the AWS_ORG_ACCOUNT_ROLE_ARN environment variable.
-        **kwargs: Additional keyword arguments for the API call.
-
-    Returns:
-        list or dict: The result of the API call. If paginate is True, returns a list of all results. If paginate is False, returns the result as a dict.
-
-    Raises:
-        ValueError: If the role_arn is not provided.
-    """
-    if session_config is None:
-        session_config = {"region_name": AWS_REGION}
-    if client_config is None:
-        client_config = {"region_name": AWS_REGION}
-
-    log = logger.bind(service=service_name, method=method, paginated=paginated)
-    log.debug("aws_api_call_started")
-
-    client = get_aws_service_client(
-        service_name,
-        role_arn,
-        session_config=session_config,
-        client_config=client_config,
-    )
-    api_method = getattr(client, method)
-    results = paginator(client, method, keys, **kwargs) if paginated else api_method(**kwargs)
-
-    if "ResponseMetadata" in results and results["ResponseMetadata"]["HTTPStatusCode"] != 200:
-        log.error(
-            "aws_api_call_failed",
-            status_code=results["ResponseMetadata"]["HTTPStatusCode"],
-        )
-        raise RuntimeError(
-            f"API call to {service_name}.{method} failed with status code {results['ResponseMetadata']['HTTPStatusCode']}"
-        )
-
-    log.debug("aws_api_call_completed")
-
-    return results
-
-
-def paginator(client: BaseClient, operation, keys=None, **kwargs):
-    """Generic paginator for AWS operations
-
-    Args:
-        client (BaseClient): The service client.
-        operation (str): The operation to paginate.
-        keys (list, optional): The keys to extract from the paginated results.
-        **kwargs: Additional keyword arguments for the operation.
-
-    Returns:
-        list: The paginated results.
-
-    Reference: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/paginators.html
-    """
-    paginator = client.get_paginator(operation)
-    results = []
-    log = logger.bind(service=client.meta.service_model.service_name, operation=operation)
-
-    for page in paginator.paginate(**kwargs):
-        if keys is None:
-            for key, value in page.items():
-                if key != "ResponseMetadata":
-                    if isinstance(value, list):
-                        results.extend(value)
-                    else:
-                        results.append(value)
-                else:
-                    if key == "ResponseMetadata" and value["HTTPStatusCode"] != 200:
-                        log.error(
-                            "api_call_failed_during_pagination",
-                            status_code=value["HTTPStatusCode"],
-                        )
-                        raise RuntimeError(
-                            f"API call to {client.meta.service_model.service_name}.{operation} failed with status code {value['HTTPStatusCode']}"
-                        )
-        else:
-            for key in keys:
-                if key in page:
-                    results.extend(page[key])
-
-    return results

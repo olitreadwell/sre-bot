@@ -28,17 +28,15 @@ from packages.access.sync.policies import AdapterCapabilities
 def make_sync_settings():
     """Factory fixture for ``AccessSyncSettings``.
 
-    ``AccessSyncSettings`` is a plain ``BaseModel`` — no env file reading.
-    Pass field overrides directly as keyword arguments.
-
-    To test env-var loading, instantiate ``AccessSettings(_env_file=None)``
-    directly in the test after calling ``monkeypatch.setenv``.
+    Pass field overrides directly as keyword arguments; the access-root
+    conftest strips ``ACCESS_*`` variables and the ``.env`` file, so the
+    remaining fields take their defaults.
 
     Usage::
 
         def test_defaults(make_sync_settings):
             settings = make_sync_settings()
-            assert settings.enabled is False
+            assert settings.reconciliation_enabled is False
 
         def test_ttl_override(make_sync_settings):
             settings = make_sync_settings(job_ttl_seconds=3600)
@@ -113,6 +111,7 @@ def make_runtime_config(make_platform_policy):
     def _make(
         platform: str = "aws",
         dir_prefix: str = "sg",
+        dir_domain: str = "example.com",
         dir_separator: str = "-",
         platforms: dict | None = None,
         **policy_kwargs: object,
@@ -121,6 +120,7 @@ def make_runtime_config(make_platform_policy):
             platforms = {platform: make_platform_policy(**policy_kwargs)}  # type: ignore[arg-type]
         return AccessRuntimeConfig(
             dir_prefix=dir_prefix,
+            dir_domain=dir_domain,
             dir_separator=dir_separator,
             platforms=platforms,
         )

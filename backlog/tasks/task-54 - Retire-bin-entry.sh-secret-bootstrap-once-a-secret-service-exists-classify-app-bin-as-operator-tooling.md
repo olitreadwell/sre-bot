@@ -5,8 +5,8 @@ title: >-
   app/bin/ as operator tooling
 status: To Do
 assignee: []
-created_date: '2026-07-27 16:07'
-updated_date: '2026-07-27 16:13'
+created_date: 2026-07-27 16:07
+updated_date: '2026-10-29T00:46:00Z'
 labels:
   - architecture
   - layers
@@ -14,10 +14,10 @@ labels:
 milestone: m-4
 dependencies: []
 references:
-  - decisions/layers.md
   - decisions/configuration.md
   - decisions/security.md
-  - 'https://github.com/cds-snc/sre-bot/issues/1358'
+  - https://github.com/cds-snc/sre-bot/issues/1358
+  - decisions/migration.md
 priority: medium
 ordinal: 82000
 ---
@@ -25,19 +25,19 @@ ordinal: 82000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-decisions/layers.md does not account for app/bin/, a top-level directory of operator and dev shell/python tooling (entry.sh container entrypoint, db.sh, seed.sh, dev-token.py, unlock-sync-job.sh, generate_client_usage_matrix.sh). It is not application code and does not belong to any tier, but it is currently load-bearing: the container image runs bin/entry.sh as its entrypoint, which fetches configuration/secrets at boot.
-
-Two things this task settles:
-1. Record app/bin/ as sanctioned operator/dev tooling (not app runtime code, exempt from the three-tier import rule) in the layers.md non-tier-directories section, so it is not mistaken for a stray package to delete.
-2. entry.sh's boot-time secret/config fetching must be retired once a dedicated secret service capability is introduced (a larger change per decisions/configuration.md and decisions/security.md). This task is the acknowledged tracking item for that deprecation: when the secret service lands, entry.sh stops sourcing secrets itself and the entrypoint is simplified or removed.
-
-Depends on the secret service capability existing; until then this is the placeholder that keeps the coupling visible. Needs a human-approved implementation plan (task-planner) before any code.
+app/bin/ is operator and dev tooling (entry.sh container entrypoint, db.sh, seed.sh, dev-token.py, unlock-sync-job.sh, generate_client_usage_matrix.sh and the CI check scripts), not app runtime code and exempt from the layer contracts; decisions/migration.md's directory table records this. entry.sh is the container entrypoint (Dockerfile:77) and still writes the sre-bot-config and sre-bot-config-infrastructure SSM parameters to .env at start. decisions/configuration.md (Secrets): secrets reach the app as SSM SecureString parameters through task-definition secrets: and no container-start script fetches configuration, so no secret service is built. TASK-111.15.1 removes entry.sh's SSM fetch; TASK-111.15.2 checks AC #3 once that deploy is verified. decisions/migration.md's bin/ row still ties the retirement to a secrets contract implementation and is brought in line.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 layers.md non-tier-directories section classifies app/bin/ as operator/dev tooling exempt from the tier import rule (not a stray package slated for deletion)
-- [ ] #2 The dependency of bin/entry.sh on boot-time secret/config fetching is documented as the trigger to retire it once a secret service capability exists
-- [ ] #3 Once the secret service is available, entry.sh no longer sources secrets itself and the container entrypoint is simplified or removed, with the change verified against the deployment manifest
-- [ ] #4 No new secret-fetching logic is added to app/bin/ after the secret service exists
+- [ ] #1 decisions/migration.md's directory table classifies app/bin/ as operator and dev tooling, exempt from the layer contracts
+- [ ] #2 decisions/migration.md's bin/ row states that entry.sh fetches no configuration and secrets come through task-definition secrets: (decisions/configuration.md), not a secrets contract implementation
+- [x] #3 app/bin/entry.sh fetches no SSM parameter and only starts the app, verified against the running task definition (TASK-111.15.1)
+- [ ] #4 No secret- or configuration-fetching logic exists in app/bin/
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-29 (TASK-111.15.2): AC #3 checked. app/bin/entry.sh no longer exists (deleted by TASK-111.15.1); the image starts uvicorn directly, pinned by tests/unit/bin/test_bin_container_start_contract.py, and 111.15.1's names_only post check passed on the running revision (no blob fetch line). TASK-111.15.2 also removes the IAM read on the blobs. AC #4 is checked by the human with the Done flip, after the blobs are deleted.
+<!-- SECTION:NOTES:END -->

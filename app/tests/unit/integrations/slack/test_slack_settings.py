@@ -1,238 +1,274 @@
-"""Tests for `SlackSettings` and its `get_slack_settings()` provider.
+"""Tests for the Slack vendor slice on the [slack] table and its provider.
 
-Verifies vendor-credential scope (tokens, delivery mode, transport knobs),
-env-var resolution, fail-fast validation for delivery-mode credentials,
-the `@lru_cache` singleton contract, and the absence of domain fields.
+Each test writes a base file and an environment file into tmp_path and installs
+them, so it observes only the values it writes and sets. Every SLACK__ variable
+is removed first and the .env file is disabled unless a test passes its own.
+Failures are read from the ConfigurationError message, which must name the key
+and never carry a token: the rendered traceback is searched for each token value.
 """
 
-from __future__ import annotations
+import re
+import traceback
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
-from structlog.testing import capture_logs
 
-from integrations.slack.settings import SlackSettings, get_slack_settings
+from contracts.configuration import ConfigurationError, ConfigurationSlice, install_configuration_files
+from integrations.slack.settings import SlackSettings, SlackTenant, get_slack_settings
+from server.configuration.loader import TomlConfigurationFiles, load_configuration_files
 
 pytestmark = pytest.mark.unit
 
-
-class TestSlackSettingsFields:
-    """Fields exposed by `SlackSettings`."""
-
-    def test_defaults_resolve_when_env_is_empty(self):
-        settings = SlackSettings()
-
-        assert settings.BOT_TOKEN == ""
-        assert settings.REQUEST_TIMEOUT_SECONDS == 10
-        assert settings.RETRY_MAX_ATTEMPTS == 2
-
-    def test_bot_token_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-real-token")
-
-        settings = SlackSettings()
-
-        assert settings.BOT_TOKEN == "xoxb-real-token"
-
-    def test_request_timeout_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_REQUEST_TIMEOUT_SECONDS", "25")
-
-        settings = SlackSettings()
-
-        assert settings.REQUEST_TIMEOUT_SECONDS == 25
-
-    def test_retry_max_attempts_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_RETRY_MAX_ATTEMPTS", "5")
-
-        settings = SlackSettings()
-
-        assert settings.RETRY_MAX_ATTEMPTS == 5
-
-
-class TestSlackSettingsDeliveryMode:
-    """`SlackSettings` carries delivery-mode credentials and fail-fast validation."""
-
-    def test_enabled_defaults_to_false(self):
-        assert SlackSettings().ENABLED is False
-
-    def test_socket_mode_defaults_to_true(self):
-        assert SlackSettings().SOCKET_MODE is True
-
-    def test_app_token_defaults_to_none(self):
-        assert SlackSettings().APP_TOKEN is None
-
-    def test_signing_secret_defaults_to_none(self):
-        assert SlackSettings().SIGNING_SECRET is None
-
-    def test_enabled_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-token")
-
-        assert SlackSettings().ENABLED is True
-
-    def test_socket_mode_false_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "false")
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
-
-        assert SlackSettings().SOCKET_MODE is False
-
-    def test_app_token_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-real-token")
-
-        assert SlackSettings().APP_TOKEN == "xapp-real-token"
-
-    def test_signing_secret_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_SIGNING_SECRET", "abc123")
-
-        assert SlackSettings().SIGNING_SECRET == "abc123"
-
-
-class TestSlackSettingsUserToken:
-    """Slack user token is a dedicated vendor credential for user-group writes."""
-
-    def test_user_token_defaults_to_empty_string(self):
-        settings = SlackSettings()
-
-        assert settings.USER_TOKEN == ""
-
-    def test_user_token_reads_from_env(self, monkeypatch):
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-user-token")
-
-        settings = SlackSettings()
-
-        assert settings.USER_TOKEN == "xoxp-user-token"
-
-    def test_user_token_does_not_appear_in_repr(self, monkeypatch):
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-user-token")
-
-        settings = SlackSettings()
-        settings_repr = repr(settings)
-
-        assert "USER_TOKEN" not in settings_repr
-        assert "xoxp-user-token" not in settings_repr
-
-    def test_user_token_is_not_coupled_to_transport_validation(self, monkeypatch):
-        monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-user-token")
-        monkeypatch.setenv("SLACK_ENABLED", "false")
-
-        settings = SlackSettings()
-
-        assert settings.ENABLED is False
-        assert settings.USER_TOKEN == "xoxp-user-token"
-
-
-class TestSlackSettingsFailFast:
-    """Fail-fast validation fires when enabled but required credentials are absent."""
-
-    def test_socket_mode_enabled_without_app_token_raises(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "true")
-
-        with pytest.raises(Exception, match="SLACK_APP_TOKEN"):
-            SlackSettings()
-
-    def test_http_events_enabled_without_signing_secret_raises(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "false")
-        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-x")
-
-        with pytest.raises(Exception, match="SLACK_SIGNING_SECRET"):
-            SlackSettings()
-
-    def test_disabled_skips_credential_validation(self):
-        # No APP_TOKEN or SIGNING_SECRET — should not raise because ENABLED=false.
-        settings = SlackSettings(SLACK_ENABLED=False)
-
-        assert settings.ENABLED is False
-
-    def test_socket_mode_enabled_with_app_token_is_valid(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-token")
-
-        settings = SlackSettings()
-
-        assert settings.ENABLED is True
-        assert settings.SOCKET_MODE is True
-
-    def test_http_events_enabled_with_signing_secret_is_valid(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "false")
-        monkeypatch.setenv("SLACK_SIGNING_SECRET", "hex-secret")
-
-        settings = SlackSettings()
-
-        assert settings.SOCKET_MODE is False
-
-
-class TestSlackSettingsSocketModeSigningSecretNotice:
-    """Socket Mode surfaces missing signing-secret readiness as an info notice."""
-
-    def test_enabled_socket_mode_without_signing_secret_logs_info_notice(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "true")
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-token")
-
-        with capture_logs() as entries:
-            settings = SlackSettings()
-
-        assert settings.ENABLED is True
-        assert settings.SOCKET_MODE is True
-        notice_entries = [entry for entry in entries if entry.get("event") == "slack_signing_secret_not_set_in_socket_mode"]
-        assert notice_entries
-        assert notice_entries[0].get("log_level") == "info"
-
-    def test_enabled_socket_mode_with_signing_secret_logs_no_notice(self, monkeypatch):
-        monkeypatch.setenv("SLACK_ENABLED", "true")
-        monkeypatch.setenv("SLACK_SOCKET_MODE", "true")
-        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-token")
-        monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret")
-
-        with capture_logs() as entries:
-            settings = SlackSettings()
-
-        assert settings.ENABLED is True
-        assert settings.SOCKET_MODE is True
-        notice_entries = [entry for entry in entries if entry.get("event") == "slack_signing_secret_not_set_in_socket_mode"]
-        assert notice_entries == []
-
-    def test_disabled_socket_mode_without_signing_secret_logs_no_notice(self):
-        with capture_logs() as entries:
-            settings = SlackSettings(SLACK_ENABLED=False)
-
-        assert settings.ENABLED is False
-        notice_entries = [entry for entry in entries if entry.get("event") == "slack_signing_secret_not_set_in_socket_mode"]
-        assert notice_entries == []
-
-
-class TestSlackSettingsScope:
-    """`SlackSettings` carries vendor transport fields only; domain fields are absent."""
-
-    @pytest.mark.parametrize(
-        "field",
-        [
-            "INCIDENT_CHANNEL",
-            "SLACK_SECURITY_USER_GROUP_ID",
-            "SLACK_NOTIFY_MGMT_USER_GROUP_ID",
-        ],
+BOT_TOKEN = "xoxb-secret-bot-0001"
+USER_TOKEN = "xoxp-secret-user-0001"
+APP_TOKEN = "xapp-secret-app-0001"
+SIGNING_SECRET = "secret-signing-0001"
+
+_SECRETS = {
+    "SLACK__BOT_TOKEN": BOT_TOKEN,
+    "SLACK__USER_TOKEN": USER_TOKEN,
+    "SLACK__APP_TOKEN": APP_TOKEN,
+    "SLACK__SIGNING_SECRET": SIGNING_SECRET,
+}
+
+_TENANT = '[slack.tenant]\nteam_id = "T0TENANT"\n'
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Clear the slice's variables, the .env file and the cached singleton."""
+    for name in (*_SECRETS, "SLACK__TENANT__TEAM_ID", "SLACK__COMMAND_PREFIX"):
+        monkeypatch.delenv(name, raising=False)
+    for field in SlackSettings.model_fields:
+        monkeypatch.delenv(f"SLACK__{field.upper()}", raising=False)
+    monkeypatch.setitem(SlackSettings.model_config, "env_file", None)
+    get_slack_settings.cache_clear()
+    yield
+    get_slack_settings.cache_clear()
+
+
+def _install(tmp_path: Path, base: str = "[slack]\n", environment: str = "") -> None:
+    (tmp_path / "base.toml").write_text(base, encoding="utf-8")
+    (tmp_path / "local.toml").write_text(environment, encoding="utf-8")
+    install_configuration_files(
+        TomlConfigurationFiles(environment="local", paths=(tmp_path / "base.toml", tmp_path / "local.toml"))
     )
-    def test_domain_fields_are_absent(self, field):
-        assert not hasattr(SlackSettings(), field)
 
 
-class TestGetSlackSettingsProvider:
-    """`get_slack_settings()` caches a single instance per process."""
+def _rendered(error: BaseException) -> str:
+    return "".join(traceback.format_exception(error))
 
-    def test_returns_a_slacksettings_instance(self):
-        assert isinstance(get_slack_settings(), SlackSettings)
 
-    def test_is_a_singleton_across_calls(self):
-        first = get_slack_settings()
-        second = get_slack_settings()
+def test_slack_settings_is_a_slice_on_the_slack_table() -> None:
+    """The slice reads the [slack] table with the SLACK__ prefix and rejects unknown keys."""
+    config = SlackSettings.model_config
 
-        assert first is second
+    assert issubclass(SlackSettings, ConfigurationSlice)
+    assert config.get("toml_table_header") == ("slack",)
+    assert config.get("env_prefix") == "SLACK__"
+    assert config.get("extra") == "forbid"
 
-    def test_cache_clear_yields_a_fresh_instance(self):
-        first = get_slack_settings()
-        get_slack_settings.cache_clear()
-        second = get_slack_settings()
 
-        assert first is not second
+@pytest.mark.parametrize("field", list(SlackSettings.model_fields))
+def test_slack_settings_fields_have_no_alias(field: str) -> None:
+    """Every field is read only under its SLACK__<FIELD> name or file key: no alias widens it."""
+    info = SlackSettings.model_fields[field]
+
+    assert info.alias is None
+    assert info.validation_alias is None
+
+
+def test_slack_settings_reads_non_secret_values_from_the_slack_table(tmp_path: Path) -> None:
+    """Timeouts, the retry budget and the error-code lists come from [slack], the environment file over the base."""
+    _install(
+        tmp_path,
+        base='[slack]\nrequest_timeout_seconds = 25\nretry_max_attempts = 5\nnot_found_errors = ["base_missing"]\n',
+        environment='[slack]\nretry_max_attempts = 7\ntransient_errors = ["env_transient"]\n',
+    )
+
+    settings = SlackSettings()
+
+    assert settings.request_timeout_seconds == 25
+    assert settings.retry_max_attempts == 7
+    assert settings.not_found_errors == ["base_missing"]
+    assert settings.transient_errors == ["env_transient"]
+
+
+def test_slack_settings_defaults_equal_the_base_file() -> None:
+    """The field defaults match the checked-in base.toml [slack] values, so neither drifts."""
+    from_files = SlackSettings()
+    defaults = {name: info.get_default(call_default_factory=True) for name, info in SlackSettings.model_fields.items()}
+
+    assert from_files.model_dump() == defaults
+
+
+def test_slack_settings_reads_the_tenant_from_the_tenant_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """[slack.tenant] team_id builds the frozen tenant entry; the bot token comes from SLACK__BOT_TOKEN."""
+    monkeypatch.setenv("SLACK__BOT_TOKEN", BOT_TOKEN)
+    _install(tmp_path, environment=_TENANT)
+
+    settings = SlackSettings()
+
+    assert settings.tenant == SlackTenant(team_id="T0TENANT")
+    assert settings.tenant.tenant_id == "T0TENANT"
+    assert settings.bot_token.get_secret_value() == BOT_TOKEN
+
+
+def test_slack_settings_reads_every_secret_from_its_slack_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tokens and the signing secret are read as SLACK__<FIELD> and stay out of the repr."""
+    for name, value in _SECRETS.items():
+        monkeypatch.setenv(name, value)
+    _install(tmp_path, environment=_TENANT)
+
+    settings = SlackSettings()
+
+    assert (
+        settings.bot_token.get_secret_value(),
+        settings.user_token.get_secret_value(),
+        settings.app_token.get_secret_value() if settings.app_token else None,
+        settings.signing_secret.get_secret_value() if settings.signing_secret else None,
+    ) == (
+        BOT_TOKEN,
+        USER_TOKEN,
+        APP_TOKEN,
+        SIGNING_SECRET,
+    )
+    for value in _SECRETS.values():
+        assert value not in repr(settings)
+
+
+def test_slack_settings_without_tenant_or_secrets_is_unconfigured(tmp_path: Path) -> None:
+    """No tenant entry and no secret is an unconfigured Slack: it builds with empty credentials."""
+    _install(tmp_path)
+
+    settings = SlackSettings()
+
+    assert settings.tenant is None
+    assert settings.bot_token.get_secret_value() == ""
+    assert settings.user_token.get_secret_value() == ""
+    assert settings.app_token is None
+    assert settings.signing_secret is None
+
+
+def test_slack_settings_empty_secrets_count_as_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank SLACK__<FIELD> values, as the test run sets them, are absent and fail no rule."""
+    for name in _SECRETS:
+        monkeypatch.setenv(name, "")
+    _install(tmp_path)
+
+    settings = SlackSettings()
+
+    assert settings.app_token is None
+    assert settings.signing_secret is None
+
+
+def test_slack_settings_tenant_without_the_bot_token_fails_naming_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tenant entry needs the bot token: every Slack call is made with it."""
+    monkeypatch.setenv("SLACK__APP_TOKEN", APP_TOKEN)
+    _install(tmp_path, environment=_TENANT)
+
+    with pytest.raises(ConfigurationError, match="SLACK__BOT_TOKEN is required when \\[slack.tenant\\] is set") as raised:
+        SlackSettings()
+
+    assert APP_TOKEN not in _rendered(raised.value)
+
+
+@pytest.mark.parametrize("name", list(_SECRETS))
+def test_slack_settings_secret_without_the_tenant_fails_naming_the_key(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any Slack secret set without a tenant entry is a half-configured Slack and fails naming the secret."""
+    monkeypatch.setenv(name, _SECRETS[name])
+    _install(tmp_path)
+
+    with pytest.raises(ConfigurationError, match=f"{name} is set but \\[slack.tenant\\] team_id is not") as raised:
+        SlackSettings()
+
+    assert _SECRETS[name] not in _rendered(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("environment", "location"),
+    [
+        ("[slack]\nunknown_key = 1\n", "[slack] unknown_key"),
+        ('[slack.tenant]\nteam_id = "T0TENANT"\nunknown_key = 1\n', "[slack] tenant.unknown_key"),
+        ('[slack.tenant]\nteam_id = "   "\n', "[slack] tenant.team_id"),
+    ],
+)
+def test_slack_settings_invalid_file_entry_fails_naming_file_table_and_key(
+    environment: str, location: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown key in [slack] or [slack.tenant], or a blank team id, fails naming where to fix it."""
+    monkeypatch.setenv("SLACK__BOT_TOKEN", BOT_TOKEN)
+    _install(tmp_path, environment=environment)
+
+    with pytest.raises(ConfigurationError, match=re.escape(location)) as raised:
+        SlackSettings()
+
+    assert str(tmp_path / "local.toml") in str(raised.value)
+
+
+def test_slack_settings_strips_the_team_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Surrounding whitespace is not part of the opaque workspace id."""
+    monkeypatch.setenv("SLACK__BOT_TOKEN", BOT_TOKEN)
+    _install(tmp_path, environment='[slack.tenant]\nteam_id = " T0TENANT "\n')
+
+    assert SlackSettings().tenant == SlackTenant(team_id="T0TENANT")
+
+
+def test_slack_settings_tenant_entry_is_frozen() -> None:
+    """The tenant entry is a value: it cannot be changed after the slice is built."""
+    tenant = SlackTenant(team_id="T0TENANT")
+
+    with pytest.raises(ValueError, match="frozen"):
+        tenant.team_id = "T0OTHER"  # type: ignore[misc]
+
+
+def test_slack_settings_command_prefix_does_not_fail_the_slice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SLACK__COMMAND_PREFIX, still set by the production task definition, is not a [slack] key and is ignored."""
+    monkeypatch.setenv("SLACK__COMMAND_PREFIX", "dev-")
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SLACK__COMMAND_PREFIX=dev-\n", encoding="utf-8")
+    _install(tmp_path)
+
+    settings = SlackSettings(_env_file=dotenv)  # type: ignore[call-arg]
+
+    assert settings.tenant is None
+    assert "command_prefix" not in SlackSettings.model_fields
+
+
+def test_slack_settings_local_shape_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The checked-in local.toml tenant with Codespaces-style SLACK__ tokens is a configured development Slack."""
+    monkeypatch.setenv("SLACK__BOT_TOKEN", BOT_TOKEN)
+    monkeypatch.setenv("SLACK__APP_TOKEN", APP_TOKEN)
+    install_configuration_files(load_configuration_files("local"))
+
+    settings = SlackSettings()
+
+    assert settings.tenant is not None
+    assert settings.app_token is not None
+    assert settings.app_token.get_secret_value() == APP_TOKEN
+
+
+def test_slack_settings_transport_switches_are_not_fields() -> None:
+    """Whether and how the transport runs is the [slack_transport] slice's, not this one's."""
+    assert "enabled" not in SlackSettings.model_fields
+    assert "socket_mode" not in SlackSettings.model_fields
+
+
+@pytest.mark.parametrize("field", ["INCIDENT_CHANNEL", "SLACK_SECURITY_USER_GROUP_ID", "SLACK_NOTIFY_MGMT_USER_GROUP_ID"])
+def test_slack_settings_domain_fields_are_absent(field: str) -> None:
+    """Feature ids (channels, user groups) live with the consuming feature."""
+    assert field.lower() not in SlackSettings.model_fields
+
+
+def test_get_slack_settings_is_a_singleton_until_cleared() -> None:
+    """The provider caches one instance per process; clearing the cache builds a fresh one."""
+    first = get_slack_settings()
+
+    assert get_slack_settings() is first
+    get_slack_settings.cache_clear()
+    assert get_slack_settings() is not first

@@ -6,19 +6,22 @@ Covers:
   F-03  POLICY_NOT_FOUND and ADAPTER_NOT_FOUND errors surface correctly
   F-04  dry_run returns planned actions without executing them
   F-05  UNSUPPORTED_OPERATION from adapter sets requires_manual_action
+  F-06  A group-discovery IDP failure aborts sync instead of syncing an
+        empty rule set (TASK-78)
 """
 
 from typing import Any
 
 import pytest
 
+from contracts.operations import OperationResult, OperationStatus
 from infrastructure.directory.models import (
     DirectoryGroup,
     DirectoryMember,
     MembershipCheckResult,
 )
-from infrastructure.operations import OperationResult, OperationStatus
 from packages.access.common.config import AccessRuntimeConfig, PlatformPolicy
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.sync.application import AccessSyncApplicationService
 from packages.access.sync.desired_state import DirectoryMembershipBuilder
 from packages.access.sync.domain import (
@@ -219,11 +222,13 @@ class FakeDirectory:
         is_member: bool = True,
         groups: set[str] | None = None,
         user_group_slugs: set[str] | None = None,
+        list_groups_result: OperationResult | None = None,
     ) -> None:
         self._is_member = is_member
         self._per_group: dict[str, bool] = {}
         self._groups: set[str] = groups or set()
         self._user_group_slugs: set[str] | None = user_group_slugs
+        self._list_groups_result = list_groups_result
 
     def set_membership(self, group_slug: str, value: bool) -> None:
         self._per_group[group_slug] = value
@@ -244,7 +249,8 @@ class FakeDirectory:
             ]
         )
 
-    def get_group(self, slug: str) -> OperationResult:
+    def get_group(self, group_key: str) -> OperationResult:
+        slug = group_key.partition("@")[0]
         return OperationResult.success(
             data=DirectoryGroup(
                 group_email=f"{slug}@example.com",
@@ -287,6 +293,8 @@ class FakeDirectory:
         return OperationResult.success(data=mapping)
 
     def list_groups(self, query: str = "") -> OperationResult:
+        if self._list_groups_result is not None:
+            return self._list_groups_result
         matching = [
             DirectoryGroup(
                 group_email=f"{slug}@example.com",
@@ -307,11 +315,13 @@ def make_coordinator(
     user_exists: bool = True,
     adapter: FakeAdapter | None = None,
     discovered_groups: set[str] | None = None,
+    list_groups_result: OperationResult | None = None,
 ) -> tuple:
     if adapter is None:
         adapter = FakeAdapter(current_entitlement_ids=current_ids or set(), user_exists=user_exists)
     config = AccessRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         platforms={
             platform: PlatformPolicy(
                 authn_token="authn",
@@ -325,12 +335,13 @@ def make_coordinator(
         is_member=is_member,
         groups=discovered_groups or set(),
         user_group_slugs=user_group_slugs,
+        list_groups_result=list_groups_result,
     )
     directory_provider: Any = directory
     coordinator = AccessSyncApplicationService(
         adapters={platform: adapter},
         config=config,
-        membership_builder=DirectoryMembershipBuilder(directory_provider),
+        membership_builder=DirectoryMembershipBuilder(directory_provider, ManagedGroupPolicy.from_config(config)),
     )
     return coordinator, adapter
 
@@ -394,13 +405,14 @@ def test_sync_user_policy_not_found():
 def test_sync_user_adapter_not_found():
     config = AccessRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         platforms={"aws": PlatformPolicy()},
     )
     directory_provider: Any = FakeDirectory()
     coordinator = AccessSyncApplicationService(
         adapters={},
         config=config,
-        membership_builder=DirectoryMembershipBuilder(directory_provider),
+        membership_builder=DirectoryMembershipBuilder(directory_provider, ManagedGroupPolicy.from_config(config)),
     )
     result = coordinator.sync_user("alice@example.com", "aws")
     assert not result.is_success
@@ -461,3 +473,42 @@ def test_sync_platform_unknown_platform_returns_error():
     result = coordinator.sync_platform("nonexistent")
     assert not result.is_success
     assert result.error_code == "POLICY_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# F-06 Group-discovery IDP failure aborts sync
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_sync_user_propagates_error_when_group_discovery_fails():
+    coordinator, adapter = make_coordinator(
+        discovered_groups={"sg-aws-admin"},
+        list_groups_result=OperationResult.error(
+            OperationStatus.TRANSIENT_ERROR,
+            message="rate limited",
+            error_code="429",
+        ),
+    )
+    result = coordinator.sync_user("alice@example.com", "aws")
+    assert not result.is_success
+    assert result.status == OperationStatus.TRANSIENT_ERROR
+    assert result.error_code == "429"
+    assert adapter.calls == []
+
+
+@pytest.mark.unit
+def test_sync_platform_propagates_error_when_group_discovery_fails():
+    coordinator, adapter = make_coordinator(
+        discovered_groups={"sg-aws-admin"},
+        list_groups_result=OperationResult.error(
+            OperationStatus.TRANSIENT_ERROR,
+            message="rate limited",
+            error_code="429",
+        ),
+    )
+    result = coordinator.sync_platform("aws")
+    assert not result.is_success
+    assert result.status == OperationStatus.TRANSIENT_ERROR
+    assert result.error_code == "429"
+    assert adapter.calls == []

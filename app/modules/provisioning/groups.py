@@ -1,10 +1,70 @@
 from structlog import get_logger
 
-from integrations.aws import identity_store
-from integrations.google_workspace import google_directory
+from infrastructure.directory import get_directory_provider
+from infrastructure.directory.models import DirectoryGroupWithMembers, DirectoryUser
+from modules.provisioning import users
+from packages.aws_platform.adapters.identity_center import build_identity_center_adapter
 from utils import filters
 
 logger = get_logger()
+
+
+class DirectoryGroupsUnavailableError(Exception):
+    """Raised when a directory provider cannot supply the group list."""
+
+    def __init__(self, message: str | None, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+
+
+def _google_groups_to_legacy_shape(
+    provider_groups: tuple[DirectoryGroupWithMembers, ...],
+    directory_users: list[DirectoryUser],
+    log,
+) -> list[dict]:
+    user_by_email = {user.email.lower(): user for user in directory_users}
+    legacy_groups: list[dict] = []
+
+    for provider_group in provider_groups:
+        resolved_members: list[dict] = []
+        for member in provider_group.members:
+            member_email = (member.email or "").lower()
+            matched_user = user_by_email.get(member_email)
+            if matched_user is None:
+                log.warning(
+                    "google_group_member_unresolved",
+                    group_email=provider_group.group.group_email,
+                    member_email=member_email,
+                )
+                continue
+            resolved_members.append(
+                {
+                    "primaryEmail": matched_user.email,
+                    "email": matched_user.email,
+                    "name": {
+                        "givenName": matched_user.given_name or "",
+                        "familyName": matched_user.family_name or "",
+                    },
+                }
+            )
+
+        if not resolved_members:
+            log.warning(
+                "google_group_dropped_no_resolvable_members",
+                group_email=provider_group.group.group_email,
+            )
+            continue
+
+        legacy_groups.append(
+            {
+                "email": provider_group.group.group_email,
+                "name": provider_group.group.name or "",
+                "members": resolved_members,
+            }
+        )
+
+    return legacy_groups
 
 
 def get_groups_from_integration(
@@ -12,7 +72,6 @@ def get_groups_from_integration(
     pre_processing_filters: list | None = None,
     post_processing_filters: list | None = None,
     query: str | None = None,
-    return_dataframe: bool = False,
 ) -> list:
     """Retrieve the users from an integration group source.
     Supported sources are:
@@ -24,7 +83,6 @@ def get_groups_from_integration(
         pre_processing_filters (list, optional): A list of filters to apply before processing the groups. Defaults to [].
         post_processing_filters (list, optional): A list of filters to apply after processing the groups. Defaults to [].
         query (str, optional): A query to filter the groups. Defaults to None.
-        return_dataframe (bool, optional): Return the groups as a DataFrame. Defaults to False.
 
     Returns:
         list: A list of groups with members, empty list if no groups are found.
@@ -42,7 +100,6 @@ def get_groups_from_integration(
     members = None
     members_display_key = None
     integration_name = integration_source
-    groups_dataframe = None
     match integration_source:
         case "google_groups":
             log.info(
@@ -50,12 +107,29 @@ def get_groups_from_integration(
                 service="Google Groups",
                 query=query,
             )
-            groups = google_directory.list_groups_with_members(
-                groups_filters=pre_processing_filters,
-                query=query,
-            )
-            if return_dataframe:
-                groups_dataframe = google_directory.convert_google_groups_members_to_dataframe(groups)
+            result = get_directory_provider().list_groups_with_members(query=query or "")
+            if not result.is_success:
+                log.error(
+                    "list_groups_with_members_failed",
+                    error_code=result.error_code,
+                    error=result.message,
+                )
+                raise DirectoryGroupsUnavailableError(result.message, result.error_code)
+
+            if result.data is not None:
+                for failure in result.data.failures:
+                    log.warning(
+                        "google_group_list_failed",
+                        group_email=failure.group_email,
+                        status=failure.status.name,
+                        error_code=failure.error_code,
+                        message=failure.message,
+                    )
+
+                directory_users = users.get_users_from_integration("google_directory")
+                groups = _google_groups_to_legacy_shape(result.data.groups, directory_users, log)
+                for filter in pre_processing_filters:
+                    groups = filters.filter_by_condition(groups, filter)
             integration_name = "Google"
             group_display_key = "name"
             members = "members"
@@ -65,11 +139,17 @@ def get_groups_from_integration(
                 "get_groups_from_integration_started",
                 service="AWS Identity Center",
             )
-            groups = identity_store.list_groups_with_memberships(
+            aws_result = build_identity_center_adapter().list_groups_with_memberships(
                 groups_filters=pre_processing_filters,
             )
-            if return_dataframe:
-                groups_dataframe = identity_store.convert_aws_groups_members_to_dataframe(groups)
+            if not aws_result.is_success:
+                log.error(
+                    "list_groups_with_memberships_failed",
+                    error_code=aws_result.error_code,
+                    error=aws_result.message,
+                )
+                raise DirectoryGroupsUnavailableError(aws_result.message, aws_result.error_code)
+            groups = aws_result.data or []
             integration_name = "AWS"
             group_display_key = "DisplayName"
             members = "GroupMemberships"
@@ -87,7 +167,7 @@ def get_groups_from_integration(
         members_display_key=members_display_key,
         integration_name=integration_name,
     )
-    return groups_dataframe if groups_dataframe is not None else groups
+    return groups
 
 
 def log_groups(

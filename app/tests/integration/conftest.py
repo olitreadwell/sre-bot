@@ -9,7 +9,29 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from server.server import handler
+from server.server import create_app
+
+_FAKE_ASSUMED_CREDENTIALS = {
+    "AccessKeyId": "ASIATESTASSUMEDKEY",
+    "SecretAccessKey": "test-assumed-secret",
+    "SessionToken": "test-assumed-session-token",
+}
+
+
+@pytest.fixture(autouse=True)
+def _autouse_stub_aws_assume_role(monkeypatch):
+    """Stub the AWS AssumeRole seam so no integration test reaches STS.
+
+    Integration tests boot the real lifespan and feature warmups; a client
+    built with a role ARN would otherwise call ``sts.assume_role`` for real.
+    The seam ``integrations.aws.client._assume_role_credentials`` returns
+    static temporary credentials instead, and the factory builds an ordinary
+    boto3 session from them. Tests of the seam itself live under tests/unit.
+    """
+    monkeypatch.setattr(
+        "integrations.aws.client._assume_role_credentials",
+        lambda sts, role_arn, session_name: dict(_FAKE_ASSUMED_CREDENTIALS),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -103,11 +125,7 @@ def mock_settings(make_mock_settings):
 
     Uses the factory from root conftest to avoid duplication.
     """
-    return make_mock_settings(
-        **{
-            "idempotency.IDEMPOTENCY_TTL_SECONDS": 3600,
-        }
-    )
+    return make_mock_settings()
 
 
 # ============================================================================
@@ -116,7 +134,7 @@ def mock_settings(make_mock_settings):
 
 
 @pytest.fixture
-def app_with_lifespan(monkeypatch):
+def app_with_lifespan(monkeypatch, static_aws_credentials):
     """Provide a real FastAPI app instance with lifespan context.
 
     This fixture exercises the full app initialization lifecycle including:
@@ -144,7 +162,7 @@ def app_with_lifespan(monkeypatch):
     )
 
     # Create client which triggers lifespan context manager
-    with TestClient(handler) as client:
+    with TestClient(create_app()) as client:
         yield client
 
 

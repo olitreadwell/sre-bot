@@ -4,19 +4,17 @@ from datetime import datetime, timedelta
 from slack_sdk import WebClient
 from structlog import get_logger
 
-from infrastructure.configuration.integrations.google import get_google_resources_config
-from integrations.google_workspace.google_calendar import (
-    find_first_available_slot,
+from features.incident.postmortem.settings import get_incident_postmortem_settings
+from features.incident.scheduling.adapters.google_calendar import (
     get_freebusy,
-    identify_unavailable_users,
     insert_event,
+)
+from features.incident.scheduling.availability import (
+    find_first_available_slot,
+    identify_unavailable_users,
 )
 from integrations.slack import channels as slack_channels
 from modules.incident import incident_conversation
-
-google_resources = get_google_resources_config()
-
-CALENDAR_ID = google_resources.sre_calendar_id
 
 logger = get_logger()
 
@@ -338,7 +336,7 @@ def save_retro_event(
         first_available_end.isoformat(),
         user_emails,
         "Retro " + incident_name,
-        calendar_id=CALENDAR_ID,
+        calendar_id=get_incident_postmortem_settings().calendar_id,
         incident_document=incident_document,
         **event_config,
     )

@@ -1,0 +1,31 @@
+# Overrides of base.toml for ENVIRONMENT=local, key by key.
+# Never put a secret here: secrets come from the environment as <SLICE>__<FIELD>.
+
+[slack.tenant]
+# The workspace of the development Slack app every development environment shares
+# (its tokens are the repository's Codespaces secrets SLACK__BOT_TOKEN and SLACK__APP_TOKEN).
+team_id = "T2G2S06PM"
+
+[slack_transport]
+enabled = true
+command_prefix = "dev-"
+
+[notify_api_key_leak]
+channel_id = "C033L7RGCT0"
+oncall_group_id = ""
+
+[atip]
+announce_channel_id = "C033L7RGCT0"
+
+[openai.tenant]
+# The model gateway every development environment shares; its key is the repository's Codespaces secret OPENAI__API_KEY.
+base_url = "https://ai.cdssandbox.xyz"
+model = "gpt-5.6-luna"
+
+[opsgenie.tenant]
+# The region of the account whose development key is the repository's Codespaces secret OPSGENIE__INTEGRATIONS_KEY.
+api_url = "https://api.opsgenie.com"
+
+[maxmind.tenant]
+# The database the devcontainer downloads (.devcontainer/maxmind-create.sh).
+database_path = "./geodb/GeoLite2-City.mmdb"

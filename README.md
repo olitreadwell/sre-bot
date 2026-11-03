@@ -2,7 +2,7 @@
 
 ![SRE Bot Logo](https://user-images.githubusercontent.com/867334/156588127-aaae9fff-cd4b-4984-90f0-4d74dfaf4993.png)
 
-**SRE Bot** is a Slack bot designed for site reliability engineering at CDS. It automates incident management, integrates with cloud and collaboration platforms, and streamlines SRE workflows for modern teams.
+**SRE Bot** is CDS's internal operations platform, delivered as a Slack bot. Incident response is its first-class area; it also covers cloud operations, platform access and a set of workplace utilities (see `decisions/product-scope.md`), integrating with cloud and collaboration platforms.
 
 Note: This project is currently undergoing a large refactor to improve maintainability and add new features.
 
@@ -122,6 +122,30 @@ This project uses [Visual Studio Code Remote - Containers](https://code.visualst
 The authoritative architecture records live in [`decisions/`](decisions/README.md). Start with [`decisions/README.md`](decisions/README.md) for the reading order and record index.
 
 The legacy `docs/adr/` folder has been removed; its historical content is available in git history.
+
+---
+
+## AI Coding Agents
+
+This repo is configured for Claude Code and GitHub Copilot from one shared source
+of truth, so every model behaves the same way.
+
+- **[`CLAUDE.md`](CLAUDE.md)** — the always-on engineering contract. Claude Code
+  loads it natively; VS Code loads it for *every* model via `chat.useClaudeMdFile`.
+- **[`.claude/skills/`](.claude/skills/)** — knowledge and workflow skills, read by
+  both tools (`chat.useClaudeSkills`). Run a workflow with `/plan-task`,
+  `/tdd-implementation`, `/tests-creation`, `/feature-architecture`,
+  `/architecture-review`, `/groom-backlog`, `/python-quality-gates`.
+- **[`.github/copilot-instructions.md`](.github/copilot-instructions.md)** — Copilot
+  policy delta: the **model cost tiers** every agent is pinned to, plus agent routing.
+- **Agents** — [`.claude/agents/`](.claude/agents/) (Claude Code) and
+  [`.github/agents/`](.github/agents/) (Copilot). Same six roles, per-tool
+  frontmatter: `codebase-researcher` → `architecture` → `feature-architecture` →
+  `task-planner` → `tests-creation` → `implementation`.
+
+Agents are pinned to low/medium-cost models only; Tier H models (Opus, GPT-5.5,
+GPT-6, Fable) require explicit human approval. Read-only surveys are delegated to
+the Tier L `codebase-researcher` so file dumps never enter an expensive session.
 
 ---
 

@@ -13,22 +13,24 @@ from infrastructure.directory import get_directory_provider
 from infrastructure.events import (
     get_event_dispatcher,
 )
-from infrastructure.storage import get_storage_service
+from infrastructure.records import get_record_store
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.common.providers import get_access_runtime_config
-from packages.access.common.settings import AccessRequestsSettings, get_access_settings
+from packages.access.common.settings import AccessRequestsSettings
 from packages.access.request.service import AccessRequestService
 from packages.access.request.store import AccessRequestRepository
 
 
+@lru_cache(maxsize=1)
 def get_access_request_settings() -> AccessRequestsSettings:
-    """Return the requests settings slice from the unified access settings."""
-    return get_access_settings().requests
+    """Return the singleton access.request settings; fails without a fallback approver slug."""
+    return AccessRequestsSettings()
 
 
 @lru_cache(maxsize=1)
 def get_access_request_repository() -> AccessRequestRepository:
     """Return the singleton AccessRequestRepository instance."""
-    return AccessRequestRepository(storage=get_storage_service())
+    return AccessRequestRepository(storage=get_record_store(), table_name=get_access_request_settings().table_name)
 
 
 @lru_cache(maxsize=1)
@@ -39,11 +41,13 @@ def get_access_request_service() -> AccessRequestService:
     feature settings into a single fully-assembled service instance.
     """
     settings = get_access_request_settings()
+    runtime_config = get_access_runtime_config()
     return AccessRequestService(
         repository=get_access_request_repository(),
         directory=get_directory_provider(),
-        runtime_config=get_access_runtime_config(),
+        runtime_config=runtime_config,
         dispatcher=get_event_dispatcher(),
+        policy=ManagedGroupPolicy.from_config(runtime_config),
         fallback_approver_slug=settings.fallback_approver_slug,
         min_approver_count=settings.min_approver_count,
     )

@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-07 19:56'
-updated_date: '2026-08-05 16:15'
+updated_date: '2026-09-24 20:10'
 labels:
   - clients
   - phase-3
@@ -20,6 +20,7 @@ references:
   - decisions/operation-result.md
   - decisions/sdk-typing.md
   - 'https://github.com/cds-snc/sre-bot/issues/1279'
+  - decisions/plugin-architecture.md
 priority: high
 ordinal: 25000
 ---
@@ -106,5 +107,35 @@ AWS remainder decomposed into a real subtask TASK-25.2 (coordinator) + TASK-25.2
 created: 2026-08-05 16:15
 ---
 DECOMPOSED 2026-08-05 (full-coverage pass, prompted by re-verifying TASK-22.3 downstream). Created the three remaining subtasks that were only umbrella-level prose before: TASK-25.3 (MaxMind unification + 2 legacy tuple consumers), TASK-25.4 (Slack classify_slack_error + factory), TASK-25.5 (AWSShield deletion). KEY CORRECTION found while grounding TASK-25.5: integrations/aws/shield.py::AWSShield has ZERO production consumers (repo-wide grep) - only its own dedicated test files reference it. This contradicts the 'AWSShield feeds remaining AWS services' framing in this task's original Description and comment #2 - the AWS remainder (TASK-25.2.x) actually routes entirely through integrations/aws/client.py's execute_aws_api_call dispatcher, never through AWSShield. TASK-25.5 is therefore a straight deletion (shield.py + 3 test files), not a consumer migration, and is independent of every other subtask (no shared files) - safe to schedule anytime, no dependency added. TASK-25.3/25.4 kept dependent on TASK-22.5+TASK-23 per this task's existing prerequisite framing. Full REMAINING SCOPE section rewritten via --plan to reference the real IDs instead of 'not yet decomposed' placeholders.
+---
+
+created: 2026-09-02 15:06
+---
+GOOGLE REMAINDER - ENDSTATE RESTATED AND TASK-25.1.6 DECOMPOSED (2026-09-02, human-directed, after assessing the shipped TASK-25.1.1/.2/.3/.4/.5 slices against decisions/outbound-clients.md and decisions/sdk-typing.md).
+
+FINDING: those slices removed the execute_google_api_call dispatcher but kept the per-method wrapper module per Google surface. decisions/sdk-typing.md item 1 retires BOTH ("the generic dispatcher and the per-method wrapper module"), so this umbrella's AC#1 ("each vendor package exports exactly: factories, classify_<vendor>_error, settings") is currently NOT satisfiable for google_workspace, which still has six mirror modules plus google_service.py. AC#2 ("no client returns OperationResult") is also open for that vendor: client.py::execute_batch_request returns OperationResult from inside the vendor package. AC#5 ("no hand-rolled retry in app/integrations/") is open too: integrations/utils/api.py::retry_request is a time.sleep loop called from google_directory.py. This umbrella cannot close on the current state - which is the correct outcome; the gate worked.
+
+NOT A PLANNING FAILURE IN SEQUENCING: 16 legacy app/modules/* consumers have no adapter tier, so inlining classification would have meant building six feature adapters inside a dispatcher-removal PR. The slices were correctly sized. What was missing is that nothing marked the mirror modules themselves as temporary. TASK-25.1's Description now carries an explicit ENDSTATE section saying integrations/google_workspace/ ends as client.py + settings and that the six modules are a strangler seam, not the destination.
+
+ACTIONS TAKEN: TASK-25.1.6 retitled to "Retire the Google Workspace vendor mirror layer", raised to high priority, converted to a coordinator with no direct implementation, and decomposed into eleven children (characterization-test gate, pure-helper relocation, three Directory slices, the incident_draft adapter Docs half, four legacy-incident adapter slices, and a final helper-deletion + CI-guardrail slice). The last of those adds a machine check so app/integrations/<vendor>/ cannot regrow non-factory/non-classification modules - this convention proved too expensive to re-establish by memory.
+
+DIRECTORY DECISION (human): infrastructure/directory's DirectoryProvider / GoogleDirectoryProvider survives; integrations/google_workspace/google_directory.py is deleted; the four legacy consumers migrate onto the Protocol. That also retires retry_request and satisfies AC#5 for the Google vendor.
+
+APPLIES TO THE OTHER VENDORS TOO: TASK-25.2.x (AWS) is migrating the same way - off execute_aws_api_call and onto integrations/aws primitives - and risks landing the same per-method mirror layer under integrations/aws/. Read TASK-25.1's ENDSTATE section before planning any remaining TASK-25.2.x slice, and state per slice whether the vendor module survives or the call sites move into adapters. TASK-25.4 (Slack) is net-new contract application and should be written to the endstate directly rather than through an intermediate mirror.
+---
+
+created: 2026-09-14 15:27
+---
+2026-09-14 progress: TASK-25.2.3 is Done (Identity Center adapter + caller migration; integrations/aws/identity_store.py deleted). Note: the plan's AWS-remainder slice list (lines ~63 and ~103) predates the 2026-09-11 TASK-25.2 re-scope and still describes TASK-25.2.3 as 'Lambda + delete sqs.py' and TASK-25.2.4 as 'Organizations+SSO-Admin+legacy IdentityStore'. The current mapping is on TASK-25.2: .2.1 characterization, .2.2 client.py, .2.3 Identity Center (done), .2.4 Organizations/SSO-Admin/Config/CostExplorer/GuardDuty/SecurityHub/Lambda, .2.5 DynamoDB, .2.6 deletions.
+---
+
+created: 2026-09-18 16:47
+---
+2026-09-18 ID NOTE: TASK-25.5 is now 'Retire MaxMindClient' (created 2026-09-18). The CLI reused the ID of the archived AWSShield-deletion task that this task's plan still calls TASK-25.5; that work was folded into TASK-25.2.6 and done in TASK-25.2.6.2. Also 2026-09-18: TASK-25.4 re-scoped to delete SlackClientManager and bring every Slack Web-client construction site onto one factory. TASK-25.4 and the new TASK-25.5 are the two tasks decisions/sdk-typing.md waits on before applies: now.
+---
+
+created: 2026-09-24 20:10
+---
+2026-09-24 alignment with decisions/plugin-architecture.md and outbound-clients.md: integrations import nothing from the app except app/contracts/ shared types. The infrastructure.operations import becomes a contracts import through TASK-106, and vendor settings leave app/infrastructure/configuration/ through TASK-24. Business operations leaving a vendor package go to a feature's or capability's adapters/, never to app/infrastructure/: Sentinel audit sink -> capabilities/audit (TASK-25.7); Opsgenie -> oncall_sync and incident adapters (TASK-25.6); Notify revoke_api_key -> its webhooks caller (TASK-25.8); Trello ATIP ops -> features/atip adapters (TASK-25.9); OpenAI Summarizer -> decided in TASK-25.10. The workplace providers named in the description (infrastructure/directory, drive, spreadsheets) move to app/capabilities/ (TASK-119, TASK-120, TASK-121).
 ---
 <!-- COMMENTS:END -->

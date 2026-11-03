@@ -15,7 +15,7 @@ from typing import Annotated, Protocol
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response, Security
 
-from infrastructure.operations import OperationResult
+from contracts.operations import OperationResult
 from infrastructure.security import get_current_user
 from infrastructure.security.models import User
 from packages.access.sync.interactions.ingress import (
@@ -47,14 +47,13 @@ router = APIRouter(prefix="/access", tags=["Access Sync"])
 # ---------------------------------------------------------------------------
 
 
-class _AccessSyncSettingsPort(Protocol):
+class _AccessSyncRouteSettings(Protocol):
     """Structural contract for the settings object consumed by route handlers."""
 
-    enabled: bool
     job_ttl_seconds: int
 
 
-class _AccessSyncApplicationServicePort(Protocol):
+class _AccessSynchronizer(Protocol):
     """Structural contract for application service methods consumed by routes."""
 
     def sync_user(
@@ -78,22 +77,15 @@ class _AccessSyncApplicationServicePort(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _http_error_from_enqueue(error_code: str, message: str) -> HTTPException:
-    """Map ingress error codes to HTTP exceptions."""
-    if error_code == "FEATURE_DISABLED":
-        return HTTPException(status_code=503, detail=message)
-    return HTTPException(status_code=500, detail=message)
-
-
 def _resolve_coordinator(
-    coordinator: _AccessSyncApplicationServicePort | None,
-) -> _AccessSyncApplicationServicePort:
-    """Resolve coordinator lazily after feature-gate checks."""
+    coordinator: _AccessSynchronizer | None,
+) -> _AccessSynchronizer:
+    """Resolve the coordinator lazily, unless a caller injected one."""
     return coordinator if coordinator is not None else get_access_sync_coordinator()
 
 
-def _noop_coordinator() -> _AccessSyncApplicationServicePort | None:
-    """No-op dependency used to defer coordinator assembly until after gating."""
+def _noop_coordinator() -> _AccessSynchronizer | None:
+    """No-op dependency that defers coordinator assembly to the handler."""
     return None
 
 
@@ -116,15 +108,15 @@ def _noop_coordinator() -> _AccessSyncApplicationServicePort | None:
     ),
     status_code=202,
     responses={
-        503: {"description": "Access Sync feature is disabled."},
+        500: {"description": "The sync job could not be enqueued."},
     },
 )
 def sync_endpoint(
     request: AccessSyncRequest,
     response: Response,
-    settings: Annotated[_AccessSyncSettingsPort, Depends(get_access_sync_settings)],
+    settings: Annotated[_AccessSyncRouteSettings, Depends(get_access_sync_settings)],
     current_user: Annotated[User, Security(get_current_user, scopes=["sre-bot:access-sync"])],
-    coordinator: Annotated[_AccessSyncApplicationServicePort | None, Depends(_noop_coordinator)] = None,
+    coordinator: Annotated[_AccessSynchronizer | None, Depends(_noop_coordinator)] = None,
 ) -> UserSyncJobAcceptedResponse | PlatformSyncJobAcceptedResponse:
     """Enqueue an on-demand user sync or a full platform sync job."""
     log = logger.bind(
@@ -135,9 +127,6 @@ def sync_endpoint(
         endpoint="POST /api/v1/access/sync-runs",
     )
     log.info("sync_request")
-
-    if not settings.enabled:
-        raise HTTPException(status_code=503, detail="Access Sync is not enabled")
 
     coordinator_dep = _resolve_coordinator(coordinator)
 
@@ -156,7 +145,7 @@ def sync_endpoint(
             request_id=request.request_id or "",
         )
         if not result.is_success or result.data is None:
-            raise _http_error_from_enqueue(result.error_code or "", result.message or "")
+            raise HTTPException(status_code=500, detail=result.message or "")
         job: EnqueuedJob = result.data
         response.status_code = 202
         return UserSyncJobAcceptedResponse(
@@ -180,7 +169,7 @@ def sync_endpoint(
         request_id=request.request_id or "",
     )
     if not result.is_success or result.data is None:
-        raise _http_error_from_enqueue(result.error_code or "", result.message or "")
+        raise HTTPException(status_code=500, detail=result.message or "")
     job = result.data
     response.status_code = 202
     return PlatformSyncJobAcceptedResponse(

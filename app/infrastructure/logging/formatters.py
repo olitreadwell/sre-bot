@@ -4,37 +4,52 @@ This module provides formatters that can be used as structlog processors
 to customize log output format.
 
 Usage:
-    from infrastructure.logging.formatters import add_app_info, mask_sensitive_data
+    from infrastructure.logging.formatters import mask_sensitive_data
 
 Dependencies:
     - structlog processors
 """
 
+import re
 from typing import Any
 
+from structlog.typing import EventDict, WrappedLogger
 
-def add_app_info(app_name: str, app_version: str = "unknown"):
-    """Create a processor that adds application info to log entries.
+SLACK_SOCKET_MODE_LOGGER = "slack_sdk.socket_mode"
 
-    Args:
-        app_name: Name of the application.
-        app_version: Version string for the application.
+# slack_sdk logs dropped websocket connections either by exception type name
+# ("error: BrokenPipeError, message: ...") or by str(e) only ("error: [Errno 32] Broken pipe",
+# "error: [SSL: UNEXPECTED_EOF_WHILE_READING] ..."). Certificate verification failures are
+# deliberately excluded: they are not transient and must keep alerting.
+_TRANSIENT_SOCKET_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("BrokenPipeError", re.compile(r"\bBrokenPipeError\b|\[Errno 32\] Broken pipe")),
+    (
+        "SSLError",
+        re.compile(r"\bSSL(?:EOF|ZeroReturn|Syscall|WantRead|WantWrite)?Error\b|\[SSL: (?!CERTIFICATE_VERIFY_FAILED)"),
+    ),
+)
 
-    Returns:
-        A structlog processor function.
 
-    Example:
-        configure_logging(
-            extra_processors=[add_app_info("sre-bot", "1.2.3")]
-        )
+def downgrade_transient_socket_mode_errors(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Downgrade self-healing Slack Socket Mode connection errors from ``error`` to ``info``.
+
+    slack_sdk logs a dropped websocket at ERROR before its monitor thread reconnects
+    automatically (slackapi/bolt-python#605), so these lines are not actionable. Only
+    records from the Socket Mode logger whose message names a ``BrokenPipeError`` or a
+    non-certificate ``SSLError`` are rewritten; everything else is returned unchanged.
     """
-
-    def processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-        event_dict["app_name"] = app_name
-        event_dict["app_version"] = app_version
+    if event_dict.get("level") != "error":
         return event_dict
-
-    return processor
+    if not str(event_dict.get("logger", "")).startswith(SLACK_SOCKET_MODE_LOGGER):
+        return event_dict
+    message = str(event_dict.get("event", ""))
+    for error_type, pattern in _TRANSIENT_SOCKET_ERROR_PATTERNS:
+        if pattern.search(message):
+            event_dict["level"] = "info"
+            event_dict["error_type"] = error_type
+            event_dict["socket_mode_transient"] = True
+            break
+    return event_dict
 
 
 # Sensitive field patterns that should be masked in logs
@@ -159,7 +174,7 @@ def add_environment_info(environment: str):
 
     Example:
         configure_logging(
-            extra_processors=[add_environment_info(settings.ENVIRONMENT)]
+            extra_processors=[add_environment_info(settings.environment)]
         )
     """
 

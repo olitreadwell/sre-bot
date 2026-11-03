@@ -7,9 +7,8 @@ from slack_sdk import WebClient
 from slack_sdk.models import blocks, views
 from structlog import get_logger
 
-from infrastructure.configuration.features.incident import get_incident_settings
-from infrastructure.configuration.integrations.google import get_google_resources_config
-from infrastructure.slack.settings import get_slack_transport_settings
+from contracts.slack.transport import slack_transport_info
+from features.incident.response.settings import get_incident_response_settings
 from integrations.sentinel import log_to_sentinel
 from integrations.slack import users as slack_users
 from models.incidents import IncidentPayload
@@ -18,12 +17,6 @@ from modules.incident import (
     incident_conversation,
     incident_folder,
 )
-
-incident_settings = get_incident_settings()
-google_resource = get_google_resources_config()
-INCIDENT_CHANNEL = incident_settings.INCIDENT_CHANNEL
-SLACK_SECURITY_USER_GROUP_ID = incident_settings.SLACK_SECURITY_USER_GROUP_ID
-INCIDENT_HANDBOOK_ID = google_resource.incident_handbook_id
 
 logger = get_logger()
 
@@ -34,8 +27,8 @@ i18n.set("fallback", "en-US")
 
 
 def register(bot: App):
-    transport_settings = get_slack_transport_settings()
-    bot.command(f"/{transport_settings.COMMAND_PREFIX}incident")(open_create_incident_modal)
+    transport_settings = slack_transport_info()
+    bot.command(f"/{transport_settings.command_prefix}incident")(open_create_incident_modal)
     bot.view("incident_view")(submit)
     bot.action("incident_change_locale")(handle_change_locale_button)
 
@@ -235,7 +228,7 @@ def generate_incident_modal_view(command, options=None, private_metadata=None, l
         options = []
     if not private_metadata:
         private_metadata = ""
-    handbook_string = f"For more details on what constitutes a security incident, visit our <https://docs.google.com/document/d/{INCIDENT_HANDBOOK_ID}|Incident Management Handbook>"
+    handbook_string = f"For more details on what constitutes a security incident, visit our <https://docs.google.com/document/d/{get_incident_response_settings().handbook_id}|Incident Management Handbook>"
     return {
         "type": "modal",
         "callback_id": "incident_view",

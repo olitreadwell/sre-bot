@@ -1,0 +1,64 @@
+# Overrides of base.toml for ENVIRONMENT=production, key by key.
+# Never put a secret here: secrets come from the environment as <SLICE>__<FIELD>.
+
+[slack.tenant]
+# The workspace the production Slack app is installed in.
+team_id = "T2G2S06PM"
+
+[slack_transport]
+enabled = true
+
+[scheduler]
+enabled = true
+
+[server]
+public_base_url = "https://sre-bot.cdssandbox.xyz"
+sre_test_channel_id = "C033L7RGCT0"
+
+[notify_api_key_leak]
+channel_id = "CNWA63606"
+oncall_group_id = "S0BNW0G8CFK"
+
+[atip]
+announce_channel_id = "C033L7RGCT0"
+
+[incident_response]
+announcement_channel_id = "CUYR73ESX"
+security_group_id = "S057X3XB5FX"
+notify_management_group_id = "S0BC6L00PUG"
+
+[sre_ops]
+sre_ops_channel_id = "C0388M21LKZ"
+
+[cloud_operations]
+# The group production ran on as the code default until TASK-111.14.
+aws_admin_groups = ["sre-ifs@cds-snc.ca"]
+
+[openai.tenant]
+# The model gateway production drafts with; its key is the task-definition secret OPENAI__API_KEY.
+base_url = "https://ai.cdssandbox.xyz"
+model = "gpt-5.6-luna"
+
+[notify.tenant]
+# The GC Notify API leaked keys are revoked through; its credentials are the task-definition
+# secrets NOTIFY__SRE_USER_NAME and NOTIFY__SRE_CLIENT_SECRET.
+api_url = "https://api.notification.canada.ca"
+
+[opsgenie.tenant]
+# The account's region (US); its key is the task-definition secret OPSGENIE__INTEGRATIONS_KEY.
+api_url = "https://api.opsgenie.com"
+
+[sentinel]
+# The custom log table production's events go to; the workspace id and its shared key are the
+# task-definition secrets SENTINEL__CUSTOMER_ID and SENTINEL__SHARED_KEY.
+log_type = "SREBot"
+
+[maxmind.tenant]
+# The database the image ships (Dockerfile).
+database_path = "./geodb/GeoLite2-City.mmdb"
+
+[[security.issuers]]
+issuer = "https://backstage.cdssandbox.xyz/api/auth"
+jwks_uri = "https://backstage.cdssandbox.xyz/api/auth/.well-known/jwks.json"
+algorithms = ["ES256"]
+audience = "backstage"

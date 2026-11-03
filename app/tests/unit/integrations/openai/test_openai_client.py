@@ -9,7 +9,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from infrastructure.operations.status import OperationStatus
+from contracts.operations.status import OperationStatus
 from integrations.openai.client import build_openai_client, classify_openai_error
 
 pytestmark = pytest.mark.unit
@@ -27,7 +27,7 @@ class TestBuildOpenAIClient:
 
         assert client.headers["Authorization"] == "Bearer sk-test-key"
         assert client.headers["Content-Type"] == "application/json"
-        assert str(client.base_url).rstrip("/") == openai_settings.BASE_URL
+        assert str(client.base_url).rstrip("/") == openai_settings.base_url
 
 
 class TestClassifyOpenAIError:

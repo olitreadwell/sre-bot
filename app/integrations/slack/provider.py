@@ -5,6 +5,7 @@ Slack platform provider implementation.
 Provides integration with Slack using the Bolt SDK for Socket Mode.
 """
 
+import logging
 import threading
 from collections.abc import Callable
 from functools import cache
@@ -13,26 +14,148 @@ from typing import Any, cast
 import structlog
 from slack_bolt import Ack, App, Respond
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
+from contracts.operations import ErrorCode, OperationResult, OperationStatus
+from contracts.services import ServiceScopeOpener
+from contracts.slack.models import ArgumentParsingError, CommandPayload, CommandResponse
 from infrastructure.i18n import Locale, TranslationKey, Translator
-from infrastructure.operations import OperationResult
-from infrastructure.slack.settings import get_slack_transport_settings
 from integrations.slack import LegacySlackBootstrap
+from integrations.slack.client import classify_slack_error
 from integrations.slack.formatter import SlackBlockKitFormatter
 from integrations.slack.help import (
     SLACK_HELP_KEYWORDS,
     SlackHelpGenerator,
 )
-from integrations.slack.models import (
-    ArgumentParsingError,
-    CommandDefinition,
-    CommandPayload,
-    CommandResponse,
-)
+from integrations.slack.models import CommandDefinition
 from integrations.slack.parser import CommandArgumentParser
-from integrations.slack.settings import get_slack_settings
+from integrations.slack.settings import SlackSettings, get_slack_settings
 
 logger = structlog.get_logger()
+
+
+class SlackWebReply:
+    """Send handler replies through a Slack Web client.
+
+    Implements ``contracts.slack.reply.SlackReplySender``. Maps ``SlackApiError``
+    to ``OperationResult`` through ``classify_slack_error`` so handlers branch
+    on a result instead of catching SDK exceptions
+    (decisions/transport-slack.md, Errors).
+
+    The client is resolved on every call: the platform provider only has one
+    after it has started, which happens after command registration.
+    """
+
+    def __init__(self, client: Callable[[], WebClient | None]) -> None:
+        self._client = client
+
+    def post_message(
+        self,
+        *,
+        channel_id: str,
+        text: str,
+        username: str | None = None,
+        icon_url: str | None = None,
+    ) -> OperationResult[None]:
+        """Post a message to a channel, optionally under a custom name and avatar."""
+        return self._call(
+            "chat_postMessage",
+            lambda client: client.chat_postMessage(channel=channel_id, text=text, username=username, icon_url=icon_url),
+        )
+
+    def post_ephemeral(self, *, channel_id: str, user_id: str, text: str) -> OperationResult[None]:
+        """Post a message in a channel that only one user sees."""
+        return self._call(
+            "chat_postEphemeral",
+            lambda client: client.chat_postEphemeral(channel=channel_id, user=user_id, text=text),
+        )
+
+    def open_view(self, *, trigger_id: str, view: dict[str, Any]) -> OperationResult[str]:
+        """Open a modal view and return its id."""
+        response = self._request("views_open", lambda client: client.views_open(trigger_id=trigger_id, view=view))
+        if not response.is_success:
+            return _carry_error(response)
+        view_id = _view_id(response.data)
+        if view_id is None:
+            return OperationResult.permanent_error(
+                "Slack views_open returned no view id",
+                error_code=ErrorCode.MISSING_VIEW_ID,
+            )
+        return OperationResult.success(data=view_id)
+
+    def update_view(self, *, view_id: str, view: dict[str, Any], hash: str | None = None) -> OperationResult[None]:  # noqa: A002 -- Slack's parameter name
+        """Replace an open modal view."""
+        return self._call(
+            "views_update",
+            lambda client: client.views_update(view=view, view_id=view_id, hash=hash),
+        )
+
+    def _call(self, method: str, call: Callable[[WebClient], object]) -> OperationResult[None]:
+        """Run one Web API call whose response is not needed."""
+        result = self._request(method, call)
+        if result.is_success:
+            return OperationResult.success()
+        return _carry_error(result)
+
+    def _request(self, method: str, call: Callable[[WebClient], object]) -> OperationResult[Any]:
+        """Run one Web API call and return its response, or turn any failure into an error result."""
+        client = self._client()
+        if client is None:
+            return OperationResult.permanent_error(
+                "Slack client is not initialized",
+                error_code=ErrorCode.INITIALIZATION_ERROR,
+            )
+
+        try:
+            response = call(client)
+        except SlackApiError as exc:
+            return _classified(method, exc)
+        except Exception as exc:  # noqa: BLE001 - a reply failure is reported to the handler, never raised
+            logger.warning("slack_reply_failed", method=method, error=str(exc))
+            return OperationResult(
+                status=OperationStatus.PERMANENT_ERROR,
+                message=f"Slack {method} failed: {exc}",
+                error_code=ErrorCode.UNEXPECTED_ERROR,
+                cause=exc,
+            )
+        return OperationResult.success(data=response)
+
+
+def _carry_error[T](result: OperationResult[Any]) -> OperationResult[T]:
+    """Carry an error result's classification over to another payload type."""
+    return OperationResult(
+        status=result.status,
+        message=result.message,
+        error_code=result.error_code,
+        retry_after=result.retry_after,
+        cause=result.cause,
+    )
+
+
+def _view_id(response: Any) -> str | None:
+    """Read ``view.id`` from a Slack ``views.open`` response, or ``None`` when absent."""
+    try:
+        view_id = response["view"]["id"]
+    except KeyError, TypeError:
+        return None
+    return view_id if isinstance(view_id, str) and view_id else None
+
+
+def _classified(method: str, exc: SlackApiError) -> OperationResult[None]:
+    """Classify a Slack API error; a code the catalogues do not name is permanent."""
+    try:
+        status, error_code, retry_after = classify_slack_error(exc)
+    except SlackApiError:
+        status, error_code, retry_after = OperationStatus.PERMANENT_ERROR, exc.response.get("error"), None
+
+    return OperationResult(
+        status=status,
+        message=f"Slack {method} failed: {error_code}",
+        error_code=error_code,
+        retry_after=retry_after,
+        cause=exc,
+    )
 
 
 class SlackPlatformProvider:
@@ -45,17 +168,12 @@ class SlackPlatformProvider:
     - Response formatting using SlackBlockKitFormatter
 
     Example:
-        from infrastructure.configuration import SlackPlatformSettings
         from integrations.slack.formatter import (
             SlackBlockKitFormatter
         )
+        from integrations.slack.settings import get_slack_settings
 
-        settings = SlackPlatformSettings(
-            ENABLED=True,
-            SOCKET_MODE=True,
-            APP_TOKEN="xapp-...",
-            BOT_TOKEN="xoxb-...",
-        )
+        settings = get_slack_settings()
         formatter = SlackBlockKitFormatter()
         provider = SlackPlatformProvider(
             settings=settings,
@@ -73,30 +191,40 @@ class SlackPlatformProvider:
 
     def __init__(
         self,
-        settings,  # SlackPlatformSettings type
+        settings: SlackSettings,
         formatter: SlackBlockKitFormatter | None = None,
         command_prefix: str = "",
         name: str = "slack",
         enabled: bool = True,
+        socket_mode: bool = True,
         version: str = "1.0.0",
         translation_service: Translator | None = None,
     ):
         """Initialize Slack platform provider.
 
         Args:
-            settings: SlackPlatformSettings instance with tokens and config
+            settings: SlackSettings instance with tokens and config
             formatter: Optional SlackBlockKitFormatter for response formatting
+            command_prefix: Prefix added to every root slash command ([slack_transport] command_prefix)
             name: Provider name (default: "slack")
+            enabled: Run the transport ([slack_transport] enabled); disabled, initialization is skipped
+            socket_mode: Receive events over Socket Mode ([slack_transport] socket_mode); false is HTTP Events mode
             version: Provider version (default: "1.0.0")
             translation_service: Optional translation service for i18n support
         """
         self._name = name
         self._version = version
         self._enabled = enabled
+        self._socket_mode = socket_mode
         self._logger = logger.bind(provider=name, version=version)
         # Commands stored by full_path (e.g., "sre.dev.aws") as key
         self._commands: dict[str, CommandDefinition] = {}
+        # Native Bolt listeners by exact id, attached when the app is initialized.
+        self._block_actions: dict[str, Callable[..., object]] = {}
+        self._view_submissions: dict[str, Callable[..., object]] = {}
+        self._listeners_attached = False
         self._translator: Translator | None = None
+        self._scope_opener: ServiceScopeOpener | None = None
         if translation_service:
             self.set_translator(translation_service)
 
@@ -107,6 +235,8 @@ class SlackPlatformProvider:
         # Will be initialized when app is started
         self._app: App | None = None
         self._client: Any | None = None
+        # Reads the client on every call: it only exists once the app is initialized.
+        self._reply = SlackWebReply(lambda: self._client)
 
         # Help generator for unified help text generation
         self._help_generator = SlackHelpGenerator(
@@ -116,8 +246,8 @@ class SlackPlatformProvider:
 
         self._logger.info(
             "slack_provider_initialized",
-            socket_mode=settings.SOCKET_MODE,
-            enabled=settings.ENABLED,
+            socket_mode=socket_mode,
+            enabled=enabled,
         )
         self._handler: SocketModeHandler | None = None  # Socket Mode handler reference
         self._socket_thread: threading.Thread | None = None
@@ -150,10 +280,10 @@ class SlackPlatformProvider:
         Returns:
             OperationResult with initialization status
         """
-        log = self._logger.bind(socket_mode=self._settings.SOCKET_MODE)
+        log = self._logger.bind(socket_mode=self._socket_mode)
         log.info("initializing_slack_app")
 
-        if not self._settings.ENABLED:
+        if not self._enabled:
             log.warning("slack_disabled_skipping_init")
             return OperationResult.permanent_error(
                 message="Slack provider is disabled",
@@ -161,14 +291,14 @@ class SlackPlatformProvider:
             )
 
         # Validate required tokens
-        if self._settings.SOCKET_MODE and not self._settings.APP_TOKEN:
+        if self._socket_mode and not self._settings.app_token:
             log.error("missing_app_token")
             return OperationResult.permanent_error(
                 message="APP_TOKEN required for Socket Mode",
                 error_code="MISSING_APP_TOKEN",
             )
 
-        if not self._settings.BOT_TOKEN:
+        if not self._settings.bot_token:
             log.error("missing_bot_token")
             return OperationResult.permanent_error(
                 message="BOT_TOKEN is required",
@@ -177,7 +307,7 @@ class SlackPlatformProvider:
 
         try:
             # Create Bolt App instance
-            self._app = LegacySlackBootstrap().create_app()
+            self._app = LegacySlackBootstrap().create_app(socket_mode=self._socket_mode)
             self._client = self._app.client
             log.debug("slack_app_created")
 
@@ -185,17 +315,23 @@ class SlackPlatformProvider:
             # Extract unique root commands from registered command tree
             # (e.g., "sre" from "sre.incident", "sre.webhooks", etc.)
             self._auto_register_root_commands()
+            self._attach_interaction_listeners()
 
             # Prepare Socket Mode handler if enabled (start happens separately)
-            if self._settings.SOCKET_MODE:
-                self._handler = SocketModeHandler(self._app, self._settings.APP_TOKEN)
+            if self._socket_mode:
+                socket_credential = self._settings.app_token
+                self._handler = SocketModeHandler(
+                    self._app,
+                    socket_credential.get_secret_value() if socket_credential else None,
+                    logger=logging.getLogger("slack_sdk.socket_mode"),
+                )
                 log.info("socket_mode_handler_prepared")
             else:
                 log.info("socket_mode_disabled_http_mode")
 
             log.info("slack_app_initialized")
             return OperationResult.success(
-                data={"initialized": True, "socket_mode": self._settings.SOCKET_MODE},
+                data={"initialized": True, "socket_mode": self._socket_mode},
                 message="Slack app initialization completed",
             )
 
@@ -223,6 +359,25 @@ class SlackPlatformProvider:
             translator: Translator instance for message translation
         """
         self._translator = translator
+
+    def set_scope_opener(self, service_scopes: ServiceScopeOpener) -> None:
+        """Set the opener features use to open a per-invocation service scope.
+
+        Args:
+            service_scopes: Host-built opener over the service registry.
+        """
+        self._scope_opener = service_scopes
+
+    @property
+    def service_scopes(self) -> ServiceScopeOpener:
+        """The service scope opener the host injected.
+
+        Raises:
+            RuntimeError: The host has not called ``set_scope_opener``.
+        """
+        if self._scope_opener is None:
+            raise RuntimeError("SlackPlatformProvider has no ServiceScopeOpener; the host must call set_scope_opener first")
+        return self._scope_opener
 
     def _translate_or_fallback(
         self,
@@ -352,9 +507,9 @@ class SlackPlatformProvider:
 
     def start(self) -> OperationResult:
         """Start Slack Socket Mode if enabled."""
-        log = self._logger.bind(socket_mode=self._settings.SOCKET_MODE)
+        log = self._logger.bind(socket_mode=self._socket_mode)
 
-        if not self._settings.SOCKET_MODE:
+        if not self._socket_mode:
             log.info("socket_mode_start_skipped")
             return OperationResult.success(message="Socket Mode disabled")
 
@@ -459,6 +614,56 @@ class SlackPlatformProvider:
                 slash_command=slash_command,
                 root=root_command,
             )
+
+    def register_block_action(self, action_id: str, listener: Callable[..., object]) -> None:
+        """Register a native Bolt listener for one block action, by exact ``action_id``.
+
+        Raises:
+            ValueError: The id is blank or already registered.
+            RuntimeError: Listeners were already attached to the Bolt app.
+        """
+        self._register_listener("block action", self._block_actions, action_id, listener)
+
+    def register_view_submission(self, callback_id: str, listener: Callable[..., object]) -> None:
+        """Register a native Bolt listener for one view submission, by exact ``callback_id``.
+
+        Raises:
+            ValueError: The id is blank or already registered.
+            RuntimeError: Listeners were already attached to the Bolt app.
+        """
+        self._register_listener("view submission", self._view_submissions, callback_id, listener)
+
+    def _register_listener(
+        self,
+        kind: str,
+        listeners: dict[str, Callable[..., object]],
+        listener_id: str,
+        listener: Callable[..., object],
+    ) -> None:
+        """Store a listener until the app exists; registration is startup-only and each id is unique."""
+        if self._listeners_attached:
+            raise RuntimeError(f"Slack {kind} {listener_id!r} registered after startup")
+        if not listener_id.strip():
+            raise ValueError(f"Slack {kind} id must not be blank")
+        if listener_id in listeners:
+            raise ValueError(f"Slack {kind} {listener_id!r} is already registered")
+        listeners[listener_id] = listener
+        self._logger.debug("slack_listener_registered", kind=kind, listener_id=listener_id)
+
+    def _attach_interaction_listeners(self) -> None:
+        """Attach the registered block-action and view-submission listeners to the Bolt app, unwrapped."""
+        if not self._app:
+            return
+        for action_id, listener in self._block_actions.items():
+            self._app.block_action(action_id)(listener)
+        for callback_id, listener in self._view_submissions.items():
+            self._app.view_submission(callback_id)(listener)
+        self._listeners_attached = True
+        self._logger.info(
+            "slack_interaction_listeners_attached",
+            block_actions=sorted(self._block_actions),
+            view_submissions=sorted(self._view_submissions),
+        )
 
     def _tokenize_command_text(self, text: str) -> list[str]:
         """Tokenize Slack command text using quote-aware parsing."""
@@ -574,11 +779,21 @@ class SlackPlatformProvider:
         return self._client
 
     @property
-    def settings(self):
+    def reply(self) -> SlackWebReply:
+        """Get the reply interface handlers use to post messages and open views.
+
+        Satisfies ``contracts.slack.registrar.SlackCommandRegistrar.reply``.
+        Usable only after the provider has been started; before that every
+        call returns an error result.
+        """
+        return self._reply
+
+    @property
+    def settings(self) -> SlackSettings:
         """Get Slack platform settings.
 
         Returns:
-            SlackPlatformSettings instance
+            SlackSettings instance
         """
         return self._settings
 
@@ -704,7 +919,7 @@ class SlackPlatformProvider:
             )
 
             # With argument parsing
-            from integrations.slack.parser Argument, ArgumentType
+            from integrations.slack.parser import Argument, ArgumentType
 
             provider.register_command(
                 command="list",
@@ -926,23 +1141,20 @@ class SlackPlatformProvider:
 
 
 @cache
-def get_slack_provider() -> SlackPlatformProvider:
-    """Factory function to create and return a SlackPlatformProvider instance.
+def get_slack_provider(*, enabled: bool, socket_mode: bool, command_prefix: str) -> SlackPlatformProvider:
+    """Return the process-wide SlackPlatformProvider, built from the transport values the host passes.
 
-    This function can be used by the platform service to instantiate the provider
-    based on configuration. It encapsulates the creation logic and allows for
-    easy extension in the future (e.g., if different Slack settings profiles are needed).
+    The host reads them from its [slack_transport] slice in the configuration phase
+    (server/slack/settings.py); this module never reads that slice.
 
     Returns:
-        An instance of SlackPlatformProvider initialized with settings from configuration.
+        The SlackPlatformProvider built with the Slack vendor settings and the transport values.
     """
 
-    settings = get_slack_settings()
-    transport_settings = get_slack_transport_settings()
-    formatter = SlackBlockKitFormatter()
-    provider = SlackPlatformProvider(
-        settings=settings,
-        formatter=formatter,
-        command_prefix=transport_settings.COMMAND_PREFIX,
+    return SlackPlatformProvider(
+        settings=get_slack_settings(),
+        formatter=SlackBlockKitFormatter(),
+        command_prefix=command_prefix,
+        enabled=enabled,
+        socket_mode=socket_mode,
     )
-    return provider

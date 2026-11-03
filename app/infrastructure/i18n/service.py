@@ -8,10 +8,10 @@ from typing import Any
 
 import structlog
 
+from contracts.operations import OperationResult, OperationStatus
 from infrastructure.i18n.loader import YAMLTranslationLoader
 from infrastructure.i18n.models import Locale, TranslationKey
 from infrastructure.i18n.translator import Translator
-from infrastructure.operations import OperationResult, OperationStatus
 
 
 class TranslationService:
@@ -41,7 +41,8 @@ class TranslationService:
             return {"message": msg}
 
         # Initialization (lifespan)
-        from infrastructure.i18n import get_translation_service, I18nResourceSpec
+        from contracts.i18n.resources import I18nResourceSpec
+        from infrastructure.i18n import get_translation_service
 
         translation = get_translation_service()
         resources = [

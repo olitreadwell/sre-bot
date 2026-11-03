@@ -16,13 +16,8 @@ from packages.access.catalog.parsers import (
     FallbackCatalogSlugParser,
 )
 from packages.access.catalog.service import CatalogService
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.common.providers import get_access_runtime_config
-from packages.access.common.settings import AccessCatalogSettings, get_access_settings
-
-
-def get_catalog_settings() -> AccessCatalogSettings:
-    """Return the catalog settings slice from the unified access settings."""
-    return get_access_settings().catalog
 
 
 @lru_cache(maxsize=1)
@@ -73,5 +68,6 @@ def get_catalog_service() -> CatalogService:
         runtime_config=runtime_config,
         directory=directory,
         parsers=parser_map,
+        policy=ManagedGroupPolicy.from_config(runtime_config),
         display_names=display_names,
     )

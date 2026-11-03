@@ -1,12 +1,17 @@
 """Core module to handle Incident creation"""
 
+from typing import Any
+from urllib.parse import urlencode
+
 from slack_sdk import WebClient
 from slack_sdk.models import blocks
 from structlog import get_logger
 
-from infrastructure.configuration.app import get_app_settings
-from infrastructure.configuration.features.incident import get_incident_settings
-from integrations.google_workspace import google_drive, meet
+from contracts.configuration import host_info
+from features.incident.drive.adapters import google_drive as incident_drive
+from features.incident.meet.adapters import google_meet as meet
+from features.incident.response.settings import get_incident_response_settings
+from integrations.slack.settings import get_slack_settings
 from models.incidents import IncidentPayload
 from modules.incident import (
     db_operations,
@@ -14,14 +19,21 @@ from modules.incident import (
     incident_folder,
     on_call,
 )
-
-app_settings = get_app_settings()
-incident_settings = get_incident_settings()
-INCIDENT_CHANNEL = incident_settings.INCIDENT_CHANNEL
-SLACK_SECURITY_USER_GROUP_ID = incident_settings.SLACK_SECURITY_USER_GROUP_ID
-SLACK_NOTIFY_MGMT_USER_GROUP_ID = incident_settings.SLACK_NOTIFY_MGMT_USER_GROUP_ID
+from modules.incident.incident_folder import channel_slug
 
 logger = get_logger()
+
+
+def channel_url(channel_id: str) -> str:
+    """Link to a channel through Slack's deep link, naming the configured workspace when there is one."""
+    tenant = get_slack_settings().tenant
+    query = {"channel": channel_id} | ({"team": tenant.team_id} if tenant else {})
+    return f"https://slack.com/app_redirect?{urlencode(query)}"
+
+
+def _security_answer_to_flag(answer: str) -> bool | None:
+    """Map the declare modal's yes/no answer to the stored flag; anything else is NULL."""
+    return {"yes": True, "no": False}.get(answer)
 
 
 def _get_channel_info_and_topic(client: WebClient, channel_id: str) -> tuple:
@@ -59,17 +71,18 @@ def _get_channel_info_and_topic(client: WebClient, channel_id: str) -> tuple:
         return None, "", "Unknown"
 
 
-def _get_existing_bookmarks(client: WebClient, channel_id: str) -> dict:
+def _get_existing_bookmarks(client: WebClient, channel_id: str) -> dict[str, str]:
     """Retrieve existing bookmarks in the channel.
 
     Returns:
         dict: Mapping of bookmark titles to links
     """
-    existing_bookmarks = {}
+    existing_bookmarks: dict[str, str] = {}
     try:
         bookmark_response = client.bookmarks_list(channel_id=channel_id)
         if bookmark_response.get("ok"):
-            for bookmark in bookmark_response.get("bookmarks", []):
+            bookmarks: list[dict[str, Any]] = bookmark_response.get("bookmarks", [])
+            for bookmark in bookmarks:
                 existing_bookmarks[bookmark["title"]] = bookmark["link"]
     except Exception as e:
         logger.warning(
@@ -80,11 +93,11 @@ def _get_existing_bookmarks(client: WebClient, channel_id: str) -> dict:
     return existing_bookmarks
 
 
-def _find_product_folder(product: str) -> str:
+def _find_product_folder(product: str) -> str | None:
     """Find the folder ID for a given product.
 
     Returns:
-        str: Folder ID or None if not found
+        str | None: Folder ID or None if not found
     """
     if product == "Unknown":
         return None
@@ -93,7 +106,8 @@ def _find_product_folder(product: str) -> str:
         folders = incident_folder.list_incident_folders()
         for folder in folders:
             if folder["name"].lower() == product.lower():
-                return folder["id"]
+                folder_id: str = folder["id"]
+                return folder_id
     except Exception as e:
         logger.warning(
             "recreate_missing_resources_folder_lookup_failed",
@@ -103,7 +117,7 @@ def _find_product_folder(product: str) -> str:
     return None
 
 
-def _create_meet_link_bookmark(client: WebClient, channel_id: str, existing_bookmarks: dict, results: dict) -> str:
+def _create_meet_link_bookmark(client: WebClient, channel_id: str, existing_bookmarks: dict[str, str], results: dict) -> str:
     """Create Meet link bookmark if it doesn't exist.
 
     Returns:
@@ -115,19 +129,20 @@ def _create_meet_link_bookmark(client: WebClient, channel_id: str, existing_book
 
     try:
         meet_link = meet.create_space()
+        meeting_uri: str = meet_link["meetingUri"]
         client.bookmarks_add(
             channel_id=channel_id,
             title="Meet link",
             type="link",
-            link=meet_link["meetingUri"],
+            link=meeting_uri,
         )
-        results["success"].append(f"Created Meet link: {meet_link['meetingUri']}")
+        results["success"].append(f"Created Meet link: {meeting_uri}")
         logger.info(
             "recreate_missing_resources_meet_created",
             channel_id=channel_id,
-            meet_url=meet_link["meetingUri"],
+            meet_url=meeting_uri,
         )
-        return meet_link["meetingUri"]
+        return meeting_uri
     except Exception as e:
         logger.error(
             "recreate_missing_resources_meet_failed",
@@ -142,8 +157,8 @@ def _create_document_bookmark(
     client: WebClient,
     channel_id: str,
     channel_name: str,
-    existing_bookmarks: dict,
-    folder_id: str,
+    existing_bookmarks: dict[str, str],
+    folder_id: str | None,
     incident_name: str,
     product: str,
     results: dict,
@@ -162,12 +177,12 @@ def _create_document_bookmark(
         return ""
 
     try:
-        slug = channel_name.replace("incident-", "")
+        slug = channel_slug(channel_name)
         document_id = None
-        document_link = None
+        document_link = ""
 
         # Search for document by name in the folder
-        files = google_drive.list_files_in_folder(folder_id)
+        files = incident_drive.list_folder_files(folder_id)
         for file in files:
             if slug in file.get("name", ""):
                 document_id = file["id"]
@@ -180,7 +195,7 @@ def _create_document_bookmark(
             document_link = f"https://docs.google.com/document/d/{document_id}/edit"
 
             # Update boilerplate if we have the necessary info
-            channel_url = f"https://gcdigital.slack.com/archives/{channel_id}"
+            channel_link = channel_url(channel_id)
             oncall = on_call.get_on_call_users_from_folder(client, folder_id)
             oncall_names = ", ".join([user["profile"]["display_name_normalized"] for user in oncall])
 
@@ -188,7 +203,7 @@ def _create_document_bookmark(
                 document_id,
                 incident_name,
                 product,
-                channel_url,
+                channel_link,
                 oncall_names,
             )
             results["success"].append(f"Created incident document: {document_link}")
@@ -238,7 +253,7 @@ def _add_incident_to_sheet(
     try:
         # Check if incident already exists in the list
         incidents_in_sheet = incident_folder.get_incidents_from_sheet()
-        slug = channel_name.replace("incident-", "")
+        slug = channel_slug(channel_name)
 
         already_in_sheet = False
         for inc in incidents_in_sheet:
@@ -247,13 +262,13 @@ def _add_incident_to_sheet(
                 break
 
         if not already_in_sheet:
-            channel_url = f"https://gcdigital.slack.com/archives/{channel_id}"
+            channel_link = channel_url(channel_id)
             incident_folder.add_new_incident_to_list(
                 document_link,
                 incident_name,
                 slug,
                 product,
-                channel_url,
+                channel_link,
             )
             results["success"].append("Added incident to Google Sheets list")
             logger.info(
@@ -285,7 +300,7 @@ def _create_database_record(
 ) -> None:
     """Create database record for incident if it doesn't exist."""
     try:
-        environment = "prod" if app_settings.ENVIRONMENT == "production" else "dev"
+        environment = "prod" if host_info().environment == "production" else "dev"
 
         incident_data = {
             "channel_id": channel_id,
@@ -409,13 +424,14 @@ def initiate_resources_creation(
     incident_payload: IncidentPayload,
 ):
     """Create an incident and its related resources. If incident Slack channel provided, skips that resource creation"""
+    incident_settings = get_incident_response_settings()
 
     # Create channel
-    environment = "dev" if app_settings.ENVIRONMENT == "dev" else "prod"
+    environment = "prod" if host_info().environment == "production" else "dev"
 
     oncall = on_call.get_on_call_users_from_folder(client, incident_payload.folder)
 
-    channel_url = f"https://gcdigital.slack.com/archives/{incident_payload.channel_id}"
+    channel_link = channel_url(incident_payload.channel_id)
 
     # Set topic
     client.conversations_setTopic(
@@ -433,8 +449,8 @@ def initiate_resources_creation(
         f"<@{incident_payload.user_id}> a initié un nouvel incident: {incident_payload.name} pour {incident_payload.product}"
         f" dans <#{incident_payload.channel_id}>"
     )
-    if INCIDENT_CHANNEL:
-        client.chat_postMessage(text=text, channel=INCIDENT_CHANNEL)
+    if incident_settings.announcement_channel_id:
+        client.chat_postMessage(text=text, channel=incident_settings.announcement_channel_id)
 
     # Add incident creator to channel
     client.conversations_invite(channel=incident_payload.channel_id, users=incident_payload.user_id)
@@ -484,7 +500,7 @@ def initiate_resources_creation(
         incident_payload.name,
         incident_payload.slug,
         incident_payload.product,
-        channel_url,
+        channel_link,
     )
 
     folders = incident_folder.list_incident_folders()
@@ -504,6 +520,7 @@ def initiate_resources_creation(
         "meet_url": meet_link["meetingUri"],
         "environment": environment,
         "severity": incident_payload.severity,
+        "security_incident": _security_answer_to_flag(incident_payload.security_incident),
     }
     incident_id = db_operations.create_incident(incident_data)
     logger.info("incident_record_created", incident_id=incident_id)
@@ -540,22 +557,25 @@ def initiate_resources_creation(
             users_to_invite.append(user["id"])
 
     # Get users from the @security group
-    if incident_payload.security_incident == "yes":
+    security_group_id = incident_settings.security_group_id
+    if incident_payload.security_incident == "yes" and not security_group_id:
+        logger.warning("security_user_group_not_configured", channel_id=incident_payload.channel_id)
+    elif incident_payload.security_incident == "yes" and security_group_id:
         # If this is a security incident, get users from the security user group
         # and add them to the list of users to invite
-        response = client.usergroups_users_list(usergroup=SLACK_SECURITY_USER_GROUP_ID)
+        response = client.usergroups_users_list(usergroup=security_group_id)
 
         # Avoid inviting security group users outside production to prevent spam.
-        if response.get("ok") and app_settings.ENVIRONMENT == "production":
+        if response.get("ok") and host_info().environment == "production":
             for security_user in response["users"]:
                 if security_user != incident_payload.user_id:
                     users_to_invite.append(security_user)
 
     # Get users from the @notify-management group
-    if incident_payload.product == "Notify" and SLACK_NOTIFY_MGMT_USER_GROUP_ID:
+    if incident_payload.product == "Notify" and incident_settings.notify_management_group_id:
         # If this is a Notify product incident, get users from the Notify management user group
         # and add them to the list of users to invite
-        response = client.usergroups_users_list(usergroup=SLACK_NOTIFY_MGMT_USER_GROUP_ID)
+        response = client.usergroups_users_list(usergroup=incident_settings.notify_management_group_id)
         if response.get("ok"):
             for notify_user in response["users"]:
                 if notify_user != incident_payload.user_id:
@@ -564,7 +584,7 @@ def initiate_resources_creation(
             logger.warning(
                 "notify_mgmt_group_fetch_failed",
                 error=response.get("error"),
-                usergroup=SLACK_NOTIFY_MGMT_USER_GROUP_ID,
+                usergroup=incident_settings.notify_management_group_id,
             )
 
     # Invite all collected users to the channel in a single API call
@@ -576,9 +596,10 @@ def initiate_resources_creation(
 • `/sre incident schedule retro` - Schedule a retrospective meeting
 • `/sre incident close` - Close and archive this incident
 • `/sre incident status update <status>` - Update incident status
-• `/sre incident updates add` - Add incident updates
+• `/sre incident status-update` - Draft, review and approve a public status update
 • `/sre incident show` - View incident details
 • `/sre incident summarize` - Summarize the channel to catch up someone joining the incident (optionally add `--since 30m` or `--since 2h` to limit the time range)
+• `/sre incident draft` - Draft an incident report from this channel into a new document, ready for you to review and edit
 
 *Quick Actions:*
 📋 Use the bookmarked incident report above to document findings
@@ -591,7 +612,7 @@ _Type_ `/sre incident help` _for complete command list_"""
         document_id,
         incident_payload.name,
         incident_payload.product,
-        channel_url,
+        channel_link,
         ", ".join([x["profile"]["display_name_normalized"] for x in oncall]),
     )
     logger.info(

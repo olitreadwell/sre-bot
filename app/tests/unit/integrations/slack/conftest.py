@@ -10,6 +10,7 @@ import os
 from collections.abc import Iterator
 
 import pytest
+from pydantic import SecretStr
 
 from integrations.slack.formatter import SlackBlockKitFormatter
 from integrations.slack.settings import SlackSettings, get_slack_settings
@@ -47,17 +48,13 @@ class MockSlackSettings:
 
     def __init__(
         self,
-        enabled=True,
-        socket_mode=True,
         app_token="xapp-test",
         bot_token="xoxb-test",
         signing_secret="test-secret",
     ):
-        self.ENABLED = enabled
-        self.SOCKET_MODE = socket_mode
-        self.APP_TOKEN = app_token
-        self.BOT_TOKEN = bot_token
-        self.SIGNING_SECRET = signing_secret
+        self.app_token = SecretStr(app_token) if app_token else None
+        self.bot_token = SecretStr(bot_token)
+        self.signing_secret = SecretStr(signing_secret) if signing_secret else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,15 +69,9 @@ def slack_settings():
 
 
 @pytest.fixture
-def slack_settings_disabled():
-    """Provide mock Slack settings with provider disabled."""
-    return MockSlackSettings(enabled=False)
-
-
-@pytest.fixture
 def slack_settings_http_mode():
-    """Provide mock Slack settings in HTTP webhook mode."""
-    return MockSlackSettings(socket_mode=False, signing_secret="webhook-secret")
+    """Provide mock Slack settings for HTTP Events mode: a signing secret and no app token."""
+    return MockSlackSettings(app_token=None, signing_secret="webhook-secret")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

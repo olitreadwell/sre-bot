@@ -3,10 +3,10 @@ id: TASK-59
 title: >-
   Consolidate the DynamoDB RetryStore onto QueueService; delete the
   unimplemented SQS retry backend
-status: To Do
+status: Done
 assignee: []
-created_date: '2026-07-28 13:20'
-updated_date: '2026-07-28 14:40'
+created_date: 2026-07-28 13:20
+updated_date: '2026-10-28T19:48:00Z'
 labels:
   - infrastructure
   - phase-4
@@ -16,7 +16,7 @@ dependencies:
   - TASK-34
 references:
   - decisions/reliability.md
-  - 'https://github.com/cds-snc/sre-bot/issues/1367'
+  - https://github.com/cds-snc/sre-bot/issues/1367
 priority: medium
 ordinal: 89000
 ---
@@ -42,6 +42,7 @@ Depends on TASK-34 (QueueService must exist before retry can fold onto it). Step
 - [ ] #2 The retry/redelivery mechanism routes through QueueService (at-least-once + DLQ) for every consumer SQS-native semantics cover; no bespoke second durable-queue implementation runs beside QueueService
 - [ ] #3 Any retained DynamoDB store is scoped strictly to the SQS-inexpressible residue (scheduled/delayed retries beyond 15-min DelaySeconds); if none survives triage, app/infrastructure/resilience/retry/ is deleted entirely
 - [ ] #4 All RetryProcessor consumers migrated; old retry-store paths and transitional shims deleted; the circuit breaker is left untouched
+- [ ] #5 The RetryStore and RetryProcessor lines are removed from app/bin/baselines/fake_coverage.txt and make check-fake-coverage passes
 <!-- AC:END -->
 
 ## Definition of Done
@@ -49,3 +50,33 @@ Depends on TASK-34 (QueueService must exist before retry can fold onto it). Step
 - [ ] #1 Retry consumers migrated onto QueueService; tests green; no back-compat shim remains
 - [ ] #2 PR references decisions/reliability.md
 <!-- DOD:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Superseded by TASK-111.13.2 (#1802).
+<!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-09-15 20:06
+
+---
+
+2026-09-15 follow-up from TASK-25.2.5 planning (human decision): three classify-and-continue sites in infrastructure/resilience/retry/dynamodb_store.py were found and deliberately NOT fixed in TASK-25.2.5, because the DynamoDB retry store is not used in production today (RetrySettings.backend defaults to "memory", and create_retry_store / get_resilience_service / RetryWorker are only constructed in tests). Decide raise vs keep for each one when this task consolidates or deletes the store:
+- fetch_due (~:162-169): a query failure logs dynamodb_fetch_due_failed and returns [], so a DynamoDB outage looks like "nothing due".
+- increment_attempt (~:334-347): a get_item failure logs retry_record_not_found_for_increment and returns without incrementing, so the record is retried again at its old schedule.
+- _count_by_status (~:424-445): a query failure returns None, which get_stats reports as a count.
+If the store is deleted outright (AC#3), these go with it and no decision is needed.
+
+---
+
+created: 2026-10-28T13:46:00Z
+
+---
+
+2026-10-28 (TASK-111.13 planning, human-approved): infrastructure/resilience/ has no production consumer; TASK-111.13.2 deletes it with RetrySettings and the sre_bot_retry_records table. This task is superseded; durable retry is built on QueueService (TASK-34) when a consumer needs it (decisions/reliability.md 2026-10-28). Human: close it.
+
+---
+<!-- COMMENTS:END -->

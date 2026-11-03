@@ -4,16 +4,19 @@ title: Wire or remove the unwired Route53 health check for sre-bot
 status: To Do
 assignee: []
 created_date: '2026-07-29 20:03'
+updated_date: '2026-10-15 17:45'
 labels:
   - infrastructure
   - phase-4
   - observability
 milestone: m-4
-dependencies: []
+dependencies:
+  - TASK-92
 references:
   - decisions/health-checks.md
   - terraform/route53.tf
   - terraform/alb.tf
+  - 'https://github.com/cds-snc/sre-bot/issues/1614'
 priority: medium
 ordinal: 103000
 ---
@@ -35,3 +38,17 @@ decisions/health-checks.md documents four independent health-check layers (Docke
 <!-- DOD:BEGIN -->
 - [ ] #1 Human confirms which option (wire vs remove) before merge; PR references decisions/health-checks.md
 <!-- DOD:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-09-14 14:55
+---
+2026-09-14 (human decision): now depends on TASK-92. The service-health decision may change the options here, for example a Route53 health check driven by a CloudWatch alarm instead of an HTTP probe of /version, or a single shallow endpoint for all layers. Re-read decisions/health-checks.md after TASK-92 lands before choosing wire vs remove.
+---
+
+created: 2026-09-25 15:00
+---
+2026-09-25: TASK-92 kept decisions/health-checks.md's Route53 decision unchanged (wire to an alarm or remove) and made every health check static. /version stays the Route53 target.
+---
+<!-- COMMENTS:END -->

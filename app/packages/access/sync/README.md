@@ -27,6 +27,7 @@ Runtime config is a JSON document with this shape:
 ```json
 {
   "dir_prefix": "sg",
+  "dir_domain": "example.com",
   "dir_separator": "-",
   "platforms": {
     "aws": {
@@ -41,6 +42,7 @@ Runtime config is a JSON document with this shape:
 | Field | Description |
 |---|---|
 | `dir_prefix` | Organization-wide IDP group prefix (e.g. `sg`) |
+| `dir_domain` | Email domain of managed IDP groups (e.g. `cds-snc.ca`); required, no default |
 | `dir_separator` | Separator between prefix segments (almost always `-`) |
 | `platforms.<key>` | Platform key, used to look up adapters and derive slugs |
 | `adapter_type` | Which adapter implementation to use: `aws_identity_center` or `fake` (default: `fake`) |
@@ -49,28 +51,29 @@ Runtime config is a JSON document with this shape:
 
 ### Config sources (set via env vars)
 
-Env var `ACCESS_CONFIG_SOURCE` controls which loader is used. It is read from `settings.config.source` in `AccessSettings` (defined in `packages/access/common/settings.py`).
+Env var `ACCESS_CONFIG_SOURCE` controls which loader is used. It is read by `AccessConfigSettings` (defined in `packages/access/common/settings.py`).
 
 | `ACCESS_CONFIG_SOURCE` | `ACCESS_CONFIG_REF` | When to use |
 |---|---|---|
-| `bundle` (default) | ignored | Local dev — no platforms configured, feature in waiting mode |
+| `bundle` (default) | ignored | No built-in configuration — loading fails with `CONFIG_NOT_CONFIGURED` when access is enabled but unconfigured |
 | `file_json` | Absolute path to a local JSON file | Local dev with a real config (e.g. `access-sync.local.json`) |
 | `inline_json` | The full JSON document as a string | Useful in CI or one-off testing |
-| `env` | ignored | **Production via SSM bundle** — reads flat env vars (see below) |
+| `env` | ignored | Reads flat env vars from the process environment (see below) |
 | `dynamodb` / `s3` / `ssm` | Key/path in that store | Not yet implemented |
 
-### env source (production)
+### env source
 
-When `ACCESS_CONFIG_SOURCE=env`, no JSON file or inline document is needed. The loader reads three env vars that `entry.sh` populates from the SSM parameter bundle at container startup:
+When `ACCESS_CONFIG_SOURCE=env`, no JSON file or inline document is needed. The loader reads flat env vars from the process environment:
 
 ```
 ACCESS_CONFIG_SOURCE=env
-ACCESS_SYNC_DIR_PREFIX=sg
-ACCESS_SYNC_DIR_SEPARATOR=-
-ACCESS_SYNC_PLATFORMS_JSON={"aws": {"adapter_type": "aws_identity_center", "authn_token": "authn", "authn_removal_mode": "delete"}}
+ACCESS_CONFIG_ENV_DIR_PREFIX=sg
+ACCESS_CONFIG_ENV_DIR_DOMAIN=cds-snc.ca
+ACCESS_CONFIG_ENV_DIR_SEPARATOR=-
+ACCESS_CONFIG_ENV_PLATFORMS_JSON={"aws": {"adapter_type": "aws_identity_center", "authn_token": "authn", "authn_removal_mode": "delete"}}
 ```
 
-`ACCESS_SYNC_PLATFORMS_JSON` is the platforms block only — not the full config document. Add these vars to the `sre-bot-config` (or `sre-bot-config-infrastructure`) SSM parameter alongside the other app config.
+`ACCESS_CONFIG_ENV_PLATFORMS_JSON` is the platforms block only — not the full config document. Production sets none of them: the access plugins are off there, and the container no longer reads a `.env` from SSM (TASK-111.15.1). Where a deployment's access configuration lives is TASK-166's (the access rebuild).
 
 **For local development**, use `file_json` instead:
 
@@ -81,11 +84,10 @@ ACCESS_CONFIG_REF=/workspace/app/packages/access/access.local.json
 
 ### Operational settings
 
-All sync operational settings are in `AccessSyncSettings` (a slice of `AccessSettings` in `packages/access/common/settings.py`):
+The plugin runs when its `[plugins.platform_access]` key `access.sync` is true (off by default; see `packages/access/README.md`). Its operational settings are in `AccessSyncSettings` (`packages/access/common/settings.py`):
 
 | Env var | Default | Description |
 |---|---|---|
-| `ACCESS_SYNC_ENABLED` | `false` | Master on/off switch |
 | `ACCESS_SYNC_RECONCILIATION_ENABLED` | `false` | Enable scheduled batch sync |
 | `ACCESS_SYNC_RECONCILIATION_SCHEDULE` | `03:00` | Daily run time (UTC, HH:MM) |
 | `ACCESS_SYNC_JOB_TTL_SECONDS` | `86400` | Retention for completed/failed job records |
@@ -94,7 +96,6 @@ All sync operational settings are in `AccessSyncSettings` (a slice of `AccessSet
 ### Scheduled reconciliation
 
 ```
-ACCESS_SYNC_ENABLED=true
 ACCESS_SYNC_RECONCILIATION_ENABLED=true
 ACCESS_SYNC_RECONCILIATION_SCHEDULE=03:00   # UTC, HH:MM
 ```
@@ -106,15 +107,19 @@ ACCESS_SYNC_RECONCILIATION_SCHEDULE=03:00   # UTC, HH:MM
 1. **Create the adapter class** in `adapters/<platform>.py`. Implement the `AccessSyncAdapter` protocol:
 
    ```python
-     class MyPlatformAdapter:
+   class MyPlatformAdapter:
        def capabilities(self) -> AdapterCapabilities: ...
        def ensure_user(self, user_email: str) -> OperationResult: ...
        def disable_user(self, user_email: str) -> OperationResult: ...
        def remove_user(self, user_email: str) -> OperationResult: ...
        def apply_entitlement(self, user_email: str, entitlement_type: str, entitlement_id: str) -> OperationResult: ...
        def remove_entitlement(self, user_email: str, entitlement_type: str, entitlement_id: str) -> OperationResult: ...
-       def reconcile_user(self, user_email: str, desired_state: DesiredUserState, context: PlanningContext, dry_run: bool = False) -> OperationResult: ...
-       def reconcile_platform(self, desired_states: Dict[str, DesiredUserState], context: PlanningContext, dry_run: bool = False) -> OperationResult: ...
+       def reconcile_user(
+           self, user_email: str, desired_state: DesiredUserState, context: PlanningContext, dry_run: bool = False
+       ) -> OperationResult: ...
+       def reconcile_platform(
+           self, desired_states: Dict[str, DesiredUserState], context: PlanningContext, dry_run: bool = False
+       ) -> OperationResult: ...
        def list_all_provisioned_users(self) -> OperationResult: ...
        def list_group_members(self, group_id: str) -> OperationResult: ...
    ```
@@ -169,4 +174,4 @@ ACCESS_SYNC_RECONCILIATION_SCHEDULE=03:00   # UTC, HH:MM
 | `store.py` | `SyncRunRepository` — persists audit records |
 | `transport/` | HTTP routes and Slack command handlers |
 
-**Settings** live in `packages/access/common/settings.py` as `AccessSyncSettings` (slice of `AccessSettings`).
+**Settings** live in `packages/access/common/settings.py` as `AccessSyncSettings`.

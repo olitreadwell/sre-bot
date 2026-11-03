@@ -1,7 +1,7 @@
-.PHONY: dev dev-setup fmt install lint test test-unit test-integration test-legacy test-all fmt-ci lint-ci install-dev run test-coverage test-coverage-unit backlog-board audit-client-usage-matrix client-usage-matrix check-deprecated-client-imports check-sdk-typing
+.PHONY: dev dev-setup fmt install lint test test-unit test-integration test-legacy test-all fmt-ci lint-ci install-dev run test-coverage-unit backlog-board audit-client-usage-matrix client-usage-matrix check-sdk-typing check-vendor-package-contract check-runtime-imports check-aws-platform-seam check-import-contracts check-fake-coverage check-settings-key-ownership env-example debug install-ci lint-types lock-check test-coverage-integration test-coverage-all test-coverage test-new
 
 dev:
-	SLACK__COMMAND_PREFIX="dev-" uv run uvicorn main:server_app --reload
+	ENVIRONMENT=local uv run uvicorn --factory main:create_app --reload
 
 dev-setup: # Requires to be signed in to AWS
 	uv sync
@@ -9,7 +9,7 @@ dev-setup: # Requires to be signed in to AWS
 	sh ../.devcontainer/dynamodb-create.sh
 
 debug:
-	SLACK__COMMAND_PREFIX="dev-" LOG_LEVEL=DEBUG uv run uvicorn main:server_app --reload
+	ENVIRONMENT=local LOGGING__LOG_LEVEL=DEBUG uv run uvicorn --factory main:create_app --reload
 
 fmt:
 	uv run ruff check --fix . $(ARGS)
@@ -27,34 +27,35 @@ lint:
 lint-types:
 	@command -v uv >/dev/null 2>&1 && uv run mypy . --check-untyped-defs --explicit-package-bases || echo "⚠️  uv not installed. Run 'make install-dev' to enable type checking."
 
+# Test runs skip coverage so they stay fast in sessions and CI; use test-coverage for a report.
+PYTEST_ARGS = --show-capture=log --log-level=INFO -r fE
+LEGACY_TEST_PATHS = tests/api tests/modules tests/integrations tests/utils tests/test_factory_validation.py
+
 # NEW STRUCTURE: Pure unit tests
 test-unit:
-	uv run coverage run -m pytest tests/unit --show-capture=log --log-level=INFO -r fE && \
-	uv run coverage report -m
+	uv run pytest tests/unit $(PYTEST_ARGS)
 
 # NEW STRUCTURE: Integration tests
 test-integration:
-	uv run coverage run -m pytest tests/integration --show-capture=log --log-level=INFO -r fE && \
-	uv run coverage report -m
+	uv run pytest tests/integration $(PYTEST_ARGS)
 
 # NEW STRUCTURE: Both unit and integration (recommended going forward)
 test-new:
-	uv run coverage run -m pytest tests/unit tests/integration --show-capture=log --log-level=INFO -r fE && \
-	uv run coverage report -m
+	uv run pytest tests/unit tests/integration $(PYTEST_ARGS)
 
 # LEGACY: All legacy tests (gradual phase-out)
 test-legacy:
-	uv run coverage run -m pytest \
-		tests/api \
-		tests/modules \
-		tests/integrations \
-		tests/utils \
-		tests/test_factory_validation.py \
-		--show-capture=log --log-level=INFO -r fE && \
-	uv run coverage report -m
+	uv run pytest $(LEGACY_TEST_PATHS) $(PYTEST_ARGS)
 
-# RUN ALL: New + legacy (default, maintain backward compatibility)
+# RUN ALL: New + legacy (default, maintain backward compatibility; CI runs this)
 test: test-new test-legacy
+
+# Opt-in coverage: the same suites as test, each with its coverage report
+test-coverage:
+	uv run coverage run -m pytest tests/unit tests/integration $(PYTEST_ARGS) && \
+	uv run coverage report -m
+	uv run coverage run -m pytest $(LEGACY_TEST_PATHS) $(PYTEST_ARGS) && \
+	uv run coverage report -m
 
 # ALL tests including smoke, load, performance (explicit opt-in for slower tests)
 test-all:
@@ -94,14 +95,32 @@ audit-client-usage-matrix:
 
 client-usage-matrix: audit-client-usage-matrix
 
-check-deprecated-client-imports:
-	uv run python bin/check_deprecated_infra_client_imports.py
-
 check-sdk-typing:
-	uv run python bin/check_sdk_typing.py
+	uv run python -m bin.check_sdk_typing
+
+check-vendor-package-contract:
+	uv run python -m bin.check_vendor_package_contract
+
+check-runtime-imports:
+	uv run python -m bin.check_runtime_imports
+
+check-aws-platform-seam:
+	uv run python -m bin.check_aws_platform_seam
+
+check-import-contracts:
+	uv run lint-imports
+
+check-fake-coverage:
+	uv run python -m bin.check_fake_coverage
+
+check-settings-key-ownership:
+	uv run python -m bin.check_settings_key_ownership
+
+env-example: # Regenerate app/.env.example from the settings classes
+	uv run python -m bin.generate_env_example
 
 backlog-board: # Backlog.md web UI (Kanban board) at http://localhost:6421
 	cd .. && backlog browser --no-open --port 6421
 
 run:
-	uv run uvicorn main:server_app
+	uv run uvicorn --factory main:create_app

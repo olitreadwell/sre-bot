@@ -1,9 +1,41 @@
+from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
 from models.incidents import IncidentPayload
 from modules.incident import core
+
+# The incident slice initiate_resources_creation reads when it runs; each test starts from these values.
+_SETTINGS = SimpleNamespace(
+    announcement_channel_id="",
+    security_group_id="S0SECURITYDEFAULT",
+    notify_management_group_id="S0NOTIFYDEFAULT",
+)
+
+
+_SLACK_SETTINGS = SimpleNamespace(tenant=SimpleNamespace(team_id="T0TEAM"))
+
+
+@pytest.fixture(autouse=True)
+def _incident_settings() -> Iterator[None]:
+    """Stub the incident slice and the Slack tenant the declare path reads at call time."""
+    with (
+        patch("modules.incident.core.get_incident_response_settings", return_value=_SETTINGS),
+        patch("modules.incident.core.get_slack_settings", return_value=_SLACK_SETTINGS),
+    ):
+        yield
+
+
+def test_channel_url_is_a_slack_deep_link_into_the_tenant() -> None:
+    """The link names the configured workspace, never a workspace host written in code."""
+    assert core.channel_url("C0123") == "https://slack.com/app_redirect?channel=C0123&team=T0TEAM"
+
+
+def test_channel_url_without_a_tenant_leaves_the_workspace_to_slack() -> None:
+    with patch("modules.incident.core.get_slack_settings", return_value=SimpleNamespace(tenant=None)):
+        assert core.channel_url("C0123") == "https://slack.com/app_redirect?channel=C0123"
 
 
 def helper_generate_default_incident_params():
@@ -44,7 +76,7 @@ def _mock_successful_dependencies(
     mock_db_operations.create_incident.return_value = "incident_id"
 
 
-@patch("modules.incident.core.INCIDENT_CHANNEL", "incident-channel")
+@patch.object(_SETTINGS, "announcement_channel_id", "incident-channel")
 @patch("modules.incident.core.logger")
 @patch("modules.incident.core.on_call.get_on_call_users_from_folder")
 @patch("modules.incident.core.db_operations")
@@ -62,7 +94,7 @@ def test_initiate_resources_creation_succeeds(
     mock_logger,
     set_environment,
 ):
-    set_environment(core.app_settings, "production")
+    set_environment("production")
 
     incident_payload = helper_generate_default_incident_params()
     mock_get_on_call_users_from_folder.return_value = [
@@ -116,9 +148,10 @@ def test_initiate_resources_creation_succeeds(
 • `/sre incident schedule retro` - Schedule a retrospective meeting
 • `/sre incident close` - Close and archive this incident
 • `/sre incident status update <status>` - Update incident status
-• `/sre incident updates add` - Add incident updates
+• `/sre incident status-update` - Draft, review and approve a public status update
 • `/sre incident show` - View incident details
 • `/sre incident summarize` - Summarize the channel to catch up someone joining the incident (optionally add `--since 30m` or `--since 2h` to limit the time range)
+• `/sre incident draft` - Draft an incident report from this channel into a new document, ready for you to review and edit
 
 *Quick Actions:*
 📋 Use the bookmarked incident report above to document findings
@@ -175,7 +208,7 @@ _Type_ `/sre incident help` _for complete command list_"""
         "name",
         "slug",
         "product",
-        "https://gcdigital.slack.com/archives/channel_id",
+        "https://slack.com/app_redirect?channel=channel_id&team=T0TEAM",
     )
 
     mock_db_operations.create_incident.assert_called_once_with(
@@ -189,6 +222,7 @@ _Type_ `/sre incident help` _for complete command list_"""
             "meet_url": "https://meet.google.com/aaa-bbbb-ccc",
             "environment": "prod",
             "severity": None,
+            "security_incident": True,
         }
     )
 
@@ -218,10 +252,51 @@ _Type_ `/sre incident help` _for complete command list_"""
         "document_id",
         "name",
         "product",
-        "https://gcdigital.slack.com/archives/channel_id",
+        "https://slack.com/app_redirect?channel=channel_id&team=T0TEAM",
         "test user name",
     )
     mock_logger.info.assert_any_call("incident_record_created", incident_id="incident_id")
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected_label"),
+    [("production", "prod"), ("local", "dev"), ("ci", "dev")],
+)
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.on_call.get_on_call_users_from_folder")
+@patch("modules.incident.core.db_operations")
+@patch("modules.incident.core.meet")
+@patch("modules.incident.core.incident_document")
+@patch("modules.incident.core.incident_folder")
+def test_initiate_resources_creation_labels_record_environment(
+    mock_incident_folder,
+    mock_incident_document,
+    mock_google_meet,
+    mock_db_operations,
+    mock_get_on_call_users_from_folder,
+    mock_logger,
+    environment,
+    expected_label,
+    set_environment,
+):
+    """The stored incident is labelled prod only in production; every other environment stores dev.
+
+    Google, Meet and the database are stubbed; the assertion reads the environment
+    field of the record handed to the database, which is what downstream reports filter on.
+    """
+    set_environment(environment)
+    _mock_successful_dependencies(
+        mock_incident_folder,
+        mock_incident_document,
+        mock_google_meet,
+        mock_db_operations,
+        mock_get_on_call_users_from_folder,
+    )
+
+    core.initiate_resources_creation(MagicMock(), helper_generate_default_incident_params())
+
+    record = mock_db_operations.create_incident.call_args.args[0]
+    assert record["environment"] == expected_label
 
 
 @patch("modules.incident.core.logger")
@@ -422,6 +497,7 @@ def test_initiate_resources_creation_db_fails(
     mock_logger.info.assert_any_call("incident_document_created", document_id="doc_id")
 
 
+@patch.object(_SETTINGS, "security_group_id", "S0SECURITY")
 @patch("modules.incident.core.logger")
 @patch("modules.incident.core.on_call.get_on_call_users_from_folder")
 @patch("modules.incident.core.db_operations")
@@ -559,7 +635,7 @@ def test_initiate_resources_creation_notify_group_added(
         "ok": True,
         "users": ["notify_user_1", "notify_user_2"],
     }
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", "NOTIFY_GROUP_ID"):
+    with patch.object(_SETTINGS, "notify_management_group_id", "NOTIFY_GROUP_ID"):
         core.initiate_resources_creation(client, incident_payload)
 
     client.usergroups_users_list.assert_called_once_with(usergroup="NOTIFY_GROUP_ID")
@@ -625,7 +701,7 @@ def test_initiate_resources_creation_notify_group_fails(
     client = MagicMock()
 
     client.usergroups_users_list.side_effect = Exception("notify group error")
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", "NOTIFY_GROUP_ID"):
+    with patch.object(_SETTINGS, "notify_management_group_id", "NOTIFY_GROUP_ID"):
         try:
             core.initiate_resources_creation(client, incident_payload)
         except Exception as e:
@@ -640,7 +716,7 @@ def test_initiate_resources_creation_notify_group_fails(
     mock_logger.info.assert_any_call("incident_record_created", incident_id="incident_id")
 
 
-# --- SLACK_NOTIFY_MGMT_USER_GROUP_ID-specific tests ---
+# --- notify_management_group_id-specific tests ---
 
 
 def _notify_incident_payload():
@@ -673,12 +749,12 @@ def test_notify_incident_group_id_not_set_skips_usergroups_call(
     mock_get_on_call,
     _mock_logger,
 ):
-    """When SLACK_NOTIFY_MGMT_USER_GROUP_ID is None, usergroups_users_list is never called."""
+    """When notify_management_group_id is None, usergroups_users_list is never called."""
     incident_payload = _notify_incident_payload()
     _setup_notify_mocks(mock_incident_document, mock_google_meet, mock_db_operations, mock_get_on_call)
     client = MagicMock()
 
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", None):
+    with patch.object(_SETTINGS, "notify_management_group_id", None):
         core.initiate_resources_creation(client, incident_payload)
 
     client.usergroups_users_list.assert_not_called()
@@ -709,7 +785,7 @@ def test_notify_incident_slack_api_returns_ok_false_does_not_invite(
         "error": "no_such_subteam",
     }
 
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", "NOTIFY_GROUP_ID"):
+    with patch.object(_SETTINGS, "notify_management_group_id", "NOTIFY_GROUP_ID"):
         core.initiate_resources_creation(client, incident_payload)
 
     # Only the creator invite should happen, no batch notify invite
@@ -747,7 +823,7 @@ def test_notify_incident_creator_excluded_from_notify_group_invite(
         "users": ["user_id", "notify_user_1"],
     }
 
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", "NOTIFY_GROUP_ID"):
+    with patch.object(_SETTINGS, "notify_management_group_id", "NOTIFY_GROUP_ID"):
         core.initiate_resources_creation(client, incident_payload)
 
     # Only notify_user_1 should be in the batch invite (user_id excluded)
@@ -776,13 +852,14 @@ def test_notify_incident_empty_group_does_not_batch_invite(
     client = MagicMock()
     client.usergroups_users_list.return_value = {"ok": True, "users": []}
 
-    with patch("modules.incident.core.SLACK_NOTIFY_MGMT_USER_GROUP_ID", "NOTIFY_GROUP_ID"):
+    with patch.object(_SETTINGS, "notify_management_group_id", "NOTIFY_GROUP_ID"):
         core.initiate_resources_creation(client, incident_payload)
 
     # Only the creator invite should happen, no second batch invite
     client.conversations_invite.assert_called_once_with(channel="channel_id", users="user_id")
 
 
+@patch.object(_SETTINGS, "security_group_id", "S0SECURITY")
 @patch("modules.incident.core.logger")
 @patch("modules.incident.core.on_call.get_on_call_users_from_folder")
 @patch("modules.incident.core.db_operations")
@@ -816,8 +893,166 @@ def test_contract_security_group_invite_uses_environment_not_prefix(
         "users": ["security_user_1", "security_user_2"],
     }
 
-    set_environment(core.app_settings, "local")
+    set_environment("local")
 
     core.initiate_resources_creation(client, incident_payload)
 
     client.conversations_invite.assert_called_once_with(channel="channel_id", users="user_id")
+
+
+@patch.object(_SETTINGS, "security_group_id", None)
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.on_call.get_on_call_users_from_folder")
+@patch("modules.incident.core.db_operations")
+@patch("modules.incident.core.meet")
+@patch("modules.incident.core.incident_document")
+@patch("modules.incident.core.incident_folder")
+@patch("modules.incident.incident_conversation.create_incident_conversation")
+def test_security_incident_without_a_configured_security_group_skips_the_group_invite(
+    _mock_create_incident_conversation,
+    _mock_incident_folder,
+    mock_incident_document,
+    mock_google_meet,
+    mock_db_operations,
+    mock_get_on_call_users_from_folder,
+    mock_logger,
+    set_environment,
+):
+    """With no security user group configured, declaring a security incident still completes.
+
+    The Slack client is a mock so a group lookup would be recorded: none is made,
+    a warning is logged, and only the declaring user is invited.
+    """
+    incident_payload = helper_generate_default_incident_params()
+    incident_payload.security_incident = "yes"
+    mock_get_on_call_users_from_folder.return_value = []
+    mock_google_meet.create_space.return_value = {"meetingUri": "meet_url"}
+    mock_incident_document.create_incident_document.return_value = "doc_id"
+    mock_db_operations.create_incident.return_value = "incident_id"
+    client = MagicMock()
+    set_environment("production")
+
+    core.initiate_resources_creation(client, incident_payload)
+
+    client.usergroups_users_list.assert_not_called()
+    mock_logger.warning.assert_any_call("security_user_group_not_configured", channel_id="channel_id")
+    client.conversations_invite.assert_called_once_with(channel="channel_id", users="user_id")
+
+
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.on_call.get_on_call_users_from_folder")
+@patch("modules.incident.core.db_operations")
+@patch("modules.incident.core.meet")
+@patch("modules.incident.core.incident_document")
+@patch("modules.incident.core.incident_folder")
+@patch("modules.incident.incident_conversation.create_incident_conversation")
+def test_declare_stores_security_incident_true_for_yes(
+    _mock_create_incident_conversation,
+    _mock_incident_folder,
+    mock_incident_document,
+    mock_google_meet,
+    mock_db_operations,
+    mock_get_on_call_users_from_folder,
+    _mock_logger,
+):
+    """When security_incident is 'yes', it is stored as True in the database."""
+    incident_payload = helper_generate_default_incident_params()
+    incident_payload.security_incident = "yes"
+    mock_get_on_call_users_from_folder.return_value = []
+    mock_google_meet.create_space.return_value = {"meetingUri": "meet_url"}
+    mock_incident_document.create_incident_document.return_value = "doc_id"
+    mock_db_operations.create_incident.return_value = "incident_id"
+    client = MagicMock()
+
+    core.initiate_resources_creation(client, incident_payload)
+
+    call_kwargs = mock_db_operations.create_incident.call_args.kwargs
+    incident_data = (
+        call_kwargs.get("incident_data") if "incident_data" in call_kwargs else mock_db_operations.create_incident.call_args[0][0]
+    )
+    assert incident_data.get("security_incident") is True
+
+
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.on_call.get_on_call_users_from_folder")
+@patch("modules.incident.core.db_operations")
+@patch("modules.incident.core.meet")
+@patch("modules.incident.core.incident_document")
+@patch("modules.incident.core.incident_folder")
+@patch("modules.incident.incident_conversation.create_incident_conversation")
+def test_declare_stores_security_incident_false_for_no(
+    _mock_create_incident_conversation,
+    _mock_incident_folder,
+    mock_incident_document,
+    mock_google_meet,
+    mock_db_operations,
+    mock_get_on_call_users_from_folder,
+    _mock_logger,
+):
+    """When security_incident is 'no', it is stored as False in the database."""
+    incident_payload = helper_generate_default_incident_params()
+    incident_payload.security_incident = "no"
+    mock_get_on_call_users_from_folder.return_value = []
+    mock_google_meet.create_space.return_value = {"meetingUri": "meet_url"}
+    mock_incident_document.create_incident_document.return_value = "doc_id"
+    mock_db_operations.create_incident.return_value = "incident_id"
+    client = MagicMock()
+
+    core.initiate_resources_creation(client, incident_payload)
+
+    call_kwargs = mock_db_operations.create_incident.call_args.kwargs
+    incident_data = (
+        call_kwargs.get("incident_data") if "incident_data" in call_kwargs else mock_db_operations.create_incident.call_args[0][0]
+    )
+    assert incident_data.get("security_incident") is False
+
+
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.on_call.get_on_call_users_from_folder")
+@patch("modules.incident.core.db_operations")
+@patch("modules.incident.core.meet")
+@patch("modules.incident.core.incident_document")
+@patch("modules.incident.core.incident_folder")
+@patch("modules.incident.incident_conversation.create_incident_conversation")
+def test_declare_stores_security_incident_none_for_other_values(
+    _mock_create_incident_conversation,
+    _mock_incident_folder,
+    mock_incident_document,
+    mock_google_meet,
+    mock_db_operations,
+    mock_get_on_call_users_from_folder,
+    _mock_logger,
+):
+    """When security_incident is any other value, it is stored as None in the database."""
+    incident_payload = helper_generate_default_incident_params()
+    incident_payload.security_incident = "unknown"
+    mock_get_on_call_users_from_folder.return_value = []
+    mock_google_meet.create_space.return_value = {"meetingUri": "meet_url"}
+    mock_incident_document.create_incident_document.return_value = "doc_id"
+    mock_db_operations.create_incident.return_value = "incident_id"
+    client = MagicMock()
+
+    core.initiate_resources_creation(client, incident_payload)
+
+    call_kwargs = mock_db_operations.create_incident.call_args.kwargs
+    incident_data = (
+        call_kwargs.get("incident_data") if "incident_data" in call_kwargs else mock_db_operations.create_incident.call_args[0][0]
+    )
+    assert "security_incident" in incident_data
+    assert incident_data["security_incident"] is None
+
+
+@patch("modules.incident.core.logger")
+@patch("modules.incident.core.db_operations")
+def test_recreate_database_record_leaves_security_incident_unset(mock_db_operations, _mock_logger):
+    """The recreate-missing-resources path has no security answer, so its incident data
+    carries no security_incident key and the model default stores the flag as unknown."""
+    mock_db_operations.create_incident.return_value = "incident_id"
+    results: dict = {"success": [], "errors": []}
+
+    core._create_database_record(
+        "channel_id", "channel_name", "incident_name", "product", "user_id", "doc_link", "meet_url", results
+    )
+
+    incident_data = mock_db_operations.create_incident.call_args.args[0]
+    assert "security_incident" not in incident_data

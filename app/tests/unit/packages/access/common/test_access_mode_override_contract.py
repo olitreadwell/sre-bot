@@ -2,10 +2,11 @@
 
 from dataclasses import dataclass
 
+from contracts.operations import OperationResult
 from infrastructure.directory.models import DirectoryGroup, MembershipCheckResult
-from infrastructure.operations import OperationResult
 from packages.access.catalog.service import CatalogService
 from packages.access.common.config import AccessRuntimeConfig, PlatformPolicy
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.request.policies import check_entitlement_mode
 from packages.access.sync.policies import resolve_effective_policy
 
@@ -16,7 +17,7 @@ class _FakeDirectory:
 
     groups: list[DirectoryGroup]
 
-    def list_groups(self, query: str) -> OperationResult[list[DirectoryGroup]]:
+    def list_groups(self, query: str = "", limit: int | None = None) -> OperationResult[list[DirectoryGroup]]:
         return OperationResult.success(data=list(self.groups))
 
     def check_membership(
@@ -38,6 +39,7 @@ class _FakeDirectory:
 def _runtime_config(mode_overrides: dict[str, str]) -> AccessRuntimeConfig:
     return AccessRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         dir_separator="-",
         platforms={
             "aws": PlatformPolicy(
@@ -62,6 +64,7 @@ def _catalog_mode(config: AccessRuntimeConfig) -> tuple[str, bool]:
             ]
         ),
         parsers={},
+        policy=ManagedGroupPolicy.from_config(config),
     )
     result = service.list_entitlements(platform="aws", user_email="user@example.com")
     assert result.is_success
