@@ -1,0 +1,54 @@
+"""Integration tests for the single /sre Slack command registration at startup."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import SecretStr
+
+from integrations.slack.formatter import SlackBlockKitFormatter
+from integrations.slack.provider import SlackPlatformProvider
+from server.lifespan import _register_legacy_handlers, _register_legacy_slack_commands
+from server.slack.settings import get_slack_transport_settings
+
+
+@pytest.mark.integration
+def test_legacy_slack_commands_and_legacy_handlers_register_sre_command_once(mock_bot):
+    """The /sre slash command is registered on the Bolt app exactly once.
+
+    Runs both startup registration phases against one recording bot: the
+    real legacy sre and dev Slack command registration followed by the
+    provider's root-command auto-registration, then the hard-coded legacy
+    handler list. Only the modules that could register /sre run for real; the
+    other legacy modules are patched out because they register unrelated
+    commands and interactions. Both phases build the slash command from the
+    same transport prefix, so a count above one means the command is wired by
+    two paths.
+    """
+    # Arrange
+    command_prefix = get_slack_transport_settings().command_prefix
+    settings = SimpleNamespace(app_token=SecretStr("xapp-test"), bot_token=SecretStr("xoxb-test"))
+    provider = SlackPlatformProvider(
+        settings=settings,
+        formatter=SlackBlockKitFormatter(),
+        command_prefix=command_prefix,
+    )
+    provider._app = mock_bot
+
+    # Act
+    _register_legacy_slack_commands(provider, MagicMock())
+    provider._auto_register_root_commands()
+    with (
+        patch("server.lifespan.role"),
+        patch("server.lifespan.atip"),
+        patch("server.lifespan.aws"),
+        patch("server.lifespan.secret"),
+        patch("server.lifespan.webhook_helper"),
+        patch("server.lifespan.incident"),
+        patch("server.lifespan.incident_helper"),
+    ):
+        _register_legacy_handlers(mock_bot, MagicMock())
+
+    # Assert
+    registered = [call.args[0] for call in mock_bot.command.call_args_list]
+    assert registered.count(f"/{command_prefix}sre") == 1

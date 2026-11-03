@@ -1,23 +1,27 @@
 # On-call Sync
 
-Sync OpsGenie on-call schedules to Slack UserGroups to make contacting on-call folks in Slack easier. This allows folks to use @foo-on-call in Slack instead of trying to figure out who's currently on-call.
+Sync OpsGenie on-call schedules and self-managed user rotations to Slack UserGroups to make contacting responsible people in Slack easier. This allows folks to use @foo-on-call in Slack instead of trying to figure out who's currently on-call.
 
 ## How it works
 
-Synced rotations are defined in [rotations.json](./rotations.json).
+Synced rotations are defined in [rotations.json](./rotations.json). Defined rotations are synced with UserGroups in Slack. Schedule-level Slack UserGroups can also be synced that will contain all members of the nested rotations. The schedule-level Slack UserGroup is created if `slack_handle` and `slack_name` are set on the schedule object.
 
-Every 5 minutes, SRE Bot will fetch the current on-call individual for each rotation and update the linked Slack UserGroup if necessary. SRE Bot will also update the schedule-level UserGroup to contain all folks on-call for the nested rotations.
+Self-managed (non-OpsGenie) rotations are defined in [user_rotations](../user_rotations/).
+
+Every 5 minutes, SRE Bot will fetch the current on-call individual for each rotation and the current user for each self-managed rotation, then update the linked Slack UserGroups if necessary. SRE Bot will also update the schedule-level UserGroup to contain all folks on-call for the nested rotations.
+
+The optional top-level `approved_email_domains` list in [rotations.json](./rotations.json) restricts which participant emails are looked up in Slack. Emails outside those domains are skipped without calling Slack and logged with a hashed fingerprint instead of the raw address. Leaving the list empty disables the filtering.
 
 ## Getting started
 
-1. Figure out your OpsGenie schedule ID and rotation names. To find the schedule ID, navigate to OpsGenie, click "Who is on-call" at the top, click on your schedule, then grab the ID from the URL. The rotation names are copied directly from this schedule view.
+1. Figure out your OpsGenie schedule ID and rotation names. To find the schedule ID, navigate to OpsGenie, click "Who is on-call" at the top, click on your schedule, then grab the ID from the URL. The rotation names are copied directly from this schedule view. Set schedule-level `slack_handle` and `slack_name` only when you want an aggregate group for all nested rotations.
 2. Update [rotations.json](./rotations.json). **The Slack UserGroup handle and name does not need to already exist. SRE Bot will create the group automatically**.
 3. Push up a PR, get it approved, and merge. Your group should be created and live within 10-15 minutes.
 
 ## Slack Service Identity
 
 - Identity: Dedicated Slack service account for on-call user-group synchronization, with workspace Admin or Owner privileges.
-- Credential type: Slack user token (xoxp-) configured as SLACK_USER_TOKEN.
+- Credential type: Slack user token (xoxp-) configured as SLACK__USER_TOKEN.
 - Scopes: usergroups:write, usergroups:read, users:read.email.
 - Owner: Platform team shared ownership; never tied to an individual engineer account.
 - Rotation trigger: Rotate immediately on compromise suspicion, ownership changes, or loss of required Admin/Owner role.

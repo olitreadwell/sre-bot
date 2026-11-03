@@ -28,11 +28,7 @@ data "aws_iam_policy_document" "sre-bot_secrets_manager" {
       "ssm:GetParameters",
       "ssm:GetParameter",
     ]
-    resources = [
-      "arn:aws:ssm:ca-central-1:${data.aws_caller_identity.current.account_id}:parameter/sre-bot-config",
-      "arn:aws:ssm:ca-central-1:${data.aws_caller_identity.current.account_id}:parameter/sre-bot-config-infrastructure",
-      aws_ssm_parameter.gcp_sre_service_account_key.arn
-    ]
+    resources = [for name in sort(local.sre_bot_secret_names) : aws_ssm_parameter.sre_bot_secret[name].arn]
   }
 
   statement {
@@ -47,17 +43,21 @@ data "aws_iam_policy_document" "sre-bot_secrets_manager" {
       "dynamodb:DeleteItem"
     ]
 
-    resources = [
-      aws_dynamodb_table.aws_access_requests_table.arn,
-      aws_dynamodb_table.webhooks_table.arn,
-      aws_dynamodb_table.sre_bot_access.arn,
-      aws_dynamodb_table.sre_bot_access_requests.arn,
-      aws_dynamodb_table.incidents_table.arn,
-      aws_dynamodb_table.sre_bot_idempotency.arn,
-      aws_dynamodb_table.sre_bot_audit_trail.arn,
-      aws_dynamodb_table.sre_bot_retry_records.arn
+    resources = local.dynamodb_table_arns
+
+  }
+
+  statement {
+    effect = "Allow"
+
+    actions = [
+      "dynamodb:Query"
     ]
 
+    resources = [
+      "${aws_dynamodb_table.incidents_table.arn}/index/*",
+      "${aws_dynamodb_table.sre_bot_audit_trail.arn}/index/*"
+    ]
   }
 }
 

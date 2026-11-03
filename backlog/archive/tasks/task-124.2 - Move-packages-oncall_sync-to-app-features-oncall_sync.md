@@ -1,0 +1,44 @@
+---
+id: TASK-124.2
+title: Move packages/oncall_sync to app/features/oncall_sync/
+status: To Do
+assignee: []
+created_date: '2026-09-24 20:01'
+updated_date: '2026-10-09 17:00'
+labels:
+  - plugin-architecture
+  - features
+  - superseded
+milestone: m-7
+dependencies:
+  - TASK-109
+  - TASK-110
+  - TASK-114
+  - TASK-25.4
+  - TASK-25.6
+references:
+  - decisions/feature-packages.md
+  - decisions/plugin-architecture.md
+parent_task_id: TASK-124
+priority: medium
+type: task
+ordinal: 268000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+SUPERSEDED (2026-10-09) by TASK-146.2: oncall_sync moves once it consumes the on-call capability. This task is kept as history and is not to be planned or implemented.
+
+Child of TASK-124. oncall_sync has a ports.py outside the layout table. Its Slack client is already built in adapters/slack.py (build_user_group_sync_target, through the TASK-25.4 factory), so providers.py imports nothing from integrations/. It moves after the rotations capability (TASK-123) removes its feature-to-feature import, and after TASK-25.6 moves the Opsgenie operations into its adapters.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 features/<name>/ passes the package-shape check; platforms/ and interactions/ are renamed entrypoints/
+- [ ] #2 providers.py resolves contracts from the service registry and imports nothing from infrastructure/ or server/; integrations are imported only from adapters/
+- [ ] #3 The entry point targets features.<name> (dotted for subdomains) and has an enablement key; the settings slice's non-secret values live in the TOML files
+- [ ] #4 The old packages/ path is deleted; every importer and mock patch string is rewritten; import-linter ignore entries only shrank
+- [ ] #5 ruff, mypy (no new errors in touched files), lint-imports and pytest tests --ignore=tests/smoke pass
+- [ ] #6 ports.py is folded into layout-table names; no slack_sdk client is built outside adapters/
+<!-- AC:END -->

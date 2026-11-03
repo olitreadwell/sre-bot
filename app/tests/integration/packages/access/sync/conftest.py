@@ -43,14 +43,15 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
+from contracts.operations import OperationResult
 from infrastructure.directory.models import (
     DirectoryGroup,
     DirectoryMember,
     MembershipCheckResult,
 )
-from infrastructure.operations import OperationResult
 from packages.access.common.config import AccessRuntimeConfig as AccessSyncRuntimeConfig
 from packages.access.common.config import PlatformPolicy
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.sync.adapters.aws_identity_center import AwsIdentityCenterAdapter
 from packages.access.sync.application import AccessSyncApplicationService
 from packages.access.sync.desired_state import DirectoryMembershipBuilder
@@ -74,7 +75,6 @@ from packages.access.sync.policies import (
 # ---------------------------------------------------------------------------
 
 _ACCESS_SYNC_ENV_KEYS = [
-    "ACCESS_SYNC_ENABLED",
     "ACCESS_SYNC_RECONCILIATION_ENABLED",
     "ACCESS_SYNC_JOB_TTL_SECONDS",
     "ACCESS_CONFIG_SOURCE",
@@ -110,11 +110,17 @@ class FakeDirectory:
         transitive_membership_slugs: set[str] | None = None,
         user_direct_group_slugs: set[str] | None = None,
         group_members: dict[str, list[str]] | None = None,
+        batch_members_result: OperationResult | None = None,
+        group_result_by_slug: dict[str, OperationResult] | None = None,
+        list_groups_result: OperationResult | None = None,
     ) -> None:
         self._discovered: set[str] = discovered_slugs or set()
         self._transitive: set[str] = transitive_membership_slugs or set()
         self._direct: set[str] = user_direct_group_slugs or set()
         self._members: dict[str, list[str]] = group_members or {}
+        self._batch_members_result = batch_members_result
+        self._group_result_by_slug: dict[str, OperationResult] = group_result_by_slug or {}
+        self._list_groups_result = list_groups_result
 
     def _make_group(self, slug: str) -> DirectoryGroup:
         return DirectoryGroup(
@@ -123,9 +129,12 @@ class FakeDirectory:
             provider_group_id=f"gid-{slug}",
         )
 
-    def get_group(self, slug: str) -> OperationResult:
-        # Groups always exist in the IDP directory; only membership is configurable.
-        # The membership question is answered by check_membership / get_user_groups.
+    def get_group(self, group_key: str) -> OperationResult:
+        # Groups always exist in the IDP directory unless a per-slug result is injected;
+        # the membership question is answered by check_membership / get_user_groups.
+        slug = group_key.partition("@")[0]
+        if slug in self._group_result_by_slug:
+            return self._group_result_by_slug[slug]
         return OperationResult.success(data=self._make_group(slug))
 
     def check_membership(self, group_email: str, user_email: str) -> OperationResult:
@@ -158,6 +167,8 @@ class FakeDirectory:
         group_emails: list[str],
         include_member_types: set[str] | None = None,
     ) -> OperationResult:
+        if self._batch_members_result is not None:
+            return self._batch_members_result
         result = {}
         for group_email in group_emails:
             slug = group_email.split("@")[0]
@@ -166,6 +177,8 @@ class FakeDirectory:
         return OperationResult.success(data=result)
 
     def list_groups(self, query: str = "") -> OperationResult:
+        if self._list_groups_result is not None:
+            return self._list_groups_result
         matching = [self._make_group(slug) for slug in self._discovered if not query or slug.startswith(query)]
         return OperationResult.success(data=matching)
 
@@ -384,11 +397,13 @@ def make_sync_config():
         authn_removal_mode: str = "delete",
         mode_overrides: dict[str, Literal["sync_managed", "ephemeral", "deactivated"]] | None = None,
         dir_prefix: str = "sg",
+        dir_domain: str = "example.com",
         dir_separator: str = "-",
         adapter_type: str = "fake",
     ) -> AccessSyncRuntimeConfig:
         return AccessSyncRuntimeConfig(
             dir_prefix=dir_prefix,
+            dir_domain=dir_domain,
             dir_separator=dir_separator,
             platforms={
                 platform: PlatformPolicy(
@@ -471,7 +486,7 @@ def make_coordinator(make_sync_config):
         coordinator = AccessSyncApplicationService(
             adapters={platform: adapter},
             config=config,
-            membership_builder=DirectoryMembershipBuilder(directory_provider),
+            membership_builder=DirectoryMembershipBuilder(directory_provider, ManagedGroupPolicy.from_config(config)),
         )
         return coordinator, adapter
 
@@ -510,6 +525,7 @@ def aws_config() -> AccessSyncRuntimeConfig:
     """
     return AccessSyncRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         dir_separator="-",
         platforms={
             "aws": PlatformPolicy(

@@ -1,0 +1,66 @@
+---
+id: TASK-121
+title: >-
+  Move the spreadsheets provider from app/infrastructure/spreadsheets/ to the
+  app/capabilities/spreadsheets/ workplace capability
+status: To Do
+assignee: []
+created_date: 2026-09-24 20:00
+updated_date: '2026-10-26T19:32:00Z'
+labels:
+  - plugin-architecture
+  - capabilities
+  - workplace-systems
+milestone: m-7
+dependencies:
+  - TASK-106
+  - TASK-110
+  - TASK-114
+  - TASK-169
+references:
+  - decisions/workplace-systems.md
+  - decisions/plugin-architecture.md
+  - decisions/feature-packages.md
+  - decisions/cloud-portability.md
+  - https://github.com/cds-snc/sre-bot/issues/1664
+priority: medium
+type: task
+ordinal: 263000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+decisions/workplace-systems.md and plugin-architecture.md: workplace systems (directory, documents, files, spreadsheets, calendar, mail) are capabilities, not infrastructure. infrastructure/ is hosting-only. Their public surface is api.py (the Protocol, domain types and provider function) plus an optional hookspecs module; everything else is private. The Google implementation becomes adapters/google.py, the only file importing app.integrations.google_workspace.
+
+Today app/infrastructure/spreadsheets/ exposes a vendor-neutral Protocol with a single Google implementation behind a cached factory, re-exported through a barrel __init__.py.
+
+Scope:
+- move the package into the feature-packages shape (api.py, adapters/, settings.py, README.md with its classification and named feature consumers, and a fake);
+- repoint every consumer to api.py;
+- delete app/infrastructure/spreadsheets/ with no re-export.
+Behaviour-preserving. migration.md rule 6: the capability is not widened to reproduce legacy conventions, and legacy modules keep calling what they call today until their surface is rebuilt, except for import-path changes. The settings class moves; its configuration-file table and environment variable names do not change.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 app/capabilities/spreadsheets/ matches the feature-packages layout for a capability (the TASK-114 shape check is green); its README states the classification and at least one feature consumer
+- [ ] #2 Consumers import only app/capabilities/spreadsheets/api.py; only its adapters/ import app.integrations
+- [ ] #3 An in-memory fake of the api.py Protocol lives in the package and is exercised by tests, as the cloud-portability.md fake contract requires for externally facing capability Protocols
+- [ ] #4 app/infrastructure/spreadsheets/ is deleted with no re-export; grep finds no import of the old path, including mock patch strings
+- [ ] #5 ruff, mypy (no new errors in touched files), lint-imports and pytest tests --ignore=tests/smoke pass
+- [ ] #6 The adapter and the in_memory.py fake explicitly subclass the api.py Protocol; the SpreadsheetProvider line is removed from app/bin/baselines/fake_coverage.txt and make check-fake-coverage passes
+- [ ] #7 The capability has its pyproject entry point and an enablement key in the base configuration file (decisions/plugins.md); if it is the first package under app/capabilities/, the same PR adds capabilities to the import-linter root_packages (app/pyproject.toml:209)
+<!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-10-26T19:32:00Z
+
+---
+
+2026-10-26 (human approved): scope under review by TASK-169. decisions/workplace-systems.md now says a vendor product API is not a capability by itself; this task is expected to be re-scoped from a move into app/capabilities/ to purpose-named ports owned by its consumers over integrations/google_workspace/. Do not plan it before TASK-169 lands.
+
+---
+<!-- COMMENTS:END -->

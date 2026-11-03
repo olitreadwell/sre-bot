@@ -6,24 +6,45 @@ to exactly the provided users. Used for both single-user rotation groups and
 multi-user schedule aggregate groups.
 """
 
-from __future__ import annotations
-
+import hashlib
 from collections.abc import Sequence
 
 import structlog
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from contracts.operations.status import OperationStatus
+from integrations.slack.client import classify_slack_error, get_slack_web_client
+from integrations.slack.settings import get_slack_settings
 from packages.oncall_sync.ports import OnCallSyncError
 
 logger = structlog.get_logger()
 
 
+def _fingerprint_email(email: str) -> str:
+    """Privacy-safe, stable identifier for correlating repeated mismatches."""
+    return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()
+
+
+def _classify(exc: SlackApiError) -> tuple[OperationStatus | None, str | None]:
+    """Classified status and error code, or no status for a code the catalogues do not name.
+
+    Unnamed codes are still Slack failures of this one group, so they stay
+    ``OnCallSyncError``s and the service keeps syncing the other groups.
+    """
+    try:
+        status, error_code, _ = classify_slack_error(exc)
+    except SlackApiError:
+        return None, exc.response.get("error")
+    return status, error_code
+
+
 class SlackUserGroupTarget:
     """Mirror on-call membership into Slack user groups."""
 
-    def __init__(self, client: WebClient) -> None:
+    def __init__(self, client: WebClient, *, approved_domains: frozenset[str] = frozenset()) -> None:
         self._client = client
+        self._approved_domains = approved_domains
 
     def sync_user_group(
         self,
@@ -41,28 +62,52 @@ class SlackUserGroupTarget:
             log.info("oncall_sync_usergroup_no_resolvable_users")
             return
 
+        self.sync_user_group_ids(handle, name, description, user_ids)
+
+    def sync_user_group_ids(
+        self,
+        handle: str,
+        name: str,
+        description: str,
+        user_ids: Sequence[str],
+    ) -> None:
+        """Set the user group to contain exactly the supplied Slack user IDs."""
+        log = logger.bind(slack_handle=handle)
         try:
             usergroup_id = self._find_or_create_usergroup(handle, name, description, log)
             self._client.usergroups_users_update(usergroup=usergroup_id, users=",".join(user_ids))
         except SlackApiError as exc:
-            raise OnCallSyncError(f"Slack API call failed: {exc.response.get('error')}") from exc
-
+            status, error_code = _classify(exc)
+            detail = error_code if status is None else f"{error_code} ({status.value})"
+            raise OnCallSyncError(f"Slack API call failed: {detail}") from exc
         log.info("oncall_sync_usergroup_updated", usergroup_id=usergroup_id)
 
     def _resolve_user_id(self, email: str, log) -> str | None:
+        if self._approved_domains and not self._is_approved_domain(email):
+            log.info(
+                "oncall_sync_participant_email_domain_mismatch",
+                email_fingerprint=_fingerprint_email(email),
+            )
+            return None
         try:
             resp = self._client.users_lookupByEmail(email=email)
         except SlackApiError as exc:
+            status, error_code = _classify(exc)
             log.error(
                 "oncall_sync_user_lookup_failed",
                 email=email,
-                error=exc.response.get("error"),
+                error=error_code,
+                status=None if status is None else status.value,
             )
             return None
         if resp.get("ok"):
             user_id: str = resp["user"]["id"]
             return user_id
         return None
+
+    def _is_approved_domain(self, email: str) -> bool:
+        domain = email.rsplit("@", 1)[-1].strip().lower() if "@" in email else ""
+        return domain in self._approved_domains
 
     def _find_or_create_usergroup(self, handle: str, name: str, description: str, log) -> str:
         existing = self._lookup_usergroup(handle)
@@ -88,3 +133,13 @@ class SlackUserGroupTarget:
             if group.get("handle") == handle:
                 return group["id"], bool(group.get("date_delete", 0))
         return None
+
+
+def build_user_group_sync_target(*, approved_domains: frozenset[str] = frozenset()) -> SlackUserGroupTarget:
+    """Build the target on the admin user token; ``usergroups.*`` writes reject the bot token."""
+    if not get_slack_settings().user_token:
+        raise ValueError(
+            "SLACK__USER_TOKEN is required to sync on-call rotations into Slack user groups "
+            "(usergroups.* writes cannot use the shared inbound bot token)."
+        )
+    return SlackUserGroupTarget(get_slack_web_client(actor="user"), approved_domains=approved_domains)

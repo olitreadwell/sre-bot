@@ -1,6 +1,12 @@
 {
+    // Load the shared engineering contract (CLAUDE.md) and the shared skills in
+    // .claude/skills/ for EVERY model — GPT, Claude, MAI, Gemini.
+    // Pinned explicitly so the setup does not depend on VS Code defaults.
+    "chat.useClaudeMdFile": true,
     "chat.tools.terminal.autoApprove": {
-        "backlog": true
+        "backlog": true,
+        "rg": true,
+        "/^cd app && uv run (mypy|ruff|pytest)\\b/": true
     },
     "python.defaultInterpreterPath": "${workspaceFolder}/app/.venv/bin/python",
     "python-envs.defaultEnvManager": "ms-python.python:system",
@@ -8,6 +14,16 @@
         "${workspaceFolder}/app/.venv/bin/python"
     ],
     "ruff.organizeImports": true,
+    // Run the project-pinned mypy rather than the extension's bundled copy, and
+    // keep the editor's cache separate: two mypy processes sharing app/.mypy_cache
+    // corrupt it and crash the CLI quality gate.
+    "mypy-type-checker.interpreter": [
+        "${workspaceFolder}/app/.venv/bin/python"
+    ],
+    "mypy-type-checker.importStrategy": "fromEnvironment",
+    "mypy-type-checker.args": [
+        "--cache-dir=.mypy_cache/vscode"
+    ],
     "[python]": {
         "editor.defaultFormatter": "charliermarsh.ruff",
         "editor.formatOnSave": true,
@@ -15,5 +31,6 @@
             "source.fixAll.ruff": "explicit",
             "source.organizeImports.ruff": "explicit"
         }
-    }
+    },
+    "chat.useAgentSkills": true
 }

@@ -1,20 +1,32 @@
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
+import pytest
+
+from contracts.operations import OperationResult, OperationStatus
+from infrastructure.spreadsheets import RANGE_NOT_FOUND, SheetCell
 from modules.incident import incident_folder
 
 
-@patch("modules.incident.incident_folder.SRE_INCIDENT_FOLDER", "SRE_INCIDENT_FOLDER")
-@patch("modules.incident.incident_folder.google_drive")
-def test_list_incident_folders(google_drive_mock):
-    google_drive_mock.list_folders_in_folder.return_value = [{"id": "foo", "name": "bar"}]
+@pytest.fixture
+def logger_mock():
+    with patch("modules.incident.incident_folder.logger") as mock:
+        mock.bind.return_value = mock
+        yield mock
+
+
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(folder_id="SRE_INCIDENT_FOLDER"))
+@patch("modules.incident.incident_folder.incident_drive")
+def test_list_incident_folders(incident_drive_mock):
+    incident_drive_mock.list_child_folders.return_value = [{"id": "foo", "name": "bar"}]
     assert incident_folder.list_incident_folders() == [{"id": "foo", "name": "bar"}]
-    google_drive_mock.list_folders_in_folder.assert_called_once_with("SRE_INCIDENT_FOLDER", "not name contains 'Templates'")
+    incident_drive_mock.list_child_folders.assert_called_once_with("SRE_INCIDENT_FOLDER")
 
 
-@patch("modules.incident.incident_folder.SRE_INCIDENT_FOLDER", "SRE_INCIDENT_FOLDER")
-@patch("modules.incident.incident_folder.google_drive")
-def test_list_incident_folders_sorted(google_drive_mock):
-    google_drive_mock.list_folders_in_folder.return_value = [
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(folder_id="SRE_INCIDENT_FOLDER"))
+@patch("modules.incident.incident_folder.incident_drive")
+def test_list_incident_folders_sorted(incident_drive_mock):
+    incident_drive_mock.list_child_folders.return_value = [
         {"id": "baz", "name": "qux"},
         {"id": "foo", "name": "bar"},
     ]
@@ -22,26 +34,98 @@ def test_list_incident_folders_sorted(google_drive_mock):
         {"id": "foo", "name": "bar"},
         {"id": "baz", "name": "qux"},
     ]
-    google_drive_mock.list_folders_in_folder.assert_called_once_with("SRE_INCIDENT_FOLDER", "not name contains 'Templates'")
+    incident_drive_mock.list_child_folders.assert_called_once_with("SRE_INCIDENT_FOLDER")
 
 
-@patch("modules.incident.incident_folder.google_drive.list_folders_in_folder")
-@patch("modules.incident.incident_folder.folder_item")
-def test_list_folders_view(folder_item_mock, list_folders_in_folder_mock):
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(folder_id="SRE_INCIDENT_FOLDER"))
+@patch("modules.incident.incident_folder.incident_drive")
+def test_list_incident_folders_truncates_to_the_display_limit(incident_drive_mock):
+    """Drive listings are unbounded now, so the Slack option limit is enforced here."""
+    limit = incident_folder.LEGACY_FOLDER_DISPLAY_LIMIT
+    incident_drive_mock.list_child_folders.return_value = [{"id": str(i), "name": f"folder-{i:03d}"} for i in range(limit + 10)]
+
+    result = incident_folder.list_incident_folders()
+
+    assert len(result) == limit
+    assert result[0]["name"] == "folder-000"
+    assert result[-1]["name"] == f"folder-{limit - 1:03d}"
+
+
+def _view_client() -> MagicMock:
     client = MagicMock()
+    client.views_open.return_value = {"view": {"id": "V_LOADING"}}
+    return client
+
+
+@patch("modules.incident.incident_folder.incident_drive.list_child_folders")
+@patch("modules.incident.incident_folder.folder_item")
+def test_list_folders_view(folder_item_mock, list_child_folders_mock):
+    """The loading modal opens before the Drive read, so the trigger_id is spent within Slack's 3 seconds."""
+    client = _view_client()
+    order: list[str] = []
+    client.views_open.side_effect = lambda **kwargs: order.append("views_open") or {"view": {"id": "V_LOADING"}}
+    list_child_folders_mock.side_effect = lambda folder_id: order.append("drive_read") or [{"id": "foo", "name": "bar"}]
     body = {"trigger_id": "foo"}
     ack = MagicMock()
-    list_folders_in_folder_mock.return_value = [{"id": "foo", "name": "bar"}]
     folder_item_mock.return_value = [["folder item"]]
+
     incident_folder.list_folders_view(client, body, ack)
-    list_folders_in_folder_mock.assert_called_once()
+
+    assert order == ["views_open", "drive_read"]
     folder_item_mock.assert_called_once_with({"id": "foo", "name": "bar"})
     ack.assert_called_once()
     client.views_open.assert_called_once_with(trigger_id="foo", view=ANY)
+    assert "Loading" in str(client.views_open.call_args.kwargs["view"])
+    client.views_update.assert_called_once_with(view_id="V_LOADING", view=ANY)
+    assert client.views_update.call_args.kwargs["view"]["blocks"] == [["folder item"]]
+
+
+@patch("modules.incident.incident_folder.incident_drive.list_child_folders")
+@patch("modules.incident.incident_folder.folder_item")
+def test_list_folders_view_truncates_to_the_display_limit(folder_item_mock, list_child_folders_mock):
+    """folder_item emits three blocks per folder, so the modal must stay under Slack's 100-block cap."""
+    limit = incident_folder.LEGACY_FOLDER_DISPLAY_LIMIT
+    client = _view_client()
+    ack = MagicMock()
+    list_child_folders_mock.return_value = [{"id": str(i), "name": f"folder-{i:03d}"} for i in range(limit + 10)]
+    folder_item_mock.return_value = [{"type": "section"}, {"type": "actions"}, {"type": "divider"}]
+
+    incident_folder.list_folders_view(client, {"trigger_id": "foo"}, ack)
+
+    assert folder_item_mock.call_count == limit
+    assert len(client.views_update.call_args.kwargs["view"]["blocks"]) == limit * 3
+
+
+@patch("modules.incident.incident_folder.incident_drive.list_child_folders")
+def test_list_folders_view_with_no_folders_updates_to_a_message(list_child_folders_mock):
+    """An empty or failed read (the adapter returns []) replaces the loading text with a message."""
+    client = _view_client()
+    list_child_folders_mock.return_value = []
+
+    incident_folder.list_folders_view(client, {"trigger_id": "foo"}, MagicMock())
+
+    view = client.views_update.call_args.kwargs["view"]
+    assert client.views_update.call_args.kwargs["view_id"] == "V_LOADING"
+    assert "No products could be listed" in view["blocks"][0]["text"]["text"]
 
 
 @patch("modules.incident.incident_folder.logger")
-@patch("modules.incident.incident_folder.google_drive.delete_metadata")
+@patch("modules.incident.incident_folder.incident_drive.list_child_folders")
+def test_list_folders_view_drive_failure_updates_to_a_message_without_its_text(list_child_folders_mock, logger_mock):
+    """A raised error (a refused credential) is logged by type and never shown or logged as text."""
+    client = _view_client()
+    list_child_folders_mock.side_effect = RuntimeError("folder 1AbCsecret unreachable")
+
+    incident_folder.list_folders_view(client, {"trigger_id": "foo"}, MagicMock())
+
+    view = client.views_update.call_args.kwargs["view"]
+    assert "No products could be listed" in view["blocks"][0]["text"]["text"]
+    assert "1AbCsecret" not in str(view)
+    logger_mock.error.assert_called_once_with("incident_folders_list_failed", error_type="RuntimeError")
+
+
+@patch("modules.incident.incident_folder.logger")
+@patch("modules.incident.incident_folder.incident_drive.delete_metadata")
 @patch("modules.incident.incident_folder.view_folder_metadata")
 def test_delete_folder_metadata(view_folder_metadata_mock, delete_metadata_mock, logger_mock):
     client = MagicMock()
@@ -64,7 +148,7 @@ def test_delete_folder_metadata(view_folder_metadata_mock, delete_metadata_mock,
 
 
 @patch("modules.incident.incident_folder.logger")
-@patch("modules.incident.incident_folder.google_drive.delete_metadata")
+@patch("modules.incident.incident_folder.incident_drive.delete_metadata")
 @patch("modules.incident.incident_folder.view_folder_metadata")
 def test_delete_folder_metadata_failed(view_folder_metadata_mock, delete_metadata_mock, logger_mock):
     client = MagicMock()
@@ -83,7 +167,7 @@ def test_delete_folder_metadata_failed(view_folder_metadata_mock, delete_metadat
     logger_mock.warning.assert_called_once_with("metadata_delete_failed", key="foo", folder_id="bar")
 
 
-@patch("modules.incident.incident_folder.google_drive.add_metadata")
+@patch("modules.incident.incident_folder.incident_drive.add_metadata")
 @patch("modules.incident.incident_folder.view_folder_metadata")
 def test_save_metadata(view_folder_metadata_mock, add_metadata_mock):
     client = MagicMock()
@@ -108,25 +192,25 @@ def test_save_metadata(view_folder_metadata_mock, add_metadata_mock):
     )
 
 
-@patch("modules.incident.incident_folder.google_drive")
-def test_get_folder_metadata(google_drive_mock):
+@patch("modules.incident.incident_folder.incident_drive")
+def test_get_folder_metadata(incident_drive_mock):
     metadata = {
         "id": "folder_id",
         "name": "folder",
         "appProperties": {"key": "value"},
     }
-    google_drive_mock.list_metadata.return_value = metadata
+    incident_drive_mock.get_metadata.return_value = metadata
     assert incident_folder.get_folder_metadata("foo") == metadata
-    google_drive_mock.list_metadata.assert_called_once_with("foo")
+    incident_drive_mock.get_metadata.assert_called_once_with("foo", fields="id, name, appProperties")
 
 
-@patch("modules.incident.incident_folder.google_drive.list_metadata")
+@patch("modules.incident.incident_folder.incident_drive.get_metadata")
 @patch("modules.incident.incident_folder.metadata_items")
-def test_view_folder_metadata_open(metadata_items_mock, list_metadata_mock):
+def test_view_folder_metadata_open(metadata_items_mock, get_metadata_mock):
     client = MagicMock()
     body = {"actions": [{"value": "foo"}], "trigger_id": "trigger_id"}
     ack = MagicMock()
-    list_metadata_mock.return_value = {
+    get_metadata_mock.return_value = {
         "name": "folder",
         "appProperties": [{"key": "key", "value": "value"}],
     }
@@ -134,18 +218,18 @@ def test_view_folder_metadata_open(metadata_items_mock, list_metadata_mock):
     metadata_items_mock.return_value = [["metadata item"]]
     incident_folder.view_folder_metadata(client, body, ack)
     ack.assert_called_once()
-    list_metadata_mock.assert_called_once_with("foo")
+    get_metadata_mock.assert_called_once_with("foo", fields="id, name, appProperties")
     metadata_items_mock.assert_called_once_with({"name": "folder", "appProperties": [{"key": "key", "value": "value"}]})
     client.views_open(trigger_id="trigger_id", view=ANY)
 
 
-@patch("modules.incident.incident_folder.google_drive.list_metadata")
+@patch("modules.incident.incident_folder.incident_drive.get_metadata")
 @patch("modules.incident.incident_folder.metadata_items")
-def test_view_folder_metadata_update(metadata_items_mock, list_metadata_mock):
+def test_view_folder_metadata_update(metadata_items_mock, get_metadata_mock):
     client = MagicMock()
     body = {"actions": [{"value": "foo"}], "view": {"id": "view_id"}}
     ack = MagicMock()
-    list_metadata_mock.return_value = {
+    get_metadata_mock.return_value = {
         "name": "folder",
         "appProperties": [{"key": "key", "value": "value"}],
     }
@@ -153,7 +237,7 @@ def test_view_folder_metadata_update(metadata_items_mock, list_metadata_mock):
     metadata_items_mock.return_value = [["metadata item"]]
     incident_folder.view_folder_metadata(client, body, ack)
     ack.assert_called_once()
-    list_metadata_mock.assert_called_once_with("foo")
+    get_metadata_mock.assert_called_once_with("foo", fields="id, name, appProperties")
     metadata_items_mock.assert_called_once_with({"name": "folder", "appProperties": [{"key": "key", "value": "value"}]})
     client.views_update(view_id="view_id", view=ANY)
 
@@ -233,41 +317,69 @@ def test_metadata_items():
     ]
 
 
-@patch("modules.incident.incident_folder.INCIDENT_LIST", "INCIDENT_LIST")
+class FakeSpreadsheetProvider:
+    def __init__(self):
+        self.read_values_result = OperationResult.success(data=[])
+        self.update_values_result = OperationResult.success()
+        self.append_values_result = OperationResult.success()
+        self.read_cells_result = OperationResult.success(data=[])
+        self.read_values_calls = []
+        self.update_values_calls = []
+        self.append_values_calls = []
+        self.read_cells_calls = []
+
+    def read_values(self, spreadsheet_id, a1_range):
+        self.read_values_calls.append((spreadsheet_id, a1_range))
+        return self.read_values_result
+
+    def update_values(self, spreadsheet_id, a1_range, values):
+        self.update_values_calls.append((spreadsheet_id, a1_range, values))
+        return self.update_values_result
+
+    def append_values(self, spreadsheet_id, a1_range, values):
+        self.append_values_calls.append((spreadsheet_id, a1_range, values))
+        return self.append_values_result
+
+    def read_cells(self, spreadsheet_id, a1_range):
+        self.read_cells_calls.append((spreadsheet_id, a1_range))
+        return self.read_cells_result
+
+
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(list_sheet_id="INCIDENT_LIST"))
 @patch("modules.incident.incident_folder.datetime")
-@patch("modules.incident.incident_folder.sheets")
-def test_add_new_incident_to_list(sheets_mock, datetime_mock):
+def test_add_new_incident_to_list_success(datetime_mock):
+    provider = FakeSpreadsheetProvider()
     datetime_mock.datetime.now.return_value.strftime.return_value = "2021-01-01"
     document_link = "http://example.com"
     name = "foo"
     slug = "bar"
     product = "baz"
     channel_url = "http://channel.com"
-    body = {
-        "majorDimension": "ROWS",
-        "values": [
-            [
-                "2021-01-01",
-                '=HYPERLINK("http://example.com", "foo")',
-                "baz",
-                "In Progress",
-                '=HYPERLINK("http://channel.com", "#bar")',
-            ]
+    values = [
+        [
+            "2021-01-01",
+            '=HYPERLINK("http://example.com", "foo")',
+            "baz",
+            "In Progress",
+            '=HYPERLINK("http://channel.com", "#bar")',
         ],
-    }
-    sheets_mock.append_values.return_value = ANY
-    updated_sheet = incident_folder.add_new_incident_to_list(document_link, name, slug, product, channel_url)
-    sheets_mock.append_values.assert_called_once_with(
-        "INCIDENT_LIST",
-        "Sheet1!A:A",
-        body,
-    )
-    assert updated_sheet == ANY
+    ]
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        assert incident_folder.add_new_incident_to_list(document_link, name, slug, product, channel_url)
+    assert provider.append_values_calls == [("INCIDENT_LIST", "Sheet1!A:A", values)]
 
 
-@patch("modules.incident.incident_folder.sheets")
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(list_sheet_id="INCIDENT_LIST"))
+def test_add_new_incident_to_list_raises_on_failure():
+    provider = FakeSpreadsheetProvider()
+    provider.append_values_result = OperationResult.error(OperationStatus.TRANSIENT_ERROR, "write failed")
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        with pytest.raises(incident_folder.IncidentSheetError, match="write failed"):
+            incident_folder.add_new_incident_to_list("doc", "name", "slug", "product", "channel")
+
+
 @patch("modules.incident.incident_folder.logger")
-def test_update_spreadsheet_incident_status_invalid_status(logger_mock, sheets_mock):
+def test_update_spreadsheet_incident_status_invalid_status(logger_mock):
     assert not incident_folder.update_spreadsheet_incident_status("foo", "InvalidStatus")
     logger_mock.warning.assert_called_once_with(
         "update_incident_spreadsheet_error",
@@ -277,11 +389,11 @@ def test_update_spreadsheet_incident_status_invalid_status(logger_mock, sheets_m
     )
 
 
-@patch("modules.incident.incident_folder.sheets")
 @patch("modules.incident.incident_folder.logger")
-def test_update_spreadsheet_incident_status_empty_values(logger_mock, sheets_mock):
-    sheets_mock.get_values.return_value = {"values": []}
-    assert not incident_folder.update_spreadsheet_incident_status("foo", "Closed")
+def test_update_spreadsheet_incident_status_empty_values(logger_mock):
+    provider = FakeSpreadsheetProvider()
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        assert not incident_folder.update_spreadsheet_incident_status("foo", "Closed")
     logger_mock.warning.assert_called_once_with(
         "update_incident_spreadsheet_error",
         channel="foo",
@@ -290,19 +402,44 @@ def test_update_spreadsheet_incident_status_empty_values(logger_mock, sheets_moc
     )
 
 
-@patch("modules.incident.incident_folder.INCIDENT_LIST", "INCIDENT_LIST")
-@patch("modules.incident.incident_folder.sheets")
-def test_update_spreadsheet_incident_status_channel_found(sheets_mock):
-    sheets_mock.get_values.return_value = {"values": [["foo", "bar", "baz", "qux"]]}
-    sheets_mock.batch_update_values.return_value = True
-    assert incident_folder.update_spreadsheet_incident_status("foo", "Closed")
-    sheets_mock.batch_update_values.assert_called_once_with("INCIDENT_LIST", "Sheet1!D1", [["Closed"]])
+def test_update_spreadsheet_incident_status_read_failure_raises():
+    provider = FakeSpreadsheetProvider()
+    provider.read_values_result = OperationResult.error(OperationStatus.TRANSIENT_ERROR, "read failed")
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        with pytest.raises(incident_folder.IncidentSheetError, match="read failed"):
+            incident_folder.update_spreadsheet_incident_status("foo", "Closed")
 
 
-@patch("modules.incident.incident_folder.sheets")
-def test_update_spreadsheet_incident_status_channel_not_found(sheets_mock):
-    sheets_mock.get_values.return_value = {"values": [["bar", "baz", "qux"]]}
-    assert not incident_folder.update_spreadsheet_incident_status("foo", "Closed")
+@patch.object(incident_folder, "get_incident_core_settings", new=lambda: SimpleNamespace(list_sheet_id="INCIDENT_LIST"))
+def test_update_spreadsheet_incident_status_channel_found():
+    provider = FakeSpreadsheetProvider()
+    provider.read_values_result = OperationResult.success(data=[["foo", "bar", "baz", "qux"]])
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        assert incident_folder.update_spreadsheet_incident_status("foo", "Closed")
+    assert provider.update_values_calls == [("INCIDENT_LIST", "Sheet1!D1", [["Closed"]])]
+
+
+def test_update_spreadsheet_incident_status_update_failure_raises():
+    provider = FakeSpreadsheetProvider()
+    provider.read_values_result = OperationResult.success(data=[["foo"]])
+    provider.update_values_result = OperationResult.error(OperationStatus.TRANSIENT_ERROR, "update failed")
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        with pytest.raises(incident_folder.IncidentSheetError, match="update failed"):
+            incident_folder.update_spreadsheet_incident_status("foo", "Closed")
+
+
+@patch("modules.incident.incident_folder.logger")
+def test_update_spreadsheet_incident_status_channel_not_found(logger_mock):
+    provider = FakeSpreadsheetProvider()
+    provider.read_values_result = OperationResult.success(data=[["bar", "baz", "qux"]])
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        assert not incident_folder.update_spreadsheet_incident_status("foo", "Closed")
+    logger_mock.warning.assert_called_once_with(
+        "update_incident_spreadsheet_error",
+        channel="foo",
+        status="Closed",
+        error="Channel not found in the sheet",
+    )
 
 
 def test_return_channel_name_with_prefix():
@@ -335,48 +472,104 @@ def test_return_channel_name_dev_prefix_only():
     assert incident_folder.return_channel_name("incident-dev-") == "#"
 
 
-@patch("modules.incident.incident_folder.dynamodb.scan")
-@patch("modules.incident.incident_folder.dynamodb.update_item")
-@patch("modules.incident.incident_folder.current_time_est")
-def test_store_update(mock_current_time_est, mock_update_item, mock_scan_item):
-    mock_current_time_est.return_value = "2025-01-31 11:17:06"
-    mock_scan_item.return_value = [{"incident_updates": {"L": [{"S": "Previous update"}]}}]
-    mock_update_item.return_value = {"ResponseMetadata": {"HTTPStatusCode": 200}}
-
-    response = incident_folder.store_update("incident_id", "New update")
-    assert response is not None
-    mock_scan_item.assert_called_once()
-    mock_update_item.assert_called_once()
-
-    expected_update = "2025-01-31 11:17:06 EST\nNew update\nPrevious update"
-    actual_updates = mock_update_item.call_args[1]["ExpressionAttributeValues"][":updates"]["L"]
-    assert len(actual_updates) == 1
-    assert actual_updates[0]["S"] == expected_update
+@pytest.mark.parametrize(
+    ("channel_name", "expected"),
+    [
+        ("incident-abc123", "abc123"),
+        ("incident-dev-abc123", "abc123"),
+        ("general", "general"),
+        ("", ""),
+        ("incident-", ""),
+        ("incident-dev-", ""),
+    ],
+)
+def test_channel_slug(channel_name, expected):
+    assert incident_folder.channel_slug(channel_name) == expected
 
 
-@patch("modules.incident.incident_folder.dynamodb.scan")
-@patch("modules.incident.incident_folder.dynamodb.update_item")
-@patch("modules.incident.incident_folder.current_time_est")
-def test_store_update_failed(mock_current_time_est, mock_update_item, mock_scan_item):
-    mock_current_time_est.return_value = "2025-01-31 11:17:06"
-    mock_scan_item.return_value = [{"incident_updates": {"L": [{"S": "Previous update"}]}}]
-    mock_update_item.return_value = {"ResponseMetadata": {"HTTPStatusCode": 400}}
+@pytest.mark.parametrize(
+    ("link", "expected"),
+    [
+        ("https://gcdigital.slack.com/archives/C0123456789", "C0123456789"),
+        ("https://other.slack.com/archives/C0123456789", "C0123456789"),
+        ("https://slack.com/app_redirect?channel=C0123456789&team=T0TEAM", "C0123456789"),
+        ("https://slack.com/app_redirect?channel=C0123456789", "C0123456789"),
+        ("https://example.com/archives/C0123456789", None),
+        ("https://slack.com/app_redirect?team=T0TEAM", None),
+    ],
+)
+def test_channel_id_from_link_reads_both_link_forms(link, expected):
+    """Rows written before the deep link keep the workspace archive URL; both forms give the channel id."""
+    assert incident_folder.channel_id_from_link(link) == expected
 
-    response = incident_folder.store_update("incident_id", "New update")
-    assert response is None
-    mock_scan_item.assert_called_once()
-    mock_update_item.assert_called_once()
+
+def _incident_row_data():
+    return [
+        [SheetCell("header")],
+        [
+            SheetCell("2024-01-01"),
+            SheetCell("Incident name", "https://report.example.com/doc"),
+            SheetCell("Team A"),
+            SheetCell("Closed"),
+            SheetCell("#incident-2024-01-01-test", "https://gcdigital.slack.com/archives/C0123456789"),
+        ],
+    ]
 
 
-@patch("modules.incident.incident_folder.dynamodb.scan")
-def test_fetch_updates(mock_scan_item):
-    mock_scan_item.return_value = [{"incident_updates": {"L": [{"S": "Update 1\n Update 2"}]}}]
+def test_get_incidents_from_sheet_returns_parsed_incidents():
+    provider = FakeSpreadsheetProvider()
+    provider.read_cells_result = OperationResult.success(data=_incident_row_data())
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        incidents = incident_folder.get_incidents_from_sheet()
 
-    updates = incident_folder.fetch_updates("incident_id")
-    assert updates == ["Update 1\n Update 2"]
+    assert incidents == [
+        {
+            "channel_id": "C0123456789",
+            "channel_name": "incident-2024-01-01-test",
+            "name": "Incident name",
+            "user_id": "",
+            "teams": ["Team A"],
+            "report_url": "https://report.example.com/doc",
+            "status": "Closed",
+            "created_at": "2024-01-01",
+            "meet_url": "TBC",
+        }
+    ]
 
-    # Test case when no updates are found
-    mock_scan_item.return_value = {}
-    updates = incident_folder.fetch_updates("incident_id")
-    assert updates == []
-    assert mock_scan_item.call_count == 2
+
+def test_get_incidents_from_sheet_skips_row_without_created_at_when_looking_back():
+    """A row with an empty created-at cell is skipped by the lookback filter.
+
+    The fake provider returns one row whose first cell has no formatted value;
+    with days > 0 the row is treated as outside the window instead of comparing
+    None to the lookback date string.
+    """
+    rows = _incident_row_data()
+    rows[1][0] = SheetCell(None)
+    provider = FakeSpreadsheetProvider()
+    provider.read_cells_result = OperationResult.success(data=rows)
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        incidents = incident_folder.get_incidents_from_sheet(days=30)
+
+    assert incidents == []
+
+
+@patch("modules.incident.incident_folder.logger")
+def test_get_incidents_from_sheet_swallows_range_not_found(mock_logger):
+    provider = FakeSpreadsheetProvider()
+    provider.read_cells_result = OperationResult.error(
+        OperationStatus.NOT_FOUND,
+        "Unable to parse range: Sheet1",
+        error_code=RANGE_NOT_FOUND,
+    )
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        assert incident_folder.get_incidents_from_sheet() == []
+    mock_logger.warning.assert_called_once()
+
+
+def test_get_incidents_from_sheet_raises_on_other_failure():
+    provider = FakeSpreadsheetProvider()
+    provider.read_cells_result = OperationResult.error(OperationStatus.TRANSIENT_ERROR, "Internal error", error_code="X")
+    with patch.object(incident_folder, "get_spreadsheet_provider", lambda: provider):
+        with pytest.raises(incident_folder.IncidentSheetError, match="Internal error"):
+            incident_folder.get_incidents_from_sheet()

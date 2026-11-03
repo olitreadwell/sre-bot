@@ -1,41 +1,35 @@
 """Slack platform implementation for the rant package."""
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
 import structlog
-from slack_sdk import WebClient
 
-from integrations.slack.models import CommandPayload, CommandResponse
-from packages.rant.service import format_rant
-
-if TYPE_CHECKING:
-    from integrations.slack.provider import SlackPlatformProvider
+from contracts.slack.models import CommandPayload, CommandResponse
+from contracts.slack.registrar import SlackCommandRegistrar
+from contracts.slack.reply import SlackReplySender
+from packages.rant.providers import get_user_identity_lookup
+from packages.rant.service import UserIdentity, UserIdentityLookup, format_rant
 
 logger = structlog.get_logger()
 
 
-def register_commands(provider: SlackPlatformProvider) -> None:
-    """Register the top-level ``/rant`` Slack command with the provider.
+def register_commands(registrar: SlackCommandRegistrar) -> None:
+    """Register the top-level ``/rant`` Slack command with the registrar.
 
     Registered without a parent so it is exposed as a root slash command
     (``/rant``) rather than a subcommand of ``/sre``.
 
-    The registered handler is wrapped so it receives the provider's Slack Web
-    API client at dispatch time, which is needed to post the message with the
-    invoking user's name and avatar (``chat:write.customize``).
+    The registered handler is wrapped so it receives the registrar's reply
+    interface, which is needed to post the message with the invoking user's name
+    and avatar (``chat:write.customize``). The user's identity is resolved
+    through the package's ``UserIdentityLookup``.
 
     Args:
-        provider: Slack platform provider instance.
+        registrar: Slack command registrar.
     """
 
     def _dispatch(payload: CommandPayload) -> CommandResponse:
-        # Read the client lazily: it is only populated after the provider has
-        # started, which happens after command registration.
-        return handle_rant_command(payload, provider.client)
+        return handle_rant_command(payload, registrar.reply, get_user_identity_lookup())
 
-    provider.register_command(
+    registrar.register_command(
         command="rant",
         handler=_dispatch,
         description="Shout a message to the channel in bold uppercase",
@@ -44,7 +38,11 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     )
 
 
-def handle_rant_command(payload: CommandPayload, client: WebClient | None) -> CommandResponse:
+def handle_rant_command(
+    payload: CommandPayload,
+    reply: SlackReplySender,
+    identities: UserIdentityLookup,
+) -> CommandResponse:
     """Handle ``/rant <text>`` by posting a bold, uppercase message.
 
     The message is posted with the invoking user's display name and avatar via
@@ -60,8 +58,8 @@ def handle_rant_command(payload: CommandPayload, client: WebClient | None) -> Co
     Args:
         payload: Command payload from the Slack platform provider. ``text``
             holds the full message to shout.
-        client: Slack Web API client used to look up the user's profile and
-            post the customized message. May be ``None`` before startup.
+        reply: Interface used to post the customized message.
+        identities: Lookup resolving the invoking user's name and avatar.
 
     Returns:
         An ephemeral confirmation when the message is posted as the user, an
@@ -80,21 +78,19 @@ def handle_rant_command(payload: CommandPayload, client: WebClient | None) -> Co
         )
 
     formatted = format_rant(text)
-    identity = _resolve_user_identity(client, payload.user_id, log) if client else None
+    identity = _resolve_user_identity(identities, payload.user_id, log) if payload.channel_id else None
 
-    if client is not None and payload.channel_id and identity is not None:
-        username, icon_url = identity
-        try:
-            client.chat_postMessage(
-                channel=payload.channel_id,
-                text=formatted,
-                username=username,
-                icon_url=icon_url,
-            )
+    if payload.channel_id and identity is not None:
+        posted = reply.post_message(
+            channel_id=payload.channel_id,
+            text=formatted,
+            username=identity.display_name,
+            icon_url=identity.icon_url,
+        )
+        if posted.is_success:
             log.info("rant_command_posted_as_user")
             return CommandResponse(message="✅ Ranted.", ephemeral=True)
-        except Exception as e:
-            log.warning("rant_post_as_user_failed", error=str(e))
+        log.warning("rant_post_as_user_failed", error=posted.message, error_code=posted.error_code)
 
     # Fallback: post as the bot, attributed to the user via a mention prefix.
     log.info("rant_command_posted_as_bot")
@@ -102,38 +98,23 @@ def handle_rant_command(payload: CommandPayload, client: WebClient | None) -> Co
 
 
 def _resolve_user_identity(
-    client: WebClient,
+    identities: UserIdentityLookup,
     user_id: str,
     log: structlog.stdlib.BoundLogger,
-) -> tuple[str, str] | None:
-    """Resolve the display name and avatar URL for a Slack user.
+) -> UserIdentity | None:
+    """Resolve the display name and avatar for a Slack user.
 
     Args:
-        client: Slack Web API client.
+        identities: Lookup resolving a user's name and avatar.
         user_id: Slack user ID to look up.
         log: Bound logger for contextual logging.
 
     Returns:
-        A ``(display_name, icon_url)`` tuple, or ``None`` if the lookup fails
-        or returns no usable profile data.
+        The user's identity, or ``None`` if the lookup fails or returns no
+        usable profile data.
     """
     try:
-        response = client.users_info(user=user_id)
+        return identities.lookup_user_identity(user_id)
     except Exception as e:
         log.warning("rant_user_identity_lookup_failed", error=str(e))
         return None
-
-    if not response.get("ok"):
-        log.warning("rant_user_identity_lookup_not_ok", error=response.get("error"))
-        return None
-
-    user: dict[str, Any] = response.get("user") or {}
-    profile: dict[str, Any] = user.get("profile") or {}
-    display_name = profile.get("display_name") or profile.get("real_name")
-    icon_url = profile.get("image_512") or profile.get("image_192") or profile.get("image_72")
-
-    if not display_name or not icon_url:
-        log.warning("rant_user_identity_incomplete")
-        return None
-
-    return display_name, icon_url

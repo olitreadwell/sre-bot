@@ -5,11 +5,11 @@ from typing import get_args, get_origin, get_type_hints
 
 import pytest
 
+from contracts.operations import OperationResult
 from infrastructure.events import get_event_dispatcher
-from infrastructure.operations import OperationResult
 from packages.access.common.events import SYNC_COMPLETED, SYNC_FAILED
 from packages.access.request.domain import AccessRequest, ApprovalDecision
-from packages.access.request.service import AccessRequestServicePort
+from packages.access.request.service import AccessRequestWorkflow
 
 
 def _reload_request_package():
@@ -44,8 +44,6 @@ def test_request_startup_warmup_registers_handlers_and_warms_runtime_config(
         return object()
 
     class _Settings:
-        enabled = True
-        manager_group_slug = "sg-managers"
         fallback_approver_slug = "sg-org-admins"
         min_approver_count = 1
         request_ttl_hours = 72
@@ -83,8 +81,6 @@ def test_request_startup_warmup_registers_handlers_via_event_dispatcher(monkeypa
     request_pkg = _reload_request_package()
 
     class _Settings:
-        enabled = True
-        manager_group_slug = "sg-managers"
         fallback_approver_slug = "sg-org-admins"
         min_approver_count = 1
         request_ttl_hours = 72
@@ -137,7 +133,7 @@ def test_request_startup_warmup_registers_handlers_via_event_dispatcher(monkeypa
 
 
 @pytest.mark.unit
-def test_access_request_service_port_uses_parameterized_operation_result_returns():
+def test_access_request_workflow_uses_parameterized_operation_result_returns():
     expected_returns = {
         "submit_request": OperationResult[AccessRequest],
         "approve_request": OperationResult[tuple[AccessRequest, list[ApprovalDecision]]],
@@ -148,7 +144,7 @@ def test_access_request_service_port_uses_parameterized_operation_result_returns
     }
 
     for method_name, expected in expected_returns.items():
-        method = getattr(AccessRequestServicePort, method_name)
+        method = getattr(AccessRequestWorkflow, method_name)
         return_type = get_type_hints(method)["return"]
 
         assert get_origin(return_type) is get_origin(expected)

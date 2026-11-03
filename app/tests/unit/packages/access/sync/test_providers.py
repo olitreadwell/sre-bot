@@ -17,6 +17,7 @@ def test_get_access_sync_adapters_registers_aws_and_fake(
     providers.get_access_sync_adapters.cache_clear()
     runtime_config = AccessSyncRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         platforms={
             "aws": make_platform_policy(adapter_type="aws_identity_center"),
             "fake": make_platform_policy(adapter_type="fake"),
@@ -55,6 +56,7 @@ def test_get_access_sync_adapters_raises_for_unknown_adapter_type(
     providers.get_access_sync_adapters.cache_clear()
     runtime_config = AccessSyncRuntimeConfig(
         dir_prefix="sg",
+        dir_domain="example.com",
         platforms={
             "fake": make_platform_policy(adapter_type="fake"),
             "custom": make_platform_policy(adapter_type="custom_unsupported"),
@@ -89,7 +91,7 @@ def test_get_access_sync_lock_store_is_singleton(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(providers, "get_access_sync_settings", lambda: _Settings())
     monkeypatch.setattr(
-        "packages.access.sync.providers.build_idempotency_store",
+        "packages.access.sync.providers.build_lease_store",
         lambda in_progress_ttl_seconds: built.pop(0),
     )
 
@@ -122,7 +124,7 @@ def test_get_access_sync_lock_store_uses_lock_stale_seconds(monkeypatch: pytest.
 
     monkeypatch.setattr(providers, "get_access_sync_settings", lambda: _Settings())
     monkeypatch.setattr(
-        "packages.access.sync.providers.build_idempotency_store",
+        "packages.access.sync.providers.build_lease_store",
         _build_store,
     )
 
@@ -146,10 +148,10 @@ def test_get_access_sync_job_status_store_returns_singleton(monkeypatch: pytest.
     sentinel_storage = object()
     built: list[object] = [object(), object()]
 
-    monkeypatch.setattr(providers, "get_storage_service", lambda: sentinel_storage)
+    monkeypatch.setattr(providers, "get_record_store", lambda: sentinel_storage)
     monkeypatch.setattr(
         "packages.access.sync.providers.JobStatusStore",
-        lambda storage: (built.pop(0), storage)[0],
+        lambda storage, table_name: (built.pop(0), storage)[0],
     )
 
     first = get_job_status_store()

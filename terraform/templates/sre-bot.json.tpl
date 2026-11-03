@@ -35,12 +35,7 @@
         "protocol": "tcp"
       }
     ],
-    "secrets": [
-      {
-        "name": "GCP_SRE_SERVICE_ACCOUNT_KEY_FILE",
-        "valueFrom": "${GCP_SRE_SERVICE_ACCOUNT_KEY_FILE}"
-      }
-    ],
+    "secrets": ${secrets},
     "ulimits": [
       {
         "hardLimit": 1000000,
@@ -51,20 +46,12 @@
     "cpu": 0,
     "environment": [
       {
-        "name": "BACKEND_URL",
-        "value": "${backend_url}"
-      },
-      {
         "name": "ENVIRONMENT",
         "value": "production"
       },
       {
-        "name": "CORS_ALLOWED_ORIGINS",
-        "value": "${cors_allowed_origins}"
-      },
-      {
-        "name": "SLACK__COMMAND_PREFIX",
-        "value": ""
+        "name": "FORWARDED_ALLOW_IPS",
+        "value": "${forwarded_allow_ips}"
       }
     ],
     "essential": true,

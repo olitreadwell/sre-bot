@@ -1,8 +1,8 @@
-"""Sync job concurrency wrappers over the shared infrastructure lease primitive."""
+"""Sync job concurrency wrappers over the coordination lease facade."""
 
 from typing import Any
 
-from infrastructure.idempotency import IdempotencyStore, acquire_lease, release_lease
+from contracts.coordination import LeaseStore
 from packages.access.sync.job_status_store import JobStatusStore
 
 
@@ -17,15 +17,19 @@ def user_lock_key(platform: str, user_email: str) -> str:
 def acquire_lock(
     lock_key: str,
     payload: dict[str, Any],
-    lock_store: IdempotencyStore,
+    lock_store: LeaseStore,
     job_status_store: JobStatusStore,
     ttl_seconds: int,
-) -> bool:
-    """Atomically acquire lock and write holder metadata when successful."""
-    acquired = acquire_lease(lock_store, lock_key)
-    if acquired:
+) -> str | None:
+    """Atomically acquire lock and write holder metadata when successful.
+
+    Returns the claim token that release_lock() needs, or None when another job
+    holds the lock. The token stays out of the holder record, which pollers read.
+    """
+    claim_token = lock_store.acquire(lock_key)
+    if claim_token is not None:
         job_status_store.put(f"{lock_key}:holder", payload, ttl_seconds=ttl_seconds)
-    return acquired
+    return claim_token
 
 
 def current_holder(lock_key: str, job_status_store: JobStatusStore) -> dict[str, Any] | None:
@@ -35,7 +39,8 @@ def current_holder(lock_key: str, job_status_store: JobStatusStore) -> dict[str,
 
 def release_lock(
     lock_key: str,
-    lock_store: IdempotencyStore,
+    lock_store: LeaseStore,
+    claim_token: str,
 ) -> None:
-    """Release lock claim for future runs."""
-    release_lease(lock_store, lock_key)
+    """Release the lock claim for future runs, unless another job has taken it over."""
+    lock_store.release(lock_key, claim_token)

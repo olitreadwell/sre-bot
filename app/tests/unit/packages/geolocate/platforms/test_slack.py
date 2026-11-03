@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from infrastructure.operations import OperationResult, OperationStatus
-from integrations.slack.models import CommandPayload, CommandResponse
+from contracts.operations import OperationResult, OperationStatus
+from contracts.slack.models import CommandPayload, CommandResponse
 from integrations.slack.provider import SlackPlatformProvider
 from packages.geolocate.platforms.slack import (
     handle_geolocate_command,
@@ -94,8 +94,6 @@ def test_geolocate_without_arguments_shows_error():
     """Test that /sre geolocate without arguments returns help text."""
     # Create a mock settings object
     mock_settings = MagicMock()
-    mock_settings.ENABLED = True
-    mock_settings.SOCKET_MODE = True
 
     # Create provider and register geolocate command
     provider = SlackPlatformProvider(settings=mock_settings)

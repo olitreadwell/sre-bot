@@ -1,4 +1,3 @@
-import json
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -7,8 +6,8 @@ from slack_bolt import Ack, App, Respond
 from slack_sdk import WebClient
 from structlog import get_logger
 
-from infrastructure.configuration.integrations.google import get_google_resources_config
-from integrations.google_workspace import google_drive
+from features.incident.common.settings import get_incident_core_settings
+from features.incident.drive.adapters import google_drive as incident_drive
 from integrations.sentinel import log_to_sentinel
 from integrations.slack import (
     channels as slack_channels,
@@ -32,8 +31,6 @@ from modules.incident import (
     schedule_retro,
 )
 
-google_resources = get_google_resources_config()
-SRE_INCIDENT_FOLDER = google_resources.incident_folder_id
 INCIDENT_CHANNELS_PATTERN = r"^incident-\d{4}-"
 VALID_STATUS = [
     "In Progress",
@@ -42,6 +39,14 @@ VALID_STATUS = [
     "Reviewed",
     "Closed",
 ]
+
+UPDATES_RETIRED_POINTER = (
+    "`/sre incident updates` has been retired. "
+    "Use `/sre incident status-update` to draft, review and approve a public status update."
+    "\n\n"
+    "`/sre incident updates` a été retirée. "
+    "Utilisez `/sre incident status-update` pour rédiger, réviser et approuver une mise à jour publique."
+)
 
 logger = get_logger()
 
@@ -55,7 +60,6 @@ Usage:
 • channels     - Manage incident channels
 • products     - Manage incident products (aka folders)
 • roles        - Manage incident roles
-• updates      - Add or show incident updates
 • status       - Update or show incident status
 
 *Incident-level actions (no resource):*
@@ -63,6 +67,7 @@ Usage:
 • close        - Close the current incident
 • list         - List incidents or resources
 • summarize    - Summarize the channel to catch up someone joining the incident
+• draft        - Draft an incident report from the channel into a new document
 • help         - Show this help message
 • schedule     - Schedule an event for the incident
 • show         - Show details of the current incident
@@ -75,14 +80,13 @@ Usage:
 - `/sre incident summarize`
 - `/sre incident summarize --since 30m --limit 100`
 - `/sre incident summarize --since 2h --limit 100`
+- `/sre incident draft`
 - `/sre incident products create "foo bar"`
 - `/sre incident schedule retro`
 - `/sre incident status update Ready to be Reviewed`
-- `/sre incident updates add "new update"`
+- `/sre incident status-update`
 
 *Legacy commands (will be deprecated after 2025-11-01):*
-• summary
-• add_summary
 • create-folder
 • list-folders
 • stale
@@ -101,7 +105,6 @@ Utilisation:
 • channels     - Gérer les canaux d'incidents
 • products     - Gérer les produits d'incidents (dossiers)
 • roles        - Gérer les rôles d'incidents
-• updates      - Ajouter ou afficher des mises à jour d'incidents
 • status       - Mettre à jour ou afficher l'état d'un incident
 
 *Actions pour l'incident (sans ressource):*
@@ -109,6 +112,7 @@ Utilisation:
 • close        - Clore l'incident en cours
 • list         - Lister les incidents ou ressources
 • summarize    - Résumer le canal pour informer une personne rejoignant l'incident
+• draft        - Rédiger une ébauche de rapport d'incident à partir du canal
 • help         - Afficher ce message d'aide
 • schedule     - Planifier un événement pour l'incident
 • show         - Afficher les détails de l'incident en cours
@@ -121,14 +125,13 @@ Utilisation:
 - `/sre incident summarize`
 - `/sre incident summarize --since 30m --limit 100`
 - `/sre incident summarize --since 2h --limit 100`
+- `/sre incident draft`
 - `/sre incident products create "foo bar"`
 - `/sre incident schedule retro`
 - `/sre incident status update Ready to be Reviewed`
-- `/sre incident updates add "new update"`
+- `/sre incident status-update`
 
 *Commandes obsolètes (seront supprimées après le 2025-11-01):*
-• add_summary
-• summary
 • create-folder
 • list-folders
 • stale
@@ -158,7 +161,6 @@ def register(bot: App):
     bot.event("reaction_removed", matchers=[incident_conversation.is_floppy_disk])(incident_conversation.handle_reaction_removed)
     bot.event("reaction_added")(incident_conversation.just_ack_the_rest_of_reaction_events)
     bot.event("reaction_removed")(incident_conversation.just_ack_the_rest_of_reaction_events)
-    bot.view("incident_updates_view")(handle_updates_submission)
     bot.action("update_incident_field")(information_update.open_update_field_view)
     bot.view("update_field_modal")(information_update.handle_update_field_submission)
 
@@ -177,8 +179,6 @@ def get_incident_actions() -> dict[str, Callable]:
         "create-folder": handle_legacy_create_folder,
         "list-folders": handle_legacy_list_folders,
         "stale": handle_legacy_stale,
-        "add_summary": handle_legacy_add_summary,
-        "summary": handle_legacy_summary,
     }
 
 
@@ -349,10 +349,10 @@ Use `/sre incident help` to see a list of commands."""
             if not name:
                 respond("Please provide a product name using `create <product_name>`")
                 return
-            folder = google_drive.create_folder(name, SRE_INCIDENT_FOLDER)
+            folder = incident_drive.create_folder(name, get_incident_core_settings().folder_id)
             folder_name = None
-            if isinstance(folder, dict):
-                folder_name = folder.get("name", None)
+            if folder:
+                folder_name = folder.get("name")
             if folder_name:
                 respond(f"Product `{folder_name}` created.")
             else:
@@ -402,20 +402,8 @@ def handle_roles(client, body, respond, ack, action, _args, _flags):
 
 
 def handle_updates(client, body, respond, ack, action, _args, _flags):
-    """Handle the updates command."""
-    updates_help_text = """`/sre incident updates <action> [options] [arguments]`
-
-*Actions:*
-• `add` — add updates to the incident
-• `show` — show current incident updates"""
-
-    match action:
-        case "add":
-            open_updates_dialog(client, body, ack)
-        case "show":
-            display_current_updates(client, body, respond, ack)
-        case _:
-            respond(updates_help_text)
+    """Answer every `/sre incident updates` request with the retired-command pointer."""
+    respond(UPDATES_RETIRED_POINTER)
 
 
 def handle_legacy_create_folder(client, body, respond, ack, args, _flags):
@@ -444,22 +432,6 @@ def handle_legacy_stale(client, body, respond, ack, _args, _flags):
     stale_incidents(client, body, ack)
 
 
-def handle_legacy_add_summary(client, body, respond, ack, _args, _flags):
-    """Handle the legacy add_summary command."""
-    respond(
-        "The `/sre incident add_summary` command is deprecated and will be discontinued after 2025-11-01. Please use `/sre incident updates add` instead."
-    )
-    handle_updates(client, body, respond, ack, "add", _args, _flags)
-
-
-def handle_legacy_summary(client, body, respond, ack, _args, _flags):
-    """Handle the legacy summary command."""
-    respond(
-        "The `/sre incident summary` command is deprecated and will be discontinued after 2025-11-01. Please use `/sre incident updates show` instead."
-    )
-    handle_updates(client, body, respond, ack, "show", _args, _flags)
-
-
 def close_incident(client: WebClient, body, ack, respond):
     ack()
     # get the current chanel id and name
@@ -467,7 +439,11 @@ def close_incident(client: WebClient, body, ack, respond):
     channel_name = body["channel_name"]
     user_id = slack_users.get_user_id_from_request(body)
     incident_id = None
-    incident = db_operations.get_incident_by_channel_id(channel_id)
+    try:
+        incident = db_operations.get_incident_by_channel_id(channel_id)
+    except db_operations.IncidentStoreUnavailableError:
+        respond(db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE)
+        return
     if incident:
         incident_id = incident.get("id", {}).get("S", None)
     # ensure the bot is actually in the channel before performing actions
@@ -612,7 +588,11 @@ def handle_update_status_command(client: WebClient, body, respond: Respond, ack:
     if status not in valid_statuses:
         respond("A valid status must be used with this command:\n" + ", ".join(valid_statuses))
         return
-    incident = db_operations.get_incident_by_channel_id(body["channel_id"])
+    try:
+        incident = db_operations.get_incident_by_channel_id(body["channel_id"])
+    except db_operations.IncidentStoreUnavailableError:
+        respond(db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE)
+        return
 
     if not incident:
         respond("No incident found for this channel. Will not update status in DB record.")
@@ -646,63 +626,6 @@ def convert_timestamp(timestamp: str) -> str:
     except ValueError:
         datetime_str = "Unknown"
     return datetime_str
-
-
-def open_updates_dialog(client: WebClient, body, ack: Ack):
-    ack()
-    channel_id = body["channel_id"]  # Extract channel_id directly from body
-    incident = db_operations.get_incident_by_channel_id(channel_id)
-    incident_id = incident.get("id", "Unknown").get("S", "Unknown")
-    dialog = {
-        "type": "modal",
-        "callback_id": "incident_updates_view",
-        "private_metadata": json.dumps(
-            {
-                "incident_id": incident_id,  # Set the incident_id here
-                "channel_id": channel_id,
-            }
-        ),
-        "title": {"type": "plain_text", "text": "SRE - Incident Updates"},
-        "submit": {"type": "plain_text", "text": "Submit"},
-        "close": {"type": "plain_text", "text": "Cancel"},
-        "blocks": [
-            {
-                "type": "input",
-                "block_id": "updates_block",
-                "element": {
-                    "type": "plain_text_input",
-                    "multiline": True,
-                    "action_id": "updates_input",
-                },
-                "label": {
-                    "type": "plain_text",
-                    "text": "Enter your updates",
-                },
-            },
-        ],
-    }
-    client.views_open(trigger_id=body["trigger_id"], view=dialog)
-
-
-def handle_updates_submission(client: WebClient, ack, respond: Respond, view):
-    ack()
-    private_metadata = json.loads(view["private_metadata"])
-    incident_id = private_metadata["incident_id"]
-    updates_text = view["state"]["values"]["updates_block"]["updates_input"]["value"]
-    incident_folder.store_update(incident_id, updates_text)
-    channel_id = private_metadata["channel_id"]
-    client.chat_postMessage(channel=channel_id, text="Summary has been updated.")
-
-
-def display_current_updates(client: WebClient, body, respond: Respond, ack: Ack):
-    ack()
-    incident_id = body["channel_id"]
-    updates = incident_folder.fetch_updates(incident_id)
-    if updates:
-        updates_text = "\n".join(updates)
-        client.chat_postMessage(channel=incident_id, text=f"Current updates:\n{updates_text}")
-    else:
-        respond("No updates found for this incident.")
 
 
 def recreate_missing_incident_resources(client: WebClient, body: dict, respond: Respond, ack: Ack):

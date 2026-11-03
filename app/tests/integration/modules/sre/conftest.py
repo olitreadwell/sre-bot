@@ -7,6 +7,7 @@ Follows new platform architecture patterns.
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import SecretStr
 
 from integrations.slack.formatter import SlackBlockKitFormatter
 from integrations.slack.provider import SlackPlatformProvider
@@ -36,11 +37,11 @@ def slack_settings():
     """Mock Slack platform settings for testing."""
 
     class MockSlackSettings:
-        ENABLED = True
-        SOCKET_MODE = True
-        APP_TOKEN = "xapp-test"
-        BOT_TOKEN = "xoxb-test"
-        SIGNING_SECRET = "test-secret"
+        enabled = True
+        socket_mode = True
+        app_token = SecretStr("xapp-test")
+        bot_token = SecretStr("xoxb-test")
+        signing_secret = SecretStr("test-secret")
 
     return MockSlackSettings()
 
@@ -64,9 +65,10 @@ def slack_provider(slack_settings, slack_formatter, monkeypatch):
             self.client = MagicMock()
 
     class FakeSocketModeHandler:
-        def __init__(self, app, token):
+        def __init__(self, app, token, logger=None):
             self.app = app
             self.token = token
+            self.logger = logger
 
         def connect(self):
             return None

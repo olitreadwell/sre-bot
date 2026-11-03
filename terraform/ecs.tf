@@ -16,17 +16,22 @@ resource "aws_ecs_task_definition" "sre-bot" {
   memory                   = var.fargate_memory
   task_role_arn            = aws_iam_role.sre-bot.arn
 
+  # The deploy workflow registers the revisions the service runs (decisions/deployment.md).
+  # Keep every revision ACTIVE so a rollback target is never deregistered; track_latest
+  # stays false so the workflow's revisions are not drift. The :latest image below is only
+  # the render base: the workflow replaces it with the build's image digest.
+  skip_destroy = true
+
   container_definitions = templatefile("${path.module}/templates/sre-bot.json.tpl", {
-    awslogs-group                    = aws_cloudwatch_log_group.sre-bot_group.name
-    awslogs-region                   = "ca-central-1"
-    awslogs-stream-prefix            = "ecs-sre-bot"
-    image                            = "${aws_ecr_repository.sre-bot.repository_url}:latest"
-    backend_url                      = "https://${aws_route53_zone.sre_bot.name}"
-    fargate_cpu                      = var.fargate_cpu
-    fargate_memory                   = var.fargate_memory
-    aws_region                       = "ca-central-1"
-    cors_allowed_origins             = jsonencode(var.cors_allowed_origins)
-    GCP_SRE_SERVICE_ACCOUNT_KEY_FILE = aws_ssm_parameter.gcp_sre_service_account_key.arn
+    awslogs-group         = aws_cloudwatch_log_group.sre-bot_group.name
+    awslogs-region        = "ca-central-1"
+    awslogs-stream-prefix = "ecs-sre-bot"
+    image                 = "${aws_ecr_repository.sre-bot.repository_url}:latest"
+    forwarded_allow_ips   = join(",", module.vpc.public_subnet_cidr_blocks)
+    secrets = jsonencode([
+      for name in sort(local.sre_bot_secret_names) :
+      { name = name, valueFrom = aws_ssm_parameter.sre_bot_secret[name].arn }
+    ])
   })
 }
 
@@ -56,6 +61,14 @@ resource "aws_ecs_service" "main" {
     container_port   = 8000
   }
 
+  # Ignore unhealthy load balancer and container checks while a task boots.
+  health_check_grace_period_seconds = 60
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   # Enable deployment alarms
   alarms {
     enable      = true
@@ -65,6 +78,11 @@ resource "aws_ecs_service" "main" {
 
   tags = {
     "CostCentre" = var.billing_code
+  }
+
+  # The deploy workflow owns which revision runs (decisions/deployment.md).
+  lifecycle {
+    ignore_changes = [task_definition]
   }
 }
 

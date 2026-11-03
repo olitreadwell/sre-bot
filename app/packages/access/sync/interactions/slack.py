@@ -9,13 +9,13 @@ Command hierarchy under /sre:
             └── status  <job_id>
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
 
+from contracts.slack.models import Argument, ArgumentType, CommandPayload, CommandResponse
+from contracts.slack.registrar import SlackCommandRegistrar
 from infrastructure.i18n import t
-from integrations.slack.models import CommandPayload, CommandResponse
-from integrations.slack.parser import Argument, ArgumentType
 from packages.access.sync.interactions.ingress import (
     enqueue_platform_sync,
     enqueue_user_sync,
@@ -29,13 +29,10 @@ from packages.access.sync.providers import (
 )
 from packages.access.sync.schemas import SyncJobStatusResponse
 
-if TYPE_CHECKING:
-    from infrastructure.platforms.providers.slack import SlackPlatformProvider
-
 logger = structlog.get_logger()
 
 
-def register_commands(provider: SlackPlatformProvider) -> None:
+def register_commands(registrar: SlackCommandRegistrar) -> None:
     """Register access sync Slack commands.
 
     Registers the ``access`` parent (shared by all access subpackages), the
@@ -45,7 +42,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     # access parent — handler=None lets the framework auto-generate help.
     # Other access subpackages (catalog, admin, request) use parent="sre.access"
     # and the framework creates this node automatically if not yet registered.
-    provider.register_command(
+    registrar.register_command(
         command="access",
         handler=None,
         parent="sre",
@@ -54,7 +51,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     )
 
     # sync parent
-    provider.register_command(
+    registrar.register_command(
         command="sync",
         handler=None,
         parent="sre.access",
@@ -63,7 +60,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     )
 
     # sync user — enqueues background job, returns job_id immediately
-    provider.register_command(
+    registrar.register_command(
         command="user",
         handler=handle_sync_user_command,
         parent="sre.access.sync",
@@ -101,7 +98,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     )
 
     # sync platform — enqueues background job, returns job_id immediately
-    provider.register_command(
+    registrar.register_command(
         command="platform",
         handler=handle_sync_platform_command,
         parent="sre.access.sync",
@@ -133,7 +130,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
     )
 
     # sync status — polls job status from idempotency store
-    provider.register_command(
+    registrar.register_command(
         command="status",
         handler=handle_sync_status_command,
         parent="sre.access.sync",
@@ -192,16 +189,6 @@ def handle_sync_user_command(
     )
 
     if not result.is_success or result.data is None:
-        if result.error_code == "FEATURE_DISABLED":
-            log.warning("access_sync_disabled_rejected")
-            return CommandResponse(
-                message=t(
-                    "access_sync.disabled",
-                    locale,
-                    "\u26d4 Access Sync is not enabled. Contact your administrator.",
-                ),
-                ephemeral=True,
-            )
         return CommandResponse(
             message=t(
                 "access_sync.user.result.error",
@@ -285,16 +272,6 @@ def handle_sync_platform_command(
     )
 
     if not result.is_success or result.data is None:
-        if result.error_code == "FEATURE_DISABLED":
-            log.warning("access_sync_disabled_rejected")
-            return CommandResponse(
-                message=t(
-                    "access_sync.disabled",
-                    locale,
-                    "\u26d4 Access Sync is not enabled. Contact your administrator.",
-                ),
-                ephemeral=True,
-            )
         return CommandResponse(
             message=t(
                 "access_sync.platform.result.error",

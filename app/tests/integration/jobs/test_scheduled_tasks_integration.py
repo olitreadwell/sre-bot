@@ -8,10 +8,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from contracts.operations import OperationResult
+from integrations.slack.settings import SlackTenant
 from jobs import scheduled_tasks
 
 
+@pytest.fixture
+def slack_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configure a [slack.tenant] entry so the stale-channel job is scheduled."""
+    settings = MagicMock()
+    settings.tenant = SlackTenant(team_id="T0000TEST")
+    monkeypatch.setattr("jobs.scheduled_tasks.get_slack_settings", lambda: settings)
+
+
 @pytest.mark.integration
+@pytest.mark.usefixtures("slack_tenant")
 class TestScheduledTasksInitialization:
     """Integration tests for scheduled tasks initialization."""
 
@@ -27,9 +38,7 @@ class TestScheduledTasksInitialization:
         - AWS Identity Center provisioning (every 2 hours)
         - Spending data generation (daily at 00:00)
         """
-        bot = MagicMock()
-
-        scheduled_tasks.init(bot)
+        scheduled_tasks.init(MagicMock(), MagicMock())
 
         # Count schedule.do() calls - one per task
         do_calls = [call for call in mock_schedule.mock_calls if ".do(" in str(call)]
@@ -43,9 +52,7 @@ class TestScheduledTasksInitialization:
         - Daily tasks scheduled with .at()
         - Interval-based tasks with correct durations
         """
-        bot = MagicMock()
-
-        scheduled_tasks.init(bot)
+        scheduled_tasks.init(MagicMock(), MagicMock())
 
         # Verify daily task times were called (at least once each)
         daily_do_calls = [call for call in mock_schedule.mock_calls if ".day.at(" in str(call) and ".do(" in str(call)]
@@ -58,9 +65,6 @@ class TestScheduledTasksInitialization:
         # Verify 2-hour interval
         hours_do_calls = [call for call in mock_schedule.mock_calls if ".hours.do(" in str(call)]
         assert len(hours_do_calls) >= 1  # At least one 2-hour task
-        # Verify bot.client was passed
-        client_mentions = [call for call in mock_schedule.mock_calls if "client=" in str(call)]
-        assert len(client_mentions) >= 1
 
     @patch("jobs.scheduled_tasks.schedule")
     def test_init_uses_safe_run_wrapper(self, mock_schedule) -> None:
@@ -70,9 +74,7 @@ class TestScheduledTasksInitialization:
         Since safe_run wraps the functions, we verify at least one
         do() call references the safe_run mechanism.
         """
-        bot = MagicMock()
-
-        scheduled_tasks.init(bot)
+        scheduled_tasks.init(MagicMock(), MagicMock())
 
         # Tasks should be registered and scheduled
         do_calls = [call for call in mock_schedule.mock_calls if ".do(" in str(call)]
@@ -84,78 +86,140 @@ class TestIntegrationHealthchecksWorkflow:
     """Integration tests for health check workflow."""
 
     @patch("jobs.scheduled_tasks.logger")
-    @patch("jobs.scheduled_tasks.identity_store")
+    @patch("jobs.scheduled_tasks.build_identity_center_adapter")
     @patch("jobs.scheduled_tasks.opsgenie")
     @patch("jobs.scheduled_tasks.maxmind")
-    @patch("jobs.scheduled_tasks.google_drive")
+    @patch("jobs.scheduled_tasks.incident_drive")
     def test_healthcheck_all_healthy(
         self,
-        mock_google_drive,
+        mock_incident_drive,
         mock_maxmind,
         mock_opsgenie,
-        mock_identity_store,
+        mock_build_adapter,
         mock_logger,
     ) -> None:
         """Test healthcheck when all integrations are healthy.
+
+        The AWS entry builds the Identity Center adapter and reads is_success
+        from its healthcheck result, so the factory is patched to return an
+        adapter whose healthcheck succeeds.
 
         Verifies:
         - Each integration is checked
         - No errors are logged
         - Healthy status is reported
         """
-        mock_google_drive.healthcheck.return_value = True
-        mock_maxmind.healthcheck.return_value = True
+        mock_incident_drive.incident_drive_healthcheck.return_value = True
+        mock_maxmind.get_maxmind_client.return_value.healthcheck.return_value = OperationResult.success(
+            data={"status": "healthy"}, message="MaxMind database is accessible"
+        )
         mock_opsgenie.healthcheck.return_value = True
-        mock_identity_store.healthcheck.return_value = True
+        mock_build_adapter.return_value.healthcheck.return_value = OperationResult.success(data=True)
 
         scheduled_tasks.integration_healthchecks()
 
         # Verify all healthchecks were called
-        assert mock_google_drive.healthcheck.call_count == 1
-        assert mock_maxmind.healthcheck.call_count == 1
+        assert mock_incident_drive.incident_drive_healthcheck.call_count == 1
+        assert mock_maxmind.get_maxmind_client.return_value.healthcheck.call_count == 1
         assert mock_opsgenie.healthcheck.call_count == 1
-        assert mock_identity_store.healthcheck.call_count == 1
+        assert mock_build_adapter.return_value.healthcheck.call_count == 1
 
         # Verify no errors logged
         error_calls = [call for call in mock_logger.mock_calls if "error" in str(call)]
         assert len(error_calls) == 0
 
     @patch("jobs.scheduled_tasks.logger")
-    @patch("jobs.scheduled_tasks.identity_store")
+    @patch("jobs.scheduled_tasks.build_identity_center_adapter")
     @patch("jobs.scheduled_tasks.opsgenie")
     @patch("jobs.scheduled_tasks.maxmind")
-    @patch("jobs.scheduled_tasks.google_drive")
+    @patch("jobs.scheduled_tasks.incident_drive")
     def test_healthcheck_partial_failures(
         self,
-        mock_google_drive,
+        mock_incident_drive,
         mock_maxmind,
         mock_opsgenie,
-        mock_identity_store,
+        mock_build_adapter,
         mock_logger,
     ) -> None:
-        """Test healthcheck with some integrations failing.
+        """Test healthcheck with every integration reporting unhealthy.
+
+        Google Drive and Opsgenie return False, while MaxMind and the Identity
+        Center adapter return non-success OperationResults.
 
         Verifies:
-        - Failed integrations are logged
-        - Healthcheck continues for other integrations
-        - Error messages include integration name
+        - Every check is still called once
+        - Each integration gets its own unhealthy integration_healthcheck_result log
         """
-        mock_google_drive.healthcheck.return_value = False
-        mock_maxmind.healthcheck.return_value = True
+        mock_incident_drive.incident_drive_healthcheck.return_value = False
+        mock_maxmind.get_maxmind_client.return_value.healthcheck.return_value = OperationResult.permanent_error(
+            message="MaxMind healthcheck failed", error_code="HEALTHCHECK_FAILED"
+        )
         mock_opsgenie.healthcheck.return_value = False
-        mock_identity_store.healthcheck.return_value = True
+        mock_build_adapter.return_value.healthcheck.return_value = OperationResult.permanent_error(
+            message="User is not authorized", error_code="AccessDeniedException"
+        )
 
         scheduled_tasks.integration_healthchecks()
 
         # All checks should be called
-        assert mock_google_drive.healthcheck.call_count == 1
-        assert mock_maxmind.healthcheck.call_count == 1
+        assert mock_incident_drive.incident_drive_healthcheck.call_count == 1
+        assert mock_maxmind.get_maxmind_client.return_value.healthcheck.call_count == 1
         assert mock_opsgenie.healthcheck.call_count == 1
-        assert mock_identity_store.healthcheck.call_count == 1
+        assert mock_build_adapter.return_value.healthcheck.call_count == 1
 
-        # Errors should be logged for unhealthy checks
-        error_logs = [call for call in mock_logger.mock_calls if "error" in str(call).lower()]
-        assert len(error_logs) >= 2
+        # Each unhealthy check is logged under its integration key
+        unhealthy = {
+            call.kwargs["integration"]
+            for call in mock_logger.error.call_args_list
+            if call.args and call.args[0] == "integration_healthcheck_result" and call.kwargs.get("result") == "unhealthy"
+        }
+        assert unhealthy == {"google_drive", "maxmind", "opsgenie", "aws"}
+
+    @patch("jobs.scheduled_tasks.logger")
+    @patch("jobs.scheduled_tasks.build_identity_center_adapter")
+    @patch("jobs.scheduled_tasks.opsgenie")
+    @patch("jobs.scheduled_tasks.maxmind")
+    @patch("jobs.scheduled_tasks.incident_drive")
+    def test_healthcheck_logs_unhealthy_and_continues_when_a_check_raises(
+        self,
+        mock_incident_drive,
+        mock_maxmind,
+        mock_opsgenie,
+        mock_build_adapter,
+        mock_logger,
+    ) -> None:
+        """A healthcheck that raises is reported as unhealthy with its error, and the remaining checks still run.
+
+        Stub strategy: the Google Drive check raises RuntimeError. The Identity
+        Center adapter factory also raises, as a failed role assumption during
+        client construction would. MaxMind and Opsgenie are healthy.
+
+        Verifies:
+        - Nothing escapes integration_healthchecks
+        - The healthy checks after the raising one are still called
+        - Both raising entries log an unhealthy integration_healthcheck_result carrying the exception text
+        """
+        mock_incident_drive.incident_drive_healthcheck.side_effect = RuntimeError("drive template unreachable")
+        mock_maxmind.get_maxmind_client.return_value.healthcheck.return_value = OperationResult.success(
+            data={"status": "healthy"}, message="MaxMind database is accessible"
+        )
+        mock_opsgenie.healthcheck.return_value = True
+        mock_build_adapter.side_effect = RuntimeError("AssumeRole denied")
+
+        scheduled_tasks.integration_healthchecks()
+
+        assert mock_maxmind.get_maxmind_client.return_value.healthcheck.call_count == 1
+        assert mock_opsgenie.healthcheck.call_count == 1
+
+        unhealthy = {
+            call.kwargs["integration"]: call.kwargs.get("error")
+            for call in mock_logger.error.call_args_list
+            if call.args and call.args[0] == "integration_healthcheck_result" and call.kwargs.get("result") == "unhealthy"
+        }
+        assert unhealthy == {
+            "google_drive": "drive template unreachable",
+            "aws": "AssumeRole denied",
+        }
 
 
 @pytest.mark.integration

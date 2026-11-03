@@ -1,86 +1,163 @@
+from typing import Any, Literal
+
 import arrow
 import structlog
-from slack_bolt import Ack
+from botocore.exceptions import BotoCoreError, ClientError
+from slack_bolt import Ack, Respond
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
-from integrations.aws import (
-    config,
-    cost_explorer,
-    guard_duty,
-    organizations,
-    security_hub,
-)
+from contracts.operations import OperationResult
+from packages.aws_platform.adapters.config import ConfigAdapter, build_config_adapter
+from packages.aws_platform.adapters.cost_explorer import CostExplorerAdapter, build_cost_explorer_adapter
+from packages.aws_platform.adapters.guard_duty import GuardDutyAdapter, build_guard_duty_adapter
+from packages.aws_platform.adapters.organizations import build_organizations_adapter
+from packages.aws_platform.adapters.security_hub import SecurityHubAdapter, build_security_hub_adapter
 
 logger = structlog.get_logger()
 
+type SecuritySummary = int | Literal["not_enabled"] | None
 
-def get_account_health(account_id):
-    last_day_of_current_month = arrow.utcnow().span("month")[1].format("YYYY-MM-DD")
-    first_day_of_current_month = arrow.utcnow().span("month")[0].format("YYYY-MM-DD")
-    last_day_of_last_month = arrow.utcnow().shift(months=-1).span("month")[1].format("YYYY-MM-DD")
-    first_day_of_last_month = arrow.utcnow().shift(months=-1).span("month")[0].format("YYYY-MM-DD")
+GUARDDUTY_NOT_ENABLED: Literal["not_enabled"] = "not_enabled"
 
-    data = {
+_HEALTH_CHECK_FAILED_MESSAGE = (
+    "⚠️ Could not load the health check. Please try again later.\n"
+    "Impossible de charger la vérification de santé. Veuillez réessayer plus tard."
+)
+_MODAL_OPEN_FAILED_MESSAGE = (
+    "⚠️ Could not open the account health form. Please try again later.\n"
+    "Impossible d'ouvrir le formulaire de santé du compte. Veuillez réessayer plus tard."
+)
+
+ACCOUNT_SELECT_ACTION_ID = "aws_health_account"
+# Slack rejects an options response holding more than 100 options.
+_MAX_ACCOUNT_OPTIONS = 100
+
+
+def _failure_fields(result: OperationResult[Any]) -> dict[str, Any]:
+    """Return the structured log fields describing a non-success adapter result."""
+    return {"status": result.status.value, "error_code": result.error_code, "error": result.message}
+
+
+def get_account_health(account_id: str) -> dict[str, Any]:
+    """Collect last and current month cost plus Config, GuardDuty and Security Hub summaries.
+
+    Each adapter is built once per check. A failed lookup leaves its field as None
+    (rendered as unavailable) instead of failing the whole check.
+    """
+    current_month_start = arrow.utcnow().floor("month")
+    cost_explorer_adapter = build_cost_explorer_adapter()
+    config_adapter = build_config_adapter()
+    guard_duty_adapter = build_guard_duty_adapter()
+    security_hub_adapter = build_security_hub_adapter()
+
+    return {
         "account_id": account_id,
         "cost": {
-            "last_month": {
-                "start_date": first_day_of_last_month,
-                "end_date": last_day_of_last_month,
-                "amount": get_account_spend(account_id, first_day_of_last_month, last_day_of_last_month),
-            },
-            "current_month": {
-                "start_date": first_day_of_current_month,
-                "end_date": last_day_of_current_month,
-                "amount": get_account_spend(account_id, first_day_of_current_month, last_day_of_current_month),
-            },
+            "last_month": _month_cost(cost_explorer_adapter, account_id, current_month_start.shift(months=-1)),
+            "current_month": _month_cost(cost_explorer_adapter, account_id, current_month_start),
         },
         "security": {
-            "config": get_config_summary(account_id),
-            "guardduty": get_guardduty_summary(account_id),
-            "securityhub": get_securityhub_summary(account_id),
+            "config": get_config_summary(config_adapter, account_id),
+            "guardduty": get_guardduty_summary(guard_duty_adapter, account_id),
+            "securityhub": get_securityhub_summary(security_hub_adapter, account_id),
         },
     }
 
-    return data
+
+def _month_cost(cost_explorer_adapter: CostExplorerAdapter, account_id: str, month_start: arrow.Arrow) -> dict[str, Any]:
+    """Return one month's displayed range and spend.
+
+    Cost Explorer's End is exclusive, so the query ends on the next month's first
+    day while the displayed range ends on the month's last day.
+    """
+    next_month_start = month_start.shift(months=1)
+    start_date = month_start.format("YYYY-MM-DD")
+    return {
+        "start_date": start_date,
+        "end_date": next_month_start.shift(days=-1).format("YYYY-MM-DD"),
+        "amount": get_account_spend(cost_explorer_adapter, account_id, start_date, next_month_start.format("YYYY-MM-DD")),
+    }
 
 
-def get_account_spend(account_id, start_date, end_date):
-    time_period = {"Start": start_date, "End": end_date}
-    granularity = "MONTHLY"
-    metrics = ["UnblendedCost"]
-    group_by = [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}]
-    filter = {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [account_id]}}
-    response = cost_explorer.get_cost_and_usage(time_period, granularity, metrics, filter, group_by)
-    if "Groups" in response["ResultsByTime"][0] and len(response["ResultsByTime"][0]["Groups"]) > 0:
-        return "{:0,.2f}".format(float(response["ResultsByTime"][0]["Groups"][0]["Metrics"]["UnblendedCost"]["Amount"]))
-    else:
+def get_account_spend(cost_explorer_adapter: CostExplorerAdapter, account_id: str, start_date: str, end_date: str) -> str | None:
+    """Return the account's formatted unblended cost from start_date to the exclusive end_date.
+
+    Returns None when the lookup fails.
+    """
+    result = cost_explorer_adapter.get_cost_and_usage(
+        time_period={"Start": start_date, "End": end_date},
+        granularity="MONTHLY",
+        metrics=["UnblendedCost"],
+        filter_expression={"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [account_id]}},
+        group_by=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+    )
+    if not result.is_success:
+        logger.error(
+            "aws_health_cost_lookup_failed",
+            account_id=account_id,
+            start=start_date,
+            end=end_date,
+            **_failure_fields(result),
+        )
+        return None
+    results_by_time = result.data or []
+    groups = results_by_time[0].get("Groups", []) if results_by_time else []
+    if not groups:
         return "0.00"
+    return "{:0,.2f}".format(float(groups[0]["Metrics"]["UnblendedCost"]["Amount"]))
 
 
-def get_config_summary(account_id):
+def get_config_summary(config_adapter: ConfigAdapter, account_id: str) -> int | None:
+    """Return the number of non-compliant Config rules for the account, or None when the lookup fails."""
     config_name = "aws-controltower-GuardrailsComplianceAggregator"
     filters = {
         "AccountId": account_id,
         "ComplianceType": "NON_COMPLIANT",
     }
-    return len(config.describe_aggregate_compliance_by_config_rules(config_name, filters))
+    result = config_adapter.describe_aggregate_compliance_by_config_rules(config_name, filters)
+    if not result.is_success:
+        logger.error("aws_health_config_lookup_failed", account_id=account_id, **_failure_fields(result))
+        return None
+    return len(result.data or [])
 
 
-def get_guardduty_summary(account_id):
-    detector_ids = guard_duty.list_detectors()
+def get_guardduty_summary(guard_duty_adapter: GuardDutyAdapter, account_id: str) -> SecuritySummary:
+    """Return the count of unarchived high-severity GuardDuty findings.
+
+    Returns "not_enabled" when there is no detector and None when a lookup fails.
+    """
+    detectors_result = guard_duty_adapter.list_detectors()
+    if not detectors_result.is_success:
+        logger.error("aws_health_guardduty_detectors_failed", account_id=account_id, **_failure_fields(detectors_result))
+        return None
+    detector_ids = detectors_result.data or []
+    if not detector_ids:
+        logger.info("aws_health_guardduty_not_enabled", account_id=account_id)
+        return GUARDDUTY_NOT_ENABLED
+
     finding_criteria = {
         "Criterion": {
             "accountId": {"Eq": [account_id]},
-            "service.archived": {"Eq": ["false", "false"]},
+            "service.archived": {"Eq": ["false"]},
             "severity": {"Gte": 7},
         }
     }
-    response = guard_duty.get_findings_statistics(detector_ids[0], finding_criteria)
-    return sum(response["FindingStatistics"]["CountBySeverity"].values())
+    statistics_result = guard_duty_adapter.get_findings_statistics(detector_ids[0], finding_criteria)
+    if not statistics_result.is_success:
+        logger.error(
+            "aws_health_guardduty_statistics_failed",
+            account_id=account_id,
+            detector_id=detector_ids[0],
+            **_failure_fields(statistics_result),
+        )
+        return None
+    return sum((statistics_result.data or {}).values())
 
 
-def get_securityhub_summary(account_id):
-    filters = {
+def get_securityhub_summary(security_hub_adapter: SecurityHubAdapter, account_id: str) -> int | None:
+    """Return the number of active failed high-severity Security Hub findings, or None when the lookup fails."""
+    filters: dict[str, Any] = {
         "AwsAccountId": [{"Value": account_id, "Comparison": "EQUALS"}],
         "ComplianceStatus": [
             {"Value": "FAILED", "Comparison": "EQUALS"},
@@ -102,15 +179,14 @@ def get_securityhub_summary(account_id):
             {"Value": "NEW", "Comparison": "EQUALS"},
         ],
     }
-    response = security_hub.get_findings(filters)
-    issues = 0
-    if response:
-        for res in response:
-            issues += len(res["Findings"])
-    return issues
+    result = security_hub_adapter.get_findings(filters)
+    if not result.is_success:
+        logger.error("aws_health_securityhub_lookup_failed", account_id=account_id, **_failure_fields(result))
+        return None
+    return len(result.data or [])
 
 
-def get_ignored_security_hub_issues():
+def get_ignored_security_hub_issues() -> list[dict[str, str]]:
     ignored_issues = [
         "IAM.6 Hardware MFA should be enabled for the root user",
         '1.14 Ensure hardware MFA is enabled for the "root" account',
@@ -119,15 +195,40 @@ def get_ignored_security_hub_issues():
     return [{"Value": t, "Comparison": "NOT_EQUALS"} for t in ignored_issues]
 
 
-def health_view_handler(ack: Ack, body, client: WebClient):
+def _cost_line(period: dict[str, Any]) -> str:
+    """Render one month's cost, or a warning when the lookup failed."""
+    amount = "⚠️ unavailable" if period["amount"] is None else f"${period['amount']} USD"
+    return f"{period['start_date']} - {period['end_date']}: {amount}"
+
+
+def _security_line(label: str, summary: SecuritySummary) -> str:
+    """Render one security service summary, warning when unavailable or not enabled."""
+    if summary is None:
+        return f"⚠️ {label} (unavailable)"
+    if summary == GUARDDUTY_NOT_ENABLED:
+        return f"⚠️ {label} (not enabled)"
+    return f"{'✅' if summary == 0 else '❌'} {label} ({summary} issues)"
+
+
+def _error_view(title: str, message: str) -> dict[str, Any]:
+    """Return a closable modal showing a single error message and no submit button."""
+    return {
+        "type": "modal",
+        "title": {"type": "plain_text", "text": title},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": message}}],
+    }
+
+
+def health_view_handler(ack: Ack, body: dict[str, Any], client: WebClient) -> None:
     ack()
     log = logger.bind()
     log.info(
         "aws_health_request_received",
     )
-    account_id = body["view"]["state"]["values"]["account"]["account"]["selected_option"]["value"]
+    account_id = body["view"]["state"]["values"]["account"][ACCOUNT_SELECT_ACTION_ID]["selected_option"]["value"]
 
-    account_name = body["view"]["state"]["values"]["account"]["account"]["selected_option"]["text"]["text"]
+    account_name = body["view"]["state"]["values"]["account"][ACCOUNT_SELECT_ACTION_ID]["selected_option"]["text"]["text"]
 
     temporary_blocks = {
         "type": "modal",
@@ -159,8 +260,17 @@ def health_view_handler(ack: Ack, body, client: WebClient):
         view=temporary_blocks,
     )["view"]["id"]
 
-    account_info = get_account_health(account_id)
+    # AWS errors that are raised rather than classified (role assumption, unmapped codes) must
+    # not leave the loading modal spinning; programmer errors still propagate.
+    try:
+        account_info = get_account_health(account_id)
+    except ClientError, BotoCoreError:
+        log.exception("aws_health_check_failed", account_id=account_id)
+        client.views_update(view_id=view_id, view=_error_view("AWS - Health Check", _HEALTH_CHECK_FAILED_MESSAGE))
+        return
 
+    cost = account_info["cost"]
+    security = account_info["security"]
     blocks = {
         "type": "modal",
         "callback_id": "health_view",
@@ -182,8 +292,8 @@ def health_view_handler(ack: Ack, body, client: WebClient):
                     "text": f"""
 *Cost:*
 
-{account_info["cost"]["last_month"]["start_date"]} - {account_info["cost"]["last_month"]["end_date"]}: ${account_info["cost"]["last_month"]["amount"]} USD
-{account_info["cost"]["current_month"]["start_date"]} - {account_info["cost"]["current_month"]["end_date"]}: ${account_info["cost"]["current_month"]["amount"]} USD
+{_cost_line(cost["last_month"])}
+{_cost_line(cost["current_month"])}
                         """,
                 },
             },
@@ -195,9 +305,9 @@ def health_view_handler(ack: Ack, body, client: WebClient):
                     "text": f"""
 *Security:*
 
-{"✅" if account_info["security"]["config"] == 0 else "❌"} Config ({account_info["security"]["config"]} issues)\n
-{"✅" if account_info["security"]["guardduty"] == 0 else "❌"} GuardDuty ({account_info["security"]["guardduty"]} issues)\n
-{"✅" if account_info["security"]["securityhub"] == 0 else "❌"} SecurityHub ({account_info["security"]["securityhub"]} issues)\n
+{_security_line("Config", security["config"])}\n
+{_security_line("GuardDuty", security["guardduty"])}\n
+{_security_line("SecurityHub", security["securityhub"])}\n
                         """,
                 },
             },
@@ -207,41 +317,68 @@ def health_view_handler(ack: Ack, body, client: WebClient):
     client.views_update(view_id=view_id, view=blocks)
 
 
-def request_health_modal(client: WebClient, body):
-    accounts = organizations.list_organization_accounts()
+def request_health_modal(client: WebClient, body: dict[str, Any], respond: Respond) -> None:
+    """Open the account selector modal; its options are served by account_options_handler as the user types."""
+    try:
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "aws_health_view",
+                "title": {"type": "plain_text", "text": "AWS - Account health"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "blocks": [
+                    {
+                        "block_id": "account",
+                        "type": "input",
+                        "element": {
+                            "type": "external_select",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "Select an account to view | Choisissez un compte à afficher",
+                            },
+                            "min_query_length": 0,
+                            "action_id": ACCOUNT_SELECT_ACTION_ID,
+                        },
+                        "label": {"type": "plain_text", "text": "Account", "emoji": True},
+                    }
+                ],
+            },
+        )
+    except SlackApiError as error:
+        logger.exception("aws_health_modal_open_failed", slack_error=error.response.get("error"))
+        respond(_MODAL_OPEN_FAILED_MESSAGE)
+
+
+def _is_active(account: dict[str, Any]) -> bool:
+    """Whether an Organizations account is active, preferring State over the retired Status field."""
+    return (account.get("State") or account.get("Status")) == "ACTIVE"
+
+
+def account_options_handler(ack: Ack, body: dict[str, Any]) -> None:
+    """Serve the account selector: active accounts matching the typed text, sorted, capped at Slack's limit.
+
+    A failed listing acknowledges with no options so Slack does not time out.
+    """
+    query = body.get("value", "").strip().lower()
+    try:
+        accounts_result = build_organizations_adapter().list_organization_accounts()
+    except ClientError, BotoCoreError:
+        logger.exception("aws_health_accounts_list_failed")
+        ack(options=[])
+        return
+    if not accounts_result.is_success:
+        logger.error("aws_health_accounts_list_failed", **_failure_fields(accounts_result))
+        ack(options=[])
+        return
+
     options = [
         {
-            "text": {
-                "type": "plain_text",
-                "text": f"{account['Name']} ({account['Id']})",
-            },
+            "text": {"type": "plain_text", "text": f"{account['Name']} ({account['Id']})"},
             "value": account["Id"],
         }
-        for account in accounts
+        for account in accounts_result.data or []
+        if _is_active(account) and (query in account["Name"].lower() or query in account["Id"])
     ]
-    options.sort(key=lambda x: x["text"]["text"].lower())
-    client.views_open(
-        trigger_id=body["trigger_id"],
-        view={
-            "type": "modal",
-            "callback_id": "aws_health_view",
-            "title": {"type": "plain_text", "text": "AWS - Account health"},
-            "submit": {"type": "plain_text", "text": "Submit"},
-            "blocks": [
-                {
-                    "block_id": "account",
-                    "type": "input",
-                    "element": {
-                        "type": "static_select",
-                        "placeholder": {
-                            "type": "plain_text",
-                            "text": "Select an account to view | Choisissez un compte à afficher",
-                        },
-                        "options": options,
-                        "action_id": "account",
-                    },
-                    "label": {"type": "plain_text", "text": "Account", "emoji": True},
-                }
-            ],
-        },
-    )
+    options.sort(key=lambda option: option["text"]["text"].lower())
+    ack(options=options[:_MAX_ACCOUNT_OPTIONS])

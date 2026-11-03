@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from integrations.slack.models import CommandPayload, CommandResponse
+from contracts.slack.models import CommandPayload, CommandResponse
 from modules.sre.platforms import slack as sre_slack
 
 
@@ -55,8 +55,8 @@ class TestVersionCommandHandler:
         """Version handler should return Git SHA from settings."""
         # Arrange
         mock_settings = MagicMock()
-        mock_settings.GIT_SHA = "abc123def456"
-        monkeypatch.setattr(sre_slack, "get_app_settings", lambda: mock_settings)
+        mock_settings.git_sha = "abc123def456"
+        monkeypatch.setattr(sre_slack, "host_info", lambda: mock_settings)
 
         payload = CommandPayload(
             text="",
@@ -77,8 +77,8 @@ class TestVersionCommandHandler:
         """Version handler should work with empty text."""
         # Arrange
         mock_settings = MagicMock()
-        mock_settings.GIT_SHA = "test-sha"
-        monkeypatch.setattr(sre_slack, "get_app_settings", lambda: mock_settings)
+        mock_settings.git_sha = "test-sha"
+        monkeypatch.setattr(sre_slack, "host_info", lambda: mock_settings)
 
         payload = CommandPayload(
             text="",

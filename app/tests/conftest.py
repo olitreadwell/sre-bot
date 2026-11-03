@@ -1,15 +1,32 @@
 import logging
 import sys
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 import slack_bolt
+import svcs
 
 # Ensure project root is on path BEFORE importing test factories.
-project_root = "/workspace/app"
+project_root = str(Path(__file__).resolve().parents[1])
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+from contracts.configuration import (  # noqa: E402
+    ConfigurationFiles,
+    HostInfo,
+    install_configuration_files,
+    install_host_info,
+    uninstall_host_info,
+)
+from contracts.slack.transport import (  # noqa: E402
+    SlackTransportInfo,
+    install_slack_transport_info,
+    uninstall_slack_transport_info,
+)
+from integrations.slack.provider import get_slack_provider  # noqa: E402
+from server.configuration import load_configuration_files  # noqa: E402
 from tests.factories.aws import (  # noqa: E402
     make_aws_groups,
     make_aws_groups_memberships,
@@ -22,6 +39,7 @@ from tests.factories.google import (  # noqa: E402
     make_google_members,
     make_google_users,
 )
+from tests.fixtures.service_registry import build_fake_service_registry  # noqa: E402
 
 # Ensure the application package root is on sys.path so importing application
 # modules (e.g. `core.config`) works during pytest collection. Pytest may
@@ -49,6 +67,7 @@ def pytest_configure(config):
         self.view = MagicMock()
         self.action = MagicMock()
         self.event = MagicMock()
+        self.error = MagicMock()
         self.middleware = MagicMock()
         self.add_middleware = MagicMock()
         self.add_event_handler = MagicMock()
@@ -56,6 +75,68 @@ def pytest_configure(config):
     # Patch before any imports
 
     slack_bolt.App.__init__ = mock_app_init
+
+
+@pytest.fixture(scope="session")
+def ci_configuration_files() -> ConfigurationFiles:
+    """The checked-in base and ci configuration files, loaded once per run (pytest-env sets ENVIRONMENT=ci)."""
+    return load_configuration_files("ci")
+
+
+@pytest.fixture(autouse=True)
+def installed_ci_configuration(ci_configuration_files: ConfigurationFiles) -> None:
+    """Install the ci files before every test, so a test that installed its own leaves nothing behind."""
+    install_configuration_files(ci_configuration_files)
+
+
+@pytest.fixture(autouse=True)
+def installed_ci_host_info() -> Iterator[HostInfo]:
+    """Install a ci HostInfo before every test and remove it after, so no test leaks host facts."""
+    info = HostInfo(environment="ci", git_sha="test-sha", public_base_url="http://127.0.0.1:8000")
+    install_host_info(info)
+    yield info
+    uninstall_host_info()
+
+
+@pytest.fixture(autouse=True)
+def installed_slack_transport_info() -> Iterator[SlackTransportInfo]:
+    """Install unprefixed Slack transport facts before every test and remove them after."""
+    info = SlackTransportInfo(command_prefix="")
+    install_slack_transport_info(info)
+    yield info
+    uninstall_slack_transport_info()
+
+
+@pytest.fixture(autouse=True)
+def fresh_slack_provider():
+    """Give every test its own Slack provider.
+
+    The provider is a cached singleton whose native listener ids are unique per
+    instance, so each app lifespan started in one process needs a fresh one.
+    """
+    get_slack_provider.cache_clear()
+    yield
+    get_slack_provider.cache_clear()
+
+
+@pytest.fixture
+def static_aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Static AWS credentials with the instance metadata endpoint disabled.
+
+    Booting the real lifespan builds AWS clients for the core services, and the
+    ambient credential chain contacts the metadata endpoint when no credentials
+    are configured (as in CI). TASK-149 makes construction network-free.
+    """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+@pytest.fixture
+async def service_registry() -> AsyncIterator[svcs.Registry]:
+    """svcs registry with in-memory fakes under the core contracts, closed after the test."""
+    async with build_fake_service_registry() as registry:
+        yield registry
 
 
 @pytest.fixture(autouse=True)
@@ -371,7 +452,6 @@ def make_mock_settings():
         def mock_settings(make_mock_settings):
             return make_mock_settings(
                 **{
-                    'slack.SLACK_TOKEN': 'xoxb-test-token',
                     'commands.providers': {},
                 }
             )
@@ -384,13 +464,10 @@ def make_mock_settings():
         """Create mock settings with provided overrides."""
         settings = MagicMock()
 
-        # Set common defaults for all packages
-        settings.aws.AWS_REGION = "us-east-1"
-
         # Apply package-specific overrides
         for key, value in overrides.items():
             if "." in key:
-                # Handle nested attributes: 'slack.SLACK_TOKEN' -> settings.slack.SLACK_TOKEN
+                # Handle nested attributes: 'commands.providers' -> settings.commands.providers
                 parts = key.split(".")
                 obj = settings
                 for part in parts[:-1]:

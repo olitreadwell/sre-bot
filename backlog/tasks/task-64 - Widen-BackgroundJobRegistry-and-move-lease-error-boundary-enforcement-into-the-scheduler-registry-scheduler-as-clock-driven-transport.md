@@ -6,14 +6,15 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-28 16:29'
-updated_date: '2026-07-28 17:04'
+updated_date: '2026-10-14 18:57'
 labels:
   - architecture
   - reliability
   - layers
 milestone: m-4
 dependencies:
-  - TASK-6
+  - TASK-127
+  - TASK-148
 references:
   - decisions/reliability.md
   - decisions/plugins.md
@@ -64,5 +65,20 @@ BREAKDOWN GUIDANCE FOR THE PLANNING CODING AGENT: check the single-PR size gate.
 created: 2026-07-28 16:33
 ---
 Placeholder IDs resolved: 'THIS TASK'/'TASK-A' in the description = TASK-64 (this task); 'TASK-B' = TASK-65 (strangle the pull-hub into feature hookimpls). Predecessor TASK-6 rewritten 2026-07-28 to the minimal single-default-TTL scope; this task delivers the declarative tier/TTL/schedule registry that lets features (and the eventual migrated modules jobs) declare leasing through the boundary.
+---
+
+created: 2026-09-14 15:27
+---
+2026-09-14: AC#4 registers integration_healthchecks as a host-owned Tier-1 job. TASK-92 (service health model, AC#4) decides whether that log-only vendor-probe job should exist at all, or be replaced by per-dependency metrics or a narrower credential probe. Re-check AC#4 against TASK-92's outcome before planning. Current state: jobs/scheduled_tasks.py integration_healthchecks guards each entry against exceptions, and the 'aws' entry uses build_identity_center_adapter (TASK-25.2.3.2.4).
+---
+
+created: 2026-09-24 20:07
+---
+2026-09-24 alignment with decisions/plugin-architecture.md: the widened BackgroundJobRegistry Protocol is the scheduler contract and moves to app/contracts/ with the hookspecs (TASK-107). The runtime that applies safe_run and the Tier-2 lease moves to app/server/scheduler/ (TASK-52, rescoped: server/, not infrastructure/). The lease comes from the coordination contract (TASK-58). This task still lands in place under app/jobs/ first, as planned; its placeholder reference 'TASK-B' is TASK-65.
+---
+
+created: 2026-09-25 15:00
+---
+2026-09-25: TASK-92 was narrowed to the service health model; the fate of integration_healthchecks moved to TASK-127, now a dependency. Re-check AC#4 against TASK-127 before planning.
 ---
 <!-- COMMENTS:END -->

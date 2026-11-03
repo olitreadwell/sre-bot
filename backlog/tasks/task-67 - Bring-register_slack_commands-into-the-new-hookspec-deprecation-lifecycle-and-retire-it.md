@@ -6,14 +6,14 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-07-29 17:46'
-updated_date: '2026-07-29 17:48'
+updated_date: '2026-10-02 13:49'
 labels:
   - governance
   - plugins
   - phase-3
 milestone: m-3
 dependencies:
-  - TASK-26
+  - TASK-26.1
 references:
   - decisions/hookspec-deprecation.md
   - decisions/plugins.md
@@ -36,7 +36,26 @@ Steps:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 register_slack_commands's docstring follows the new DEPRECATED (since <milestone>, replacement: <name>) marker format
+- [ ] #1 register_slack_commands's docstring follows the DEPRECATED (since <milestone>, replacement: <name>) marker format, naming the registrar-based Slack registration hookspec defined by TASK-26.1 as the replacement
 - [ ] #2 A repo-wide grep for @hookimpl implementers of register_slack_commands is documented in the PR (count of remaining implementers stated explicitly)
-- [ ] #3 If zero implementers remain, the hookspec is deleted from specs.py and test_plugins_hookspecs.py is updated to match; if implementers remain, the hookspec is left in place with the reformatted marker and removal is filed as an explicit follow-up task
+- [ ] #3 If zero implementers remain, the hookspec is deleted from the hookspecs module (app/contracts/ after TASK-107) and the boot-test hookspec inventory is updated to match; if implementers remain, the hookspec is left in place with the reformatted marker and removal is filed as an explicit follow-up task
 <!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-09-24 20:10
+---
+2026-09-24 alignment with decisions/platform-entrypoints.md and plugins.md: the replacement is no longer register_slack_listeners(app: AsyncApp), which hands features the Bolt app. It is the registrar-based Slack hookspec in app/contracts/slack/ from TASK-26.1. Dependency moved from TASK-26 to TASK-26.1.
+---
+
+created: 2026-10-02 13:49
+---
+From the Stack A handoff, moved here when that doc was retired (2026-10-02; verified on main at f182ecd2): this task's description and steps are stale and need a rewrite or a close, not a path fix.
+- register_slack_listeners no longer exists. TASK-26.1.3 (#1519) deleted it, and the hookspec inventory test asserts its absence.
+- register_slack_commands is not deprecated any more. TASK-26.1.3 re-signed it as register_slack_commands(registrar: SlackCommandRegistrar): it IS the registrar-based hookspec that comment #1 names as the replacement, and its docstring carries no DEPRECATED marker. So AC #1 (reformat the deprecation marker) and steps 1 to 3 have no subject.
+- It has eight implementers, not four: modules/dev, modules/sre, packages/access/sync, packages/geolocate, packages/incident_draft, packages/incident_summary, packages/rant, packages/user_rotations.
+- The paths moved: the hookspec is in app/contracts/plugins/hookspecs.py (TASK-107.3), not app/infrastructure/plugins/specs.py, and the inventory test is app/tests/unit/contracts/plugins/test_contracts_hookspecs_inventory.py.
+Decision for the human: close this task as overtaken by TASK-26.1.3, or rewrite it around whatever hookspec the deprecation lifecycle (decisions/hookspec-deprecation.md) should be exercised on first.
+---
+<!-- COMMENTS:END -->

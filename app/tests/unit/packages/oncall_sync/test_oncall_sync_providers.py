@@ -1,14 +1,19 @@
 """Unit tests for on-call sync provider wiring."""
 
-from __future__ import annotations
-
 from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from slack_sdk.http_retry.builtin_handlers import (
+    ConnectionErrorRetryHandler,
+    RateLimitErrorRetryHandler,
+    ServerErrorRetryHandler,
+)
 
+from integrations.slack.settings import get_slack_settings
 from packages.oncall_sync import providers
+from packages.oncall_sync.adapters import slack as slack_adapter
 from packages.oncall_sync.adapters.slack import SlackUserGroupTarget
 
 pytestmark = pytest.mark.unit
@@ -17,27 +22,39 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def _provider_cache_isolation() -> Iterator[None]:
     providers.get_user_group_sync_target.cache_clear()
+    providers.get_oncall_sync_service.cache_clear()
     yield
     providers.get_user_group_sync_target.cache_clear()
+    providers.get_oncall_sync_service.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_oncall_sync_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        providers,
+        "get_oncall_sync_settings",
+        lambda: SimpleNamespace(APPROVED_EMAIL_DOMAINS=[]),
+        raising=False,
+    )
 
 
 def test_get_user_group_sync_target_builds_client_with_user_token(monkeypatch: pytest.MonkeyPatch) -> None:
     web_client = MagicMock(token="xoxp-user-token")
-    web_client_ctor = MagicMock(return_value=web_client)
-    monkeypatch.setattr(providers, "get_slack_settings", lambda: SimpleNamespace(USER_TOKEN="xoxp-user-token"))
-    monkeypatch.setattr(providers, "WebClient", web_client_ctor)
+    web_client_factory = MagicMock(return_value=web_client)
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token="xoxp-user-token"))
+    monkeypatch.setattr(slack_adapter, "get_slack_web_client", web_client_factory)
 
     target = providers.get_user_group_sync_target()
 
     assert isinstance(target, SlackUserGroupTarget)
     assert target._client is web_client
-    web_client_ctor.assert_called_once_with(token="xoxp-user-token")
+    web_client_factory.assert_called_once_with(actor="user")
 
 
 def test_usergroup_write_is_issued_via_user_scoped_client(monkeypatch: pytest.MonkeyPatch) -> None:
     web_client = MagicMock(token="xoxp-user-token")
-    monkeypatch.setattr(providers, "get_slack_settings", lambda: SimpleNamespace(USER_TOKEN="xoxp-user-token"))
-    monkeypatch.setattr(providers, "WebClient", MagicMock(return_value=web_client))
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token="xoxp-user-token"))
+    monkeypatch.setattr(slack_adapter, "get_slack_web_client", MagicMock(return_value=web_client))
 
     target = providers.get_user_group_sync_target()
     web_client.users_lookupByEmail.return_value = {"ok": True, "user": {"id": "U1"}}
@@ -49,21 +66,74 @@ def test_usergroup_write_is_issued_via_user_scoped_client(monkeypatch: pytest.Mo
     assert target._client.token == "xoxp-user-token"
 
 
-def test_get_user_group_sync_target_raises_when_user_token_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(providers, "get_slack_settings", lambda: SimpleNamespace(USER_TOKEN=""))
+def test_user_scoped_client_retries_through_the_sdk_retry_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The target's client comes from the shared factory, so it carries the SDK retry handlers."""
+    monkeypatch.setenv("SLACK__TENANT__TEAM_ID", "T0TEST")
+    monkeypatch.setenv("SLACK__BOT_TOKEN", "xoxb-bot-token")
+    monkeypatch.setenv("SLACK__USER_TOKEN", "xoxp-user-token")
+    get_slack_settings.cache_clear()
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token="xoxp-user-token"))
 
-    with pytest.raises(ValueError, match="SLACK_USER_TOKEN"):
+    try:
+        client = providers.get_user_group_sync_target()._client
+    finally:
+        get_slack_settings.cache_clear()
+
+    assert client.token == "xoxp-user-token"
+    assert [type(handler) for handler in client.retry_handlers] == [
+        ConnectionErrorRetryHandler,
+        RateLimitErrorRetryHandler,
+        ServerErrorRetryHandler,
+    ]
+
+
+def test_get_user_group_sync_target_raises_when_user_token_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token=""))
+
+    with pytest.raises(ValueError, match="SLACK__USER_TOKEN"):
         providers.get_user_group_sync_target()
 
 
 def test_get_user_group_sync_target_is_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
     web_client = MagicMock(token="xoxp-user-token")
-    web_client_ctor = MagicMock(return_value=web_client)
-    monkeypatch.setattr(providers, "get_slack_settings", lambda: SimpleNamespace(USER_TOKEN="xoxp-user-token"))
-    monkeypatch.setattr(providers, "WebClient", web_client_ctor)
+    web_client_factory = MagicMock(return_value=web_client)
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token="xoxp-user-token"))
+    monkeypatch.setattr(slack_adapter, "get_slack_web_client", web_client_factory)
 
     first = providers.get_user_group_sync_target()
     second = providers.get_user_group_sync_target()
 
     assert first is second
-    web_client_ctor.assert_called_once_with(token="xoxp-user-token")
+    web_client_factory.assert_called_once_with(actor="user")
+
+
+def test_get_user_group_sync_target_passes_approved_domains(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(slack_adapter, "get_slack_settings", lambda: SimpleNamespace(user_token="xoxp-user-token"))
+    monkeypatch.setattr(slack_adapter, "get_slack_web_client", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        providers,
+        "get_oncall_sync_settings",
+        lambda: SimpleNamespace(APPROVED_EMAIL_DOMAINS=["example.com"]),
+        raising=False,
+    )
+
+    target = providers.get_user_group_sync_target()
+
+    assert target._approved_domains == frozenset({"example.com"})
+
+
+def test_get_oncall_sync_service_includes_user_rotations_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    on_call = MagicMock()
+    target = MagicMock()
+    user_rotations = MagicMock()
+    with monkeypatch.context() as context:
+        context.setattr(providers, "get_oncall_schedule_provider", lambda: on_call)
+        context.setattr(providers, "get_user_group_sync_target", lambda: target)
+        context.setattr(providers, "get_oncall_schedules", lambda: [])
+        context.setattr(providers, "get_user_rotations_service", lambda: user_rotations)
+
+        service = providers.get_oncall_sync_service()
+
+        assert service._on_call is on_call
+        assert service._target is target
+        assert service._user_rotations is user_rotations

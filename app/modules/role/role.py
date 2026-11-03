@@ -3,33 +3,11 @@ from slack_bolt import Ack, App, Respond
 from slack_sdk import WebClient
 from structlog import get_logger
 
-from infrastructure.configuration.integrations.google import (
-    get_google_resources_config,
-    get_google_workspace_settings,
-)
-from infrastructure.slack.settings import get_slack_transport_settings
-from integrations.google_workspace import google_drive
+from contracts.slack.transport import slack_transport_info
+from features.talent.settings import get_talent_settings
 from integrations.slack import commands as slack_commands
 from integrations.slack import users as slack_users
-
-google_settings = get_google_workspace_settings()
-google_resources = get_google_resources_config()
-
-BOT_EMAIL = google_settings.SRE_BOT_EMAIL
-
-SCORING_GUIDE_TEMPLATE = google_resources.scoring_guide_template_id
-CORE_VALUES_INTERVIEW_NOTES_TEMPLATE = google_resources.core_values_interview_notes_id
-TECHNICAL_INTERVIEW_NOTES_TEMPLATE = google_resources.technical_interview_notes_id
-INTAKE_FORM_TEMPLATE = google_resources.intake_form_template_id
-PHONE_SCREEN_TEMPLATE = google_resources.phone_screen_template_id
-RECRUITMENT_FEEDBACK_TEMPLATE = google_resources.recruitment_feedback_template_id
-PANELIST_GUIDEBOOK_TEMPLATE = google_resources.panelist_guidebook_template_id
-
-TEMPLATES_FOLDER = google_resources.templates_folder_id
-INTERNAL_TALENT_FOLDER = google_resources.internal_talent_folder_id
-
-ROLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
-
+from packages.talent.adapters import google_drive as talent_drive
 
 # Set the locale
 i18n.load_path.append("./locales/")
@@ -41,8 +19,8 @@ logger = get_logger()
 
 
 def register(bot: App):
-    transport_settings = get_slack_transport_settings()
-    bot.command(f"/{transport_settings.COMMAND_PREFIX}talent-role")(role_command)
+    transport_settings = slack_transport_info()
+    bot.command(f"/{transport_settings.command_prefix}talent-role")(role_command)
     bot.view("role_view")(role_view_handler)
     bot.action("role_change_locale")(update_modal_locale)
 
@@ -211,23 +189,25 @@ def role_view_handler(ack, body, say, client):
     # 1. Create a new folder in the Google Drive
     # 2. Copy the template files into the new folder
     # 3. Create a new channel and invite users
+    talent = get_talent_settings()
+
+    def copy_template(template_id, document_name, label):
+        file_id = talent_drive.copy_template_to_role_folder(template_id, document_name, talent.templates_folder_id, folder_id)
+        if file_id is None:
+            log.error("talent_role_document_copy_failed", document_name=label)
+        else:
+            log_document_created(label, file_id)
+        return file_id
 
     # Step 1: Create a new folder in the Google Drive
-    folder = google_drive.create_folder(
-        role_name,
-        INTERNAL_TALENT_FOLDER,
-        "id",
-        delegated_user_email=BOT_EMAIL,
-    )
-    folder_id = None
-    if isinstance(folder, dict):
-        folder_id = folder.get("id", None)
-    else:
+    folder = talent_drive.create_role_folder(role_name, talent.internal_folder_id)
+    if folder is None:
         log.error(
             "talent_role_folder_creation_failed",
             folder_name=role_name,
         )
         return
+    folder_id: str = folder["id"]
 
     log.info(
         "talent_role_folder_created",
@@ -238,68 +218,61 @@ def role_view_handler(ack, body, say, client):
 
     # Step 2: Copy the template files into the new folder (Scoring Guilde, Template for Core Values interview notes, Template for Technical interview notes
     # Intake form, Phone screen template)
-    scoring_guide_id = google_drive.copy_file_to_folder(
-        SCORING_GUIDE_TEMPLATE,
+    scoring_guide_id = copy_template(
+        talent.scoring_guide_template_id,
         f"Template 2022/06 - {role_name} Interview Panel Scoring Document - <year/month> ",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Scoring Guide",
     )
-    log_document_created("Scoring Guide", scoring_guide_id)
+    if scoring_guide_id is None:
+        return
 
-    core_values_interview_notes_id = google_drive.copy_file_to_folder(
-        CORE_VALUES_INTERVIEW_NOTES_TEMPLATE,
+    core_values_interview_notes_id = copy_template(
+        talent.core_values_interview_notes_id,
         f"Template EN+FR 2022/09- {role_name} - Core Values Panel - Interview Guide - <year/month> - <candidate initials> ",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Core Values Interview Notes",
     )
-    log_document_created("Core Values Interview Notes", core_values_interview_notes_id)
+    if core_values_interview_notes_id is None:
+        return
 
-    technical_interview_notes_id = google_drive.copy_file_to_folder(
-        TECHNICAL_INTERVIEW_NOTES_TEMPLATE,
+    technical_interview_notes_id = copy_template(
+        talent.technical_interview_notes_id,
         f"Template EN+FR 2022/09 - {role_name} - Technical Panel - Interview Guide - <year/month> - <candidate initials> ",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Technical Interview Notes",
     )
-    log_document_created("Technical Interview Notes", technical_interview_notes_id)
+    if technical_interview_notes_id is None:
+        return
 
-    intake_form_id = google_drive.copy_file_to_folder(
-        INTAKE_FORM_TEMPLATE,
+    intake_form_id = copy_template(
+        talent.intake_form_template_id,
         f"TEMPLATE Month YYYY - {role_name} - Kick-off form",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Intake Form",
     )
-    log_document_created("Intake Form", intake_form_id)
+    if intake_form_id is None:
+        return
 
-    phone_screen_template_id = google_drive.copy_file_to_folder(
-        PHONE_SCREEN_TEMPLATE,
+    phone_screen_template_id = copy_template(
+        talent.phone_screen_template_id,
         "Phone Screen - Template",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Phone Screen Template",
     )
-    log_document_created("Phone Screen Template", phone_screen_template_id)
+    if phone_screen_template_id is None:
+        return
 
-    recruitment_feedback_template_id = google_drive.copy_file_to_folder(
-        RECRUITMENT_FEEDBACK_TEMPLATE,
+    recruitment_feedback_template_id = copy_template(
+        talent.recruitment_feedback_template_id,
         f"Recruitment Feedback - {role_name}",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Recruitment Feedback Template",
     )
-    log_document_created("Recruitment Feedback Template", recruitment_feedback_template_id)
+    if recruitment_feedback_template_id is None:
+        return
 
-    panelist_guidebook_template_id = google_drive.copy_file_to_folder(
-        PANELIST_GUIDEBOOK_TEMPLATE,
+    panelist_guidebook_template_id = copy_template(
+        talent.panelist_guidebook_template_id,
         f"Panelist Guidebook - Interview Best Practices - {role_name}",
-        TEMPLATES_FOLDER,
-        folder_id,
-        delegated_user_email=BOT_EMAIL,
+        "Panelist Guidebook Template",
     )
-    log_document_created("Panelist Guidebook Template", panelist_guidebook_template_id)
+    if panelist_guidebook_template_id is None:
+        return
 
     # Create channel
     response = client.conversations_create(name=private_channel_name, is_private=True)

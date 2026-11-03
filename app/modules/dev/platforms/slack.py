@@ -2,19 +2,21 @@
 
 Uses decorator-based command registration via auto-discovery.
 Registers the /sre dev subcommands for google, slack, stale, incident,
-load-incidents, add-incident, and aws.
+load-incidents and add-incident.
 
-Only available in development environment (ENVIRONMENT=dev).
+Only available in local development (ENVIRONMENT=local).
 """
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
+from slack_sdk import WebClient
 
-from infrastructure.configuration.app import get_app_settings
+from contracts.configuration import host_info
+from contracts.slack.models import CommandPayload, CommandResponse
+from contracts.slack.registrar import SlackCommandRegistrar
 from integrations.slack import LegacySlackBootstrap
-from integrations.slack.models import CommandPayload, CommandResponse
 from modules.dev import (
     google,
     incident,
@@ -23,12 +25,12 @@ from modules.dev import (
     slack as slack_dev,
 )
 
-if TYPE_CHECKING:
-    from integrations.slack.provider import SlackPlatformProvider
-
-
 logger = structlog.get_logger()
-client = LegacySlackBootstrap().web
+
+
+def _web_client() -> WebClient:
+    """Build the Slack Web client when a command runs; building it at import would validate settings before logging is configured."""
+    return LegacySlackBootstrap().web
 
 
 def _require_dev_environment(
@@ -39,8 +41,7 @@ def _require_dev_environment(
     Returns:
         CommandResponse with error if not in dev environment, None otherwise
     """
-    app_settings = get_app_settings()
-    if app_settings.ENVIRONMENT not in ["dev", "local"]:
+    if host_info().environment != "local":
         return CommandResponse(
             message=("This command is only available in the development environment."),
             ephemeral=True,
@@ -92,7 +93,7 @@ def _call_legacy_handler(
     # Call handler with standard signature
     handler(
         *handler_args,
-        client=client,
+        client=_web_client(),
         body=body,
         respond=capture_respond,
         **handler_kwargs,
@@ -212,7 +213,7 @@ def handle_stale_dev_command(payload: CommandPayload) -> CommandResponse:
                 message="Missing channel ID for stale notification.",
                 ephemeral=True,
             )
-        client.chat_postMessage(
+        _web_client().chat_postMessage(
             channel=channel_id,
             text=text,
             attachments=attachments,
@@ -288,62 +289,14 @@ def handle_add_incident_command(payload: CommandPayload) -> CommandResponse:
     )
 
 
-# def handle_aws_dev_command(payload: CommandPayload) -> CommandResponse:
-#     """Handle /sre dev aws - test AWS client integrations.
-
-#     Routes to subcommands: identitystore, organizations, sso, health
-#     """
-#     logger.info("command_received", command="aws", text=payload.text)
-
-#     if error := _require_dev_environment(payload):
-#         return error
-
-#     captured_responses: List[str] = []
-
-#     def capture_respond(text: str | None = None, **kwargs):
-#         if text:
-#             captured_responses.append(text)
-
-#     slack_facade = get_slack_client()
-#     client = slack_facade.raw_client
-
-#     # Build payload for legacy router
-#     router_payload = {
-#         "command": {
-#             "text": payload.text or "",
-#             "user_id": payload.user_id,
-#             "channel_id": payload.channel_id,
-#             **(payload.platform_metadata or {}),
-#         },
-#         "client": client,
-#         "respond": capture_respond,
-#         "ack": lambda: None,
-#     }
-
-#     try:
-#         aws_dev_router.handle(router_payload)
-#     except Exception as e:
-#         logger.error("aws_dev_router_error", error=str(e), exc_info=True)
-#         return CommandResponse(
-#             message=f"AWS command error: {str(e)}",
-#             ephemeral=True,
-#         )
-
-#     message = (
-#         "\n".join(captured_responses) if captured_responses else "AWS"
-#         " command executed"
-#     )
-#     return CommandResponse(message=message, ephemeral=True)
-
-
-def register_commands(provider: SlackPlatformProvider) -> None:
-    """Register dev module commands with Slack provider.
+def register_commands(registrar: SlackCommandRegistrar) -> None:
+    """Register dev module commands with the Slack registrar.
 
     Args:
-        provider: Slack platform provider instance
+        registrar: Slack command registrar
     """
     # Register parent dev command (handler=None means auto-generate help).
-    provider.register_command(
+    registrar.register_command(
         command="dev",
         handler=None,
         parent="sre",
@@ -351,7 +304,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="sre.subcommands.dev.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="google",
         handler=handle_google_dev_command,
         parent="sre.dev",
@@ -359,7 +312,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="dev.subcommands.google.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="slack",
         handler=handle_slack_dev_command,
         parent="sre.dev",
@@ -367,7 +320,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="dev.subcommands.slack.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="stale",
         handler=handle_stale_dev_command,
         parent="sre.dev",
@@ -375,7 +328,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="dev.subcommands.stale.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="incident",
         handler=handle_incident_dev_command,
         parent="sre.dev",
@@ -383,7 +336,7 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="dev.subcommands.incident.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="load-incidents",
         handler=handle_load_incidents_command,
         parent="sre.dev",
@@ -391,18 +344,10 @@ def register_commands(provider: SlackPlatformProvider) -> None:
         description_key="dev.subcommands.load_incidents.description",
     )
 
-    provider.register_command(
+    registrar.register_command(
         command="add-incident",
         handler=handle_add_incident_command,
         parent="sre.dev",
         description="Add incident",
         description_key="dev.subcommands.add_incident.description",
     )
-
-    # provider.register_command(
-    #     command="aws",
-    #     handler=handle_aws_dev_command,
-    #     parent="sre.dev",
-    #     description="Test AWS client integrations",
-    #     description_key="dev.subcommands.aws.description",
-    # )

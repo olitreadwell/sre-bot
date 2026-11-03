@@ -2,23 +2,14 @@ import json
 import uuid
 from unittest.mock import MagicMock, patch
 
+from contracts.operations import OperationStatus
 from models.incidents import Incident
-from modules.incident import information_display
+from modules.incident import db_operations, information_display
 
 
-@patch("modules.incident.information_display.incident_information_view")
-@patch("modules.incident.information_display.db_operations")
-def test_open_incident_info_view(mock_db_operations, mock_incident_information_view):
-    mock_client = MagicMock()
-    mock_respond = MagicMock()
-    body = {
-        "channel_id": "C12345",
-        "channel_name": "incident-2024-01-12-test",
-        "user_id": "U12345",
-        "trigger_id": "T12345",
-        "view": {"id": "V12345"},
-    }
-    mock_db_operations.get_incident_by_channel_id.return_value = {
+def _stored_incident_row():
+    """An incidents-table row as DynamoDB returns it."""
+    return {
         "id": {"S": "incident-2024-01-12-test"},
         "channel_id": {"S": "C1234567890"},
         "channel_name": {"S": "incident-2024-01-12-test"},
@@ -38,10 +29,12 @@ def test_open_incident_info_view(mock_db_operations, mock_incident_information_v
         "retrospective_url": {"S": "http://example.com/retrospective"},
         "environment": {"S": "prod"},
         "logs": {"L": []},
-        "incident_updates": {"L": []},
     }
 
-    incident_data = {
+
+def _expected_incident_data():
+    """The same incident as plain values, as the information view receives it."""
+    return {
         "id": "incident-2024-01-12-test",
         "channel_id": "C1234567890",
         "channel_name": "incident-2024-01-12-test",
@@ -61,7 +54,46 @@ def test_open_incident_info_view(mock_db_operations, mock_incident_information_v
         "retrospective_url": "http://example.com/retrospective",
         "environment": "prod",
         "logs": [],
-        "incident_updates": [],
+    }
+
+
+@patch("modules.incident.information_display.incident_information_view")
+@patch("modules.incident.information_display.db_operations")
+def test_open_incident_info_view(mock_db_operations, mock_incident_information_view):
+    mock_client = MagicMock()
+    mock_respond = MagicMock()
+    body = {
+        "channel_id": "C12345",
+        "channel_name": "incident-2024-01-12-test",
+        "user_id": "U12345",
+        "trigger_id": "T12345",
+        "view": {"id": "V12345"},
+    }
+    mock_db_operations.get_incident_by_channel_id.return_value = _stored_incident_row()
+
+    mock_incident_information_view.return_value = {"view": [{"block": "block_id"}]}
+    information_display.open_incident_info_view(mock_client, body, mock_respond)
+    mock_client.views_open.assert_called_once_with(
+        trigger_id="T12345",
+        view={"view": [{"block": "block_id"}]},
+    )
+    mock_incident_information_view.assert_called_once_with(Incident(**_expected_incident_data()))
+
+
+@patch("modules.incident.information_display.incident_information_view")
+@patch("modules.incident.information_display.db_operations")
+def test_open_incident_info_view_ignores_stored_legacy_incident_updates(mock_db_operations, mock_incident_information_view):
+    """A stored row still carrying the legacy incident_updates list opens the modal unchanged.
+
+    The view builder is faked so the assertion is on the Incident it receives:
+    the same incident as a row without the legacy list, and the modal opens once.
+    """
+    mock_client = MagicMock()
+    mock_respond = MagicMock()
+    body = {"channel_id": "C12345", "trigger_id": "T12345"}
+    mock_db_operations.get_incident_by_channel_id.return_value = {
+        **_stored_incident_row(),
+        "incident_updates": {"L": [{"S": "2025-01-31 11:17:06 EST\nlegacy update"}]},
     }
 
     mock_incident_information_view.return_value = {"view": [{"block": "block_id"}]}
@@ -70,7 +102,8 @@ def test_open_incident_info_view(mock_db_operations, mock_incident_information_v
         trigger_id="T12345",
         view={"view": [{"block": "block_id"}]},
     )
-    mock_incident_information_view.assert_called_once_with(Incident(**incident_data))
+    mock_incident_information_view.assert_called_once_with(Incident(**_expected_incident_data()))
+    mock_respond.assert_not_called()
 
 
 @patch("modules.incident.information_display.db_operations")
@@ -278,3 +311,101 @@ def generate_incident_data(
             incident_data[key] = value
 
     return incident_data
+
+
+@patch("modules.incident.information_display.db_operations")
+def test_open_incident_info_view_responds_when_store_unavailable(mock_db_operations):
+    """When the incidents store is unavailable, the handler responds with the unavailable message."""
+    mock_client = MagicMock()
+    mock_respond = MagicMock()
+    body = {
+        "channel_id": "C12345",
+        "channel_name": "incident-2024-01-12-test",
+        "user_id": "U12345",
+        "trigger_id": "T12345",
+        "view": {"id": "V12345"},
+    }
+    mock_db_operations.IncidentStoreUnavailableError = db_operations.IncidentStoreUnavailableError
+    mock_db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE = db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE
+    mock_db_operations.get_incident_by_channel_id.side_effect = db_operations.IncidentStoreUnavailableError(
+        OperationStatus.PERMANENT_ERROR,
+        error_code="ValidationException",
+    )
+
+    information_display.open_incident_info_view(mock_client, body, mock_respond)
+
+    mock_respond.assert_called_once_with(db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE)
+    mock_client.views_open.assert_not_called()
+
+
+@patch("modules.incident.information_display.incident_information_view")
+@patch("modules.incident.information_display.db_operations")
+def test_open_incident_info_view_with_security_incident_attribute(mock_db_operations, mock_incident_information_view):
+    """The view builds correctly from an item with the security_incident attribute."""
+    mock_client = MagicMock()
+    mock_respond = MagicMock()
+    body = {
+        "channel_id": "C12345",
+        "channel_name": "incident-2024-01-12-test",
+        "user_id": "U12345",
+        "trigger_id": "T12345",
+        "view": {"id": "V12345"},
+    }
+    mock_db_operations.get_incident_by_channel_id.return_value = {
+        "id": {"S": "incident-id"},
+        "channel_id": {"S": "C1234567890"},
+        "channel_name": {"S": "incident-channel"},
+        "name": {"S": "Test Incident"},
+        "user_id": {"S": "U12345"},
+        "teams": {"L": [{"S": "team1"}]},
+        "report_url": {"S": "http://example.com/report"},
+        "status": {"S": "Open"},
+        "security_incident": {"BOOL": True},
+    }
+
+    mock_incident_information_view.return_value = {"view": [{"block": "block_id"}]}
+    information_display.open_incident_info_view(mock_client, body, mock_respond)
+    mock_client.views_open.assert_called_once_with(
+        trigger_id="T12345",
+        view={"view": [{"block": "block_id"}]},
+    )
+    # Verify the view was called with an Incident that has the security_incident field
+    assert mock_incident_information_view.called
+    called_incident = mock_incident_information_view.call_args[0][0]
+    assert called_incident.security_incident is True
+
+
+@patch("modules.incident.information_display.incident_information_view")
+@patch("modules.incident.information_display.db_operations")
+def test_open_incident_info_view_without_security_incident_attribute(mock_db_operations, mock_incident_information_view):
+    """The view builds correctly from an item without the security_incident attribute."""
+    mock_client = MagicMock()
+    mock_respond = MagicMock()
+    body = {
+        "channel_id": "C12345",
+        "channel_name": "incident-2024-01-12-test",
+        "user_id": "U12345",
+        "trigger_id": "T12345",
+        "view": {"id": "V12345"},
+    }
+    mock_db_operations.get_incident_by_channel_id.return_value = {
+        "id": {"S": "incident-id"},
+        "channel_id": {"S": "C1234567890"},
+        "channel_name": {"S": "incident-channel"},
+        "name": {"S": "Test Incident"},
+        "user_id": {"S": "U12345"},
+        "teams": {"L": [{"S": "team1"}]},
+        "report_url": {"S": "http://example.com/report"},
+        "status": {"S": "Open"},
+    }
+
+    mock_incident_information_view.return_value = {"view": [{"block": "block_id"}]}
+    information_display.open_incident_info_view(mock_client, body, mock_respond)
+    mock_client.views_open.assert_called_once_with(
+        trigger_id="T12345",
+        view={"view": [{"block": "block_id"}]},
+    )
+    # Verify the view was called with an Incident that doesn't have the security_incident field
+    assert mock_incident_information_view.called
+    called_incident = mock_incident_information_view.call_args[0][0]
+    assert called_incident.security_incident is None

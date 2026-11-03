@@ -7,8 +7,8 @@ proper exception formatting, and environment-aware rendering.
 Usage:
     from infrastructure.logging import configure_logging
 
-    # Configure logging at app startup
-    configure_logging()
+    # Configure logging once, in the app factory's configuration phase
+    configure_logging(identity.environment, get_logging_settings())
 
     # Get a logger (standard structlog pattern)
     import structlog
@@ -16,7 +16,7 @@ Usage:
     logger.info("event_name", key="value")
 
 Dependencies:
-    - infrastructure.configuration.Settings
+    - infrastructure.logging.settings.LoggingSettings (the [logging] slice)
 """
 
 import contextlib
@@ -24,15 +24,14 @@ import logging
 import sys
 from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from structlog.processors import CallsiteParameter
 from structlog.stdlib import BoundLogger
 
-from infrastructure.configuration.app import AppSettings
-from infrastructure.logging.formatters import mask_sensitive_data
-from infrastructure.logging.settings import LoggingSettings, get_logging_settings
+from infrastructure.logging.formatters import downgrade_transient_socket_mode_errors, mask_sensitive_data
+from infrastructure.logging.settings import LoggingSettings
 
 
 def _apply_otel_code_conventions(
@@ -104,8 +103,23 @@ def _is_test_environment() -> bool:
     return "pytest" in sys.modules
 
 
+def _add_static_fields(fields: Mapping[str, str]) -> Callable[[Any, str, MutableMapping[str, Any]], Mapping[str, Any]]:
+    """Return a processor that puts the same fields on every record.
+
+    The fields are not context: clear_contextvars cannot remove them, and the chain
+    reaches standard-library records too (decisions/observability.md, Service identity).
+    """
+
+    def processor(logger: Any, method_name: str, event_dict: MutableMapping[str, Any]) -> Mapping[str, Any]:
+        event_dict.update(fields)
+        return event_dict
+
+    return processor
+
+
 def _build_base_processors(
     logging_settings: LoggingSettings,
+    static_fields: Mapping[str, str] | None = None,
 ) -> list[
     Callable[
         [Any, str, MutableMapping[str, Any]],
@@ -115,6 +129,8 @@ def _build_base_processors(
     return [
         # 1. Context propagation (must be first)
         structlog.contextvars.merge_contextvars,
+        # Service identity: the same fields on every record, ahead of the redaction processor
+        _add_static_fields(static_fields or {}),
         # 2. Add metadata
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
@@ -133,40 +149,39 @@ def _build_base_processors(
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         # 6. Redact sensitive fields before final rendering
-        mask_sensitive_data(additional_patterns=frozenset(logging_settings.REDACTION_EXTRA_KEYS)),
+        mask_sensitive_data(additional_patterns=frozenset(logging_settings.redaction_extra_keys)),
     ]
 
 
 def configure_logging(
-    settings: AppSettings,
+    environment: Literal["local", "ci", "production"],
+    logging_settings: LoggingSettings,
     log_level: str | None = None,
-    logging_settings: LoggingSettings | None = None,
+    static_fields: Mapping[str, str] | None = None,
 ) -> BoundLogger:
     """Configure structured logging with OpenTelemetry semantic conventions.
 
-    Configures structlog with:
+    Called once by the app factory's configuration phase, right after the identity
+    and [logging] slices load, so every later configuration event is rendered by
+    this pipeline (decisions/observability.md). Configures structlog with:
     - OpenTelemetry code attributes (code.file.path, code.function.name, code.line.number)
     - Proper exception formatting with stack traces
     - Context variable merging for correlation IDs
     - Test environment detection for log suppression
 
     Args:
-        settings: AppSettings instance (REQUIRED). Must be passed explicitly.
+        environment: The deployment environment; production renders JSON, others the console.
+        logging_settings: The [logging] slice.
         log_level: Optional override for log level (DEBUG, INFO, WARNING, etc).
-            Defaults to settings.LOG_LEVEL if not provided.
+            Defaults to logging_settings.log_level if not provided.
+        static_fields: Fields added to every record, the service identity; they survive
+            clear_contextvars and reach standard-library records.
 
     Returns:
         Configured logger instance
 
     Example:
-        # At application startup
-        from infrastructure.configuration.app import get_app_settings
-
-        settings = get_app_settings()
-        logger = configure_logging(settings=settings)
-
-        # With overrides for testing
-        logger = configure_logging(settings=settings, log_level="DEBUG")
+        logger = configure_logging("local", get_logging_settings(), log_level="DEBUG")
     """
 
     # Suppress all logging during tests
@@ -184,7 +199,8 @@ def configure_logging(
             ],
             logger_factory=structlog.stdlib.LoggerFactory(),
             wrapper_class=structlog.stdlib.BoundLogger,
-            cache_logger_on_first_use=True,
+            # Cached loggers keep a stale processor list across reconfigures, which breaks capture_logs.
+            cache_logger_on_first_use=False,
         )
 
         # Configure standard logging with silent handler
@@ -196,34 +212,47 @@ def configure_logging(
         return structlog.stdlib.get_logger()
 
     # Determine production mode
-    prod_mode = settings.ENVIRONMENT == "production"
-    resolved_logging_settings = logging_settings or get_logging_settings()
+    prod_mode = environment == "production"
 
     # Build processor pipeline per structlog best practices
     # Order matters: context vars first, then enrichment, then formatting
-    processors = _build_base_processors(logging_settings=resolved_logging_settings)
+    processors = _build_base_processors(logging_settings, static_fields)
 
     # 6. Final rendering (environment-specific)
+    renderers: list[Any] = [structlog.stdlib.ProcessorFormatter.remove_processors_meta]
     if not prod_mode:  # Development mode
         # Pretty exceptions with colors (requires rich or better-exceptions)
         with contextlib.suppress(ImportError):
-            processors.append(structlog.processors.ExceptionPrettyPrinter())
-        processors.append(structlog.dev.ConsoleRenderer())
+            renderers.append(structlog.processors.ExceptionPrettyPrinter())
+        renderers.append(structlog.dev.ConsoleRenderer())
     else:  # Production mode
-        processors.append(structlog.processors.JSONRenderer())
+        renderers.append(structlog.processors.JSONRenderer())
 
     structlog.configure(
-        processors=processors,
+        processors=[
+            *processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
 
-    # Configure standard logging
-    effective_log_level = log_level or settings.LOG_LEVEL
-    logging.basicConfig(
-        format="%(message)s",
-        level=getattr(logging, effective_log_level.upper(), logging.INFO),
+    # Render stdlib records (slack_bolt, slack_sdk, botocore, ...) through the same pipeline.
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=[
+                structlog.stdlib.add_logger_name,
+                *processors,
+                downgrade_transient_socket_mode_errors,
+            ],
+            processors=renderers,
+        )
     )
+    effective_log_level = log_level or logging_settings.log_level
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(getattr(logging, effective_log_level.upper(), logging.INFO))
 
     return structlog.stdlib.get_logger()

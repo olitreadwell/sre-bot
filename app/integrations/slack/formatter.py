@@ -4,12 +4,12 @@ Formats responses using Slack's Block Kit format for rich, interactive messages.
 See: https://api.slack.com/block-kit
 """
 
-from typing import Any
+from typing import Any, assert_never
 
 from structlog import get_logger
 
+from contracts.operations import OperationResult, OperationStatus
 from infrastructure.i18n import Locale, TranslationKey, TranslationService
-from infrastructure.operations import OperationResult, OperationStatus
 
 logger = get_logger(__name__)
 
@@ -173,7 +173,7 @@ class SlackBlockKitFormatter:
     def format_operation_result(self, result: OperationResult) -> dict[str, Any]:
         """Convert an OperationResult to platform-specific format.
 
-        Routes to format_success() or format_error() based on result status.
+        Routes SUCCESS to format_success() and every other status to format_error().
 
         Args:
             result: OperationResult to format.
@@ -181,17 +181,25 @@ class SlackBlockKitFormatter:
         Returns:
             Platform-specific message payload.
         """
-        if result.status == OperationStatus.SUCCESS:
-            return self.format_success(
-                data=result.data or {},
-                message=result.message,
-            )
-        else:
-            return self.format_error(
-                message=result.message or "An error occurred",
-                error_code=result.error_code,
-                details=result.data,
-            )
+        match result.status:
+            case OperationStatus.SUCCESS:
+                return self.format_success(
+                    data=result.data or {},
+                    message=result.message,
+                )
+            case (
+                OperationStatus.NOT_FOUND
+                | OperationStatus.TRANSIENT_ERROR
+                | OperationStatus.PERMANENT_ERROR
+                | OperationStatus.UNAUTHORIZED
+            ):
+                return self.format_error(
+                    message=result.message or "An error occurred",
+                    error_code=result.error_code,
+                    details=result.data,
+                )
+            case _ as unreachable:
+                assert_never(unreachable)
 
     def translate(
         self,

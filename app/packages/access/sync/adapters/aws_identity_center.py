@@ -17,14 +17,14 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
 
-from infrastructure.configuration.integrations.aws import get_aws_settings
-from infrastructure.operations import OperationResult, OperationStatus
+from contracts.operations import OperationResult, OperationStatus
 from integrations.aws.client import classify_aws_error, get_aws_client
+from integrations.aws.settings import get_aws_settings
 from packages.access.sync.domain import (
     AdapterAssessment,
     CurrentPlatformState,
@@ -92,7 +92,7 @@ class AwsIdentityCenterAdapter:
         identitystore: Typed boto3 IdentityStore client (injected — never
             constructed here). Use ``build_aws_identity_center_adapter()`` to
             wire the production instance.
-        identity_store_id: AWS SSO Identity Store ID (``AWS_SSO_INSTANCE_ID``),
+        identity_store_id: AWS SSO Identity Store ID (``AWS__TENANT__INSTANCE_ID``),
             passed as ``IdentityStoreId`` on every call.
     """
 
@@ -804,7 +804,7 @@ class AwsIdentityCenterAdapter:
             else:
                 return OperationResult.error(
                     result.status,
-                    message=result.message,
+                    message=result.message or "Failed to resolve group",
                     error_code=result.error_code,
                 )
         return OperationResult.success(data=canonical)
@@ -849,7 +849,7 @@ class AwsIdentityCenterAdapter:
             else:
                 return OperationResult.error(
                     result.status,
-                    message=result.message,
+                    message=result.message or "Action execution failed",
                     error_code=result.error_code,
                 )
 
@@ -1218,10 +1218,10 @@ def build_aws_identity_center_adapter() -> AwsIdentityCenterAdapter:
 
     Identity Store/Identity Center is centrally managed in the AWS
     Organization's management account, while sre-bot's own task runs in a
-    member account, so identitystore calls assume ``SERVICE_ROLE_MAP``'s org
+    member account, so identitystore calls assume ``service_role_map``'s org
     role when one is configured.
     """
     settings = get_aws_settings()
-    role_arn = settings.SERVICE_ROLE_MAP.get("identitystore") or None
-    client = cast("_BotoIdentityStoreClient", get_aws_client("identitystore", role_arn=role_arn))
-    return AwsIdentityCenterAdapter(client, settings.INSTANCE_ID)
+    role_arn = settings.service_role_map.get("identitystore") or None
+    client = get_aws_client("identitystore", role_arn=role_arn)
+    return AwsIdentityCenterAdapter(client, settings.identity_store_id)

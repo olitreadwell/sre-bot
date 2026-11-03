@@ -1,11 +1,13 @@
 import functools
 
+from contracts.coordination import LeaseStore
+from infrastructure.coordination import build_lease_store
 from infrastructure.directory import get_directory_provider
 from infrastructure.events import get_event_dispatcher
-from infrastructure.idempotency import IdempotencyStore, build_idempotency_store
-from infrastructure.storage import get_storage_service
+from infrastructure.records import get_record_store
+from packages.access.common.group_policy import ManagedGroupPolicy
 from packages.access.common.providers import get_access_runtime_config
-from packages.access.common.settings import AccessSyncSettings, get_access_settings
+from packages.access.common.settings import AccessSyncSettings
 from packages.access.sync.adapters import AccessSyncAdapter
 from packages.access.sync.adapters.aws_identity_center import build_aws_identity_center_adapter
 from packages.access.sync.adapters.fake_platform import FakePlatformAdapter
@@ -15,15 +17,16 @@ from packages.access.sync.job_status_store import JobStatusStore
 from packages.access.sync.store import SyncRunRepository
 
 
+@functools.lru_cache(maxsize=1)
 def get_access_sync_settings() -> AccessSyncSettings:
-    """Return the sync settings slice from the unified access settings."""
-    return get_access_settings().sync
+    """Return the singleton access.sync settings."""
+    return AccessSyncSettings()
 
 
 @functools.lru_cache(maxsize=1)
-def get_access_sync_lock_store() -> IdempotencyStore:
+def get_access_sync_lock_store() -> LeaseStore:
     """Return a singleton lock store with access-sync-specific claim TTL."""
-    return build_idempotency_store(in_progress_ttl_seconds=get_access_sync_settings().lock_stale_seconds)
+    return build_lease_store(in_progress_ttl_seconds=get_access_sync_settings().lock_stale_seconds)
 
 
 @functools.lru_cache(maxsize=1)
@@ -46,22 +49,26 @@ def get_access_sync_adapters() -> dict[str, AccessSyncAdapter]:
 @functools.lru_cache(maxsize=1)
 def get_sync_run_repository() -> SyncRunRepository:
     """Return the singleton SyncRunRepository instance."""
-    return SyncRunRepository(storage=get_storage_service())
+    return SyncRunRepository(storage=get_record_store(), table_name=get_access_sync_settings().table_name)
 
 
 @functools.lru_cache(maxsize=1)
 def get_access_sync_job_status_store() -> JobStatusStore:
     """Return the singleton JobStatusStore instance."""
-    return JobStatusStore(storage=get_storage_service())
+    return JobStatusStore(storage=get_record_store(), table_name=get_access_sync_settings().job_status_table_name)
 
 
 @functools.lru_cache(maxsize=1)
 def get_access_sync_coordinator() -> AccessSyncApplicationService:
     """Return the singleton AccessSyncApplicationService instance."""
+    config = get_access_runtime_config()
     return AccessSyncApplicationService(
         adapters=get_access_sync_adapters(),
-        config=get_access_runtime_config(),
-        membership_builder=DirectoryMembershipBuilder(directory=get_directory_provider()),
+        config=config,
+        membership_builder=DirectoryMembershipBuilder(
+            directory=get_directory_provider(),
+            policy=ManagedGroupPolicy.from_config(config),
+        ),
         repository=get_sync_run_repository(),
         dispatcher=get_event_dispatcher(),
     )

@@ -4,36 +4,48 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "arrow>=1.4.0",
-    "Authlib>=1.6.8",
     "aws-sns-message-validator>=0.0.5",
     "blinker>=1.9.0",
-    "boto3>=1.42.54",
-    "botocore>=1.42.54",
-    "fastapi>=0.133.1",
-    "geoip2>=4.8.1",
-    "google-api-python-client>=2.190.0",
-    "google-auth-httplib2>=0.3.0",
-    "google-auth-oauthlib>=0.8.0",
-    "google-api-core>=2.30.0",
-    "google-auth>=2.48.0",
+    "boto3>=1.43.116",
+    "botocore>=1.43.116",
+    "fastapi>=0.156.8",
+    "geoip2>=5.3.0",
+    "google-api-python-client>=2.201.0",
+    "google-auth-httplib2>=0.4.4",
+    "google-api-core>=2.42.0",
+    "google-auth>=2.62.0",
     "httpx>=0.28.1",
-    "pandas>=2.3.3",
-    "pluggy>=1.6.0",
-    "pydantic-settings>=2.13.1",
-    "PyJWT>=2.12.0",
+    "pandas>=3.0.6",
+    "pluggy>=1.7.0",
+    "pydantic-settings>=2.16.1",
+    "PyJWT>=2.15.1",
     "PyYAML!=6.0.0,!=5.4.0,!=5.4.1",
-    "python-dotenv>=1.2.2",
+    "python-dotenv>=1.2.4",
     "python-i18n>=0.3.9",
-    "pytz>=2023.4",
-    "requests>=2.32.5",
-    "slowapi>=0.1.9",
+    "pytz>=2026.5",
+    "requests>=2.34.2",
+    "slowapi>=0.1.10",
     "schedule>=1.2.2",
-    "slack-bolt>=1.27.0",
-    "structlog>=25.5.0",
+    "slack-bolt>=1.30.0",
+    "structlog>=26.1.0",
     "trello>=0.9.7.3",
-    "uvicorn>=0.41.0",
+    "uvicorn>=0.54.0",
     "email-validator>=2.3.0",
+    "svcs>=26.2",
 ]
+
+# One line per feature plugin (decisions/plugins.md); the group is PLUGIN_NAMESPACE.
+# Umbrella packages and their core/common kernels are never entry points.
+[project.entry-points.sre_bot]
+"access.catalog" = "packages.access.catalog"
+"access.request" = "packages.access.request"
+"access.sync" = "packages.access.sync"
+geolocate = "packages.geolocate"
+"incident.comms" = "features.incident.comms"
+"incident.scribe" = "features.incident.scribe"
+oncall_sync = "packages.oncall_sync"
+rant = "packages.rant"
+user_rotations = "packages.user_rotations"
 
 [tool.ruff]
 target-version = "py314"
@@ -48,9 +60,30 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "S"]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "S", "PLC0415"]
 ignore = ["E501"]
 mccabe.max-complexity = 16
+
+# Declared explicitly so import classification does not depend on directory
+# existence, which ruff's cache key does not track.
+[tool.ruff.lint.isort]
+known-first-party = [
+    "api",
+    "bin",
+    "capabilities",
+    "contracts",
+    "features",
+    "infrastructure",
+    "integrations",
+    "jobs",
+    "main",
+    "models",
+    "modules",
+    "packages",
+    "server",
+    "tests",
+    "utils",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "S107", "B007", "B008", "B011", "B017", "B018", "B905", "C408", "C416", "C418", "SIM116", "SIM117", "SIM118", "UP028"]
@@ -58,15 +91,20 @@ mccabe.max-complexity = 16
 
 [tool.mypy]
 python_version = "3.14"
+plugins = ["pydantic.mypy"]
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 check_untyped_defs = true
 exclude = ["^tests/"]
 explicit_package_bases = true
+# mypy rejects a Protocol class passed where type[T] is expected, which is how an
+# entry point resolves a contract (resolver.get(RecordStore)); svcs.Container.get
+# has no such error, so the contract Protocols are checked the same way.
+disable_error_code = ["type-abstract"]
 
 [[tool.mypy.overrides]]
-module = ["google.oauth2.service_account", "googleapiclient.*"]
+module = ["google.oauth2.service_account", "googleapiclient.*", "google_auth_httplib2"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -87,51 +125,66 @@ markers = [
     "smoke: Smoke tests that exercise live or sandbox external systems; excluded from default runs"
 ]
 env = [
-    "SLACK_ENABLED=false",
-    "SLACK_TOKEN=xoxb-test-token-for-tests",
-    "SLACK_BOT_TOKEN=xoxb-test-token-for-tests",
-    "SLACK_APP_TOKEN=xapp-test-token",
-    "SLACK_SIGNING_SECRET=test-signing-secret",
-    "APP_TOKEN=APP_TOKEN",
-    "SRE_DRIVE_ID=SRE_DRIVE_ID",
-    "SRE_INCIDENT_FOLDER=SRE_INCIDENT_FOLDER",
-    "INCIDENT_TEMPLATE=INCIDENT_TEMPLATE",
-    "INCIDENT_LIST=INCIDENT_LIST",
-    "ISSUER_CONFIG='test-issuer-config'",
-    "PICKLE_STRING=PICKLE_STRING",
-    "SENTINEL_CUSTOMER_ID=SENTINEL_CUSTOMER_ID",
-    "SENTINEL_LOG_TYPE=SENTINEL_LOG_TYPE",
-    "SENTINEL_SHARED_KEY=SENTINEL_SHARED_KEY",
-    "NOTIFY_OPS_CHANNEL_ID=C1234567890",
-    "NOTIFY_SRE_USER_NAME=NOTIFY_SRE_USER_NAME",
-    "NOTIFY_SRE_CLIENT_SECRET=NOTIFY_SRE_CLIENT_SECRET",
-    "SLACK_SECURITY_USER_GROUP_ID=SLACK_SECURITY_USER_GROUP_ID",
-    "SLACK_NOTIFY_MGMT_USER_GROUP_ID=SLACK_NOTIFY_MGMT_USER_GROUP_ID",
-    "INCIDENT_HANDBOOK_URL=INCIDENT_HANDBOOK_URL",
-    "AWS_ORG_ACCOUNT_ROLE_ARN=AWS_ORG_ACCOUNT_ROLE_ARN",
-    "AWS_LOGGING_ACCOUNT_ROLE_ARN=AWS_LOGGING_ACCOUNT_ROLE_ARN",
-    "AWS_AUDIT_ACCOUNT_ROLE_ARN=AWS_AUDIT_ACCOUNT_ROLE_ARN",
-    "ATIP_ANNOUNCE_CHANNEL=ATIP_ANNOUNCE_CHANNEL",
-    "TRELLO_APP_KEY=TRELLO_APP_KEY",
-    "TRELLO_TOKEN=TRELLO_TOKEN",
-    "TRELLO_ATIP_BOARD=TRELLO_ATIP_BOARD",
-    "GCP_SRE_SERVICE_ACCOUNT_KEY_FILE=GCP_SRE_SERVICE_ACCOUNT_KEY_FILE",
-    "SLACK__SLACK_TOKEN=xoxb-test-token-for-tests",
-    "SLACK__APP_TOKEN=xapp-test-token",
-    "AWS__AWS_REGION=us-east-1",
-    "SENTINEL__SENTINEL_CUSTOMER_ID=SENTINEL_CUSTOMER_ID",
-    "SENTINEL__SENTINEL_LOG_TYPE=SENTINEL_LOG_TYPE",
-    "SENTINEL__SENTINEL_SHARED_KEY=SENTINEL_SHARED_KEY",
-    "SLACK__SLACK_SECURITY_USER_GROUP_ID=SLACK_SECURITY_USER_GROUP_ID",
-    "AWS__ORG_ROLE_ARN=AWS_ORG_ACCOUNT_ROLE_ARN",
-    "AWS__LOGGING_ROLE_ARN=AWS_LOGGING_ACCOUNT_ROLE_ARN",
-    "AWS__AUDIT_ROLE_ARN=AWS_AUDIT_ACCOUNT_ROLE_ARN",
-    "ATIP__ATIP_ANNOUNCE_CHANNEL=ATIP_ANNOUNCE_CHANNEL",
-    "TRELLO__TRELLO_APP_KEY=TRELLO_APP_KEY",
-    "TRELLO__TRELLO_TOKEN=TRELLO_TOKEN",
-    "TRELLO__TRELLO_ATIP_BOARD=TRELLO_ATIP_BOARD",
-    "GOOGLE_WORKSPACE__GCP_SRE_SERVICE_ACCOUNT_KEY_FILE=GCP_SRE_SERVICE_ACCOUNT_KEY_FILE",
-    "GROUP_PROVIDERS={{\"google\": {{\"enabled\": true, \"primary\": true}}}}",
+    # Feature warmups must not depend on the developer's .env: tests that need a
+    # plugin enable it explicitly. access.sync switched on from app/.env would make
+    # lifespan build the AWS Identity Center adapter (and assume its role) at startup.
+    'PLUGINS__PLATFORM_ACCESS={{"access.catalog": false, "access.request": false, "access.sync": false}}',
+    # Likewise incident.scribe, which requires [openai.tenant]: switched on from app/.env it would
+    # abort every lifespan test boot. The whole table is pinned, as the ci files set it.
+    'PLUGINS__INCIDENT_RESPONSE={{"incident.comms": true, "incident.scribe": false, "oncall_sync": true, "user_rotations": true}}',
+    # Likewise the scheduler: SCHEDULER__ENABLED=true in app/.env would start the real
+    # jobs thread in every lifespan test. Tests that need it enable it explicitly.
+    "SCHEDULER__ENABLED=false",
+    # Every test run behaves as the CI environment, locally and in GitHub Actions.
+    "ENVIRONMENT=ci",
+    # The SDK resolves the region (botocore reads AWS_DEFAULT_REGION, not AWS_REGION); the code names none.
+    "AWS_DEFAULT_REGION=ca-central-1",
+    # The test run is an unconfigured Slack and Google (ci.toml has no [slack.tenant]; the
+    # Google tenant is environment only): the blanks override a developer's app/.env and the
+    # Codespaces secrets every process inherits.
+    "SLACK__BOT_TOKEN=",
+    "SLACK__USER_TOKEN=",
+    "SLACK__APP_TOKEN=",
+    "SLACK__SIGNING_SECRET=",
+    "GOOGLE_WORKSPACE__TENANT__CUSTOMER_ID=",
+    "GOOGLE_WORKSPACE__TENANT__SERVICE_ACCOUNT_KEY=",
+    "GOOGLE_WORKSPACE__TENANT__DELEGATED_USER_EMAIL=",
+    # Likewise AWS: the tenant entry and the permission sets are environment only (blank = unset).
+    "AWS__TENANT__INSTANCE_ID=",
+    "AWS__TENANT__INSTANCE_ARN=",
+    "AWS__TENANT__AUDIT_ROLE_ARN=",
+    "AWS__TENANT__ORG_ROLE_ARN=",
+    "AWS__TENANT__LOGGING_ROLE_ARN=",
+    "ACCESS_PERMISSION_SETS__SYSTEM_ADMIN_PERMISSIONS=",
+    "ACCESS_PERMISSION_SETS__VIEW_ONLY_PERMISSIONS=",
+    # Likewise OpenAI: its key is environment only (blank = unset).
+    "OPENAI__API_KEY=",
+    # Likewise the Google document ids: non-public, environment only (blank = unset).
+    "INCIDENT_CORE__FOLDER_ID=",
+    "INCIDENT_CORE__REPORT_TEMPLATE_ID=",
+    "INCIDENT_CORE__LIST_SHEET_ID=",
+    "INCIDENT_RESPONSE__HANDBOOK_ID=",
+    "INCIDENT_POSTMORTEM__CALENDAR_ID=",
+    "CLOUD_OPERATIONS_SPENDING__SHEET_ID=",
+    "TALENT__INTERNAL_FOLDER_ID=",
+    "TALENT__TEMPLATES_FOLDER_ID=",
+    "TALENT__SCORING_GUIDE_TEMPLATE_ID=",
+    "TALENT__CORE_VALUES_INTERVIEW_NOTES_ID=",
+    "TALENT__TECHNICAL_INTERVIEW_NOTES_ID=",
+    "TALENT__INTAKE_FORM_TEMPLATE_ID=",
+    "TALENT__PHONE_SCREEN_TEMPLATE_ID=",
+    "TALENT__RECRUITMENT_FEEDBACK_TEMPLATE_ID=",
+    "TALENT__PANELIST_GUIDEBOOK_TEMPLATE_ID=",
+    # Likewise Notify, Trello and Opsgenie: their credentials are environment only (blank = unset).
+    "NOTIFY__SRE_USER_NAME=",
+    "NOTIFY__SRE_CLIENT_SECRET=",
+    "TRELLO__TENANT__APP_KEY=",
+    "TRELLO__TENANT__TOKEN=",
+    "TRELLO__ATIP_BOARD=",
+    "OPSGENIE__INTEGRATIONS_KEY=",
+    # Likewise Sentinel: the workspace id (non-public) and its shared key are environment only.
+    "SENTINEL__CUSTOMER_ID=",
+    "SENTINEL__SHARED_KEY=",
 ]
 norecursedirs = ["tests/smoke"]
 filterwarnings = [
@@ -154,21 +207,267 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "ruff==0.15.7",
-    "mypy==1.19.1",
-    "pytest==8.4.2",
-    "pytest-asyncio==0.26.0",
-    "pytest-env==0.8.2",
-    "coverage==6.5.0",
-    "pytest-cov==4.1.0",
+    "ruff==0.17.1",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-env==1.8.1",
+    "coverage==7.16.2",
+    "pytest-cov==7.1.0",
     "freezegun==1.5.5",
     "requests-mock==1.12.1",
-    "checkov",
-    "setuptools==78.1.1",
-    "moto[dynamodb]>=5.2.2",
-    "types-boto3[ce,config,dynamodb,guardduty,identitystore,lambda,organizations,securityhub,sqs,sso-admin]>=1.43.63",
-    "google-api-python-client-stubs>=1.39.0",
+    "setuptools==84.2.1",
+    "moto[dynamodb]>=5.2.4",
+    "types-boto3[ce,config,dynamodb,guardduty,identitystore,lambda,organizations,securityhub,sqs,sso-admin,sts]>=1.43.116",
+    "google-api-python-client-stubs>=1.40.0",
+    "import-linter>=2.15",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["api", "infrastructure", "integrations", "jobs", "models", "modules", "packages", "server", "utils"]
+packages = ["api", "contracts", "features", "infrastructure", "integrations", "jobs", "models", "modules", "packages", "server", "utils"]
+
+[tool.importlinter]
+# Enforces decisions/plugin-architecture.md (six layers) with the transitional
+# packages from decisions/migration.md. capabilities is listed as an optional
+# layer; add it to root_packages in the PR that creates it
+# (import-linter rejects a root package that does not exist).
+root_packages = ["server", "packages", "features", "infrastructure", "integrations", "modules", "api", "jobs", "models", "utils", "contracts"]
+# Third-party packages join the graph so contract (j) can name slack_bolt.
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "layers"
+name = "(a) Six-layer plugin architecture"
+type = "layers"
+layers = [
+    "server",
+    "(modules) : (api) : (jobs)",
+    "(features) | packages",
+    "(capabilities)",
+    "infrastructure",
+    "integrations",
+    "contracts",
+]
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Existing violations, seeded 2026-09-28 by TASK-18 (decisions/plugin-architecture.md Migration and decisions/outbound-clients.md Migration).
+    # Shrink-only: remove an entry when its import is fixed; never add one.
+    "integrations.sentinel.client -> infrastructure.audit.models",
+    "integrations.slack.formatter -> infrastructure.i18n",
+    "integrations.slack.provider -> infrastructure.i18n",
+]
+
+[[tool.importlinter.contracts]]
+id = "no-host-imports"
+name = "(b) Packages, features and capabilities never import infrastructure or server"
+type = "forbidden"
+source_modules = ["packages", "features"]
+forbidden_modules = ["infrastructure", "server"]
+# Direct imports only: chains through integrations are tracked by contract (d).
+allow_indirect_imports = true
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Existing violations, seeded 2026-09-28 by TASK-18 (decisions/plugin-architecture.md Migration).
+    # Shrink-only: remove an entry when its import is fixed; never add one, except an entry approved on a task
+    # that names the task removing it (TASK-58.1's providers -> infrastructure.coordination, removed by TASK-124.1).
+    "packages.access.catalog.interactions.http -> infrastructure.security",
+    "packages.access.catalog.interactions.http -> infrastructure.security.models",
+    "packages.access.catalog.providers -> infrastructure.directory",
+    "packages.access.catalog.service -> infrastructure.directory.provider",
+    "packages.access.common.group_policy -> infrastructure.directory.models",
+    "packages.access.request -> infrastructure.events",
+    "packages.access.request.interactions.http -> infrastructure.security",
+    "packages.access.request.interactions.http -> infrastructure.security.models",
+    "packages.access.request.policies -> infrastructure.directory.models",
+    "packages.access.request.policies -> infrastructure.directory.provider",
+    "packages.access.request.providers -> infrastructure.directory",
+    "packages.access.request.providers -> infrastructure.events",
+    "packages.access.request.providers -> infrastructure.records",
+    "packages.access.request.service -> infrastructure.directory.models",
+    "packages.access.request.service -> infrastructure.directory.provider",
+    "packages.access.request.service -> infrastructure.events",
+    "packages.access.sync -> infrastructure.events",
+    "packages.access.sync.application -> infrastructure.events",
+    "packages.access.sync.desired_state -> infrastructure.directory.provider",
+    "packages.access.sync.interactions.http -> infrastructure.security",
+    "packages.access.sync.interactions.http -> infrastructure.security.models",
+    "packages.access.sync.interactions.slack -> infrastructure.i18n",
+    "packages.access.sync.presenters -> infrastructure.i18n",
+    "packages.access.sync.providers -> infrastructure.coordination",
+    "packages.access.sync.providers -> infrastructure.directory",
+    "packages.access.sync.providers -> infrastructure.events",
+    "packages.access.sync.providers -> infrastructure.records",
+    "packages.geolocate.platforms.slack -> infrastructure.i18n",
+    "features.incident.core.adapters.i18n -> infrastructure.i18n",
+    "features.incident.drive.adapters.google_drive -> infrastructure.drive",
+    "features.incident.drive.adapters.google_drive -> infrastructure.drive.factory",
+    "features.incident.drive.adapters.google_drive -> infrastructure.drive.models",
+    "features.incident.scribe.adapters.google_docs -> infrastructure.drive",
+    "packages.talent.adapters.google_drive -> infrastructure.drive.factory",
+]
+
+[[tool.importlinter.contracts]]
+id = "contracts-leaf"
+name = "(c) contracts imports nothing else from the app"
+type = "forbidden"
+source_modules = ["contracts"]
+forbidden_modules = ["server", "packages", "features", "infrastructure", "integrations", "modules", "api", "jobs", "models", "utils"]
+
+[[tool.importlinter.contracts]]
+id = "integrations-leaf"
+name = "(d) integrations imports nothing from the app except contracts"
+type = "forbidden"
+source_modules = ["integrations"]
+forbidden_modules = ["server", "packages", "features", "infrastructure", "modules", "api", "jobs", "models", "utils"]
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Existing violations, seeded 2026-09-28 by TASK-18 (decisions/outbound-clients.md Migration).
+    # Shrink-only: remove an entry when its import is fixed; never add one.
+    "integrations.sentinel.client -> infrastructure.audit.models",
+    "integrations.slack.formatter -> infrastructure.i18n",
+    "integrations.slack.provider -> infrastructure.i18n",
+]
+
+[[tool.importlinter.contracts]]
+id = "integrations-via-adapters"
+name = "(e) packages and features import integrations only from adapters/ modules"
+type = "forbidden"
+source_modules = ["packages", "features"]
+forbidden_modules = ["integrations"]
+# Direct imports only: chains through infrastructure are tracked by contracts (a) and (b).
+allow_indirect_imports = true
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Permanent: adapters/ is where a package or feature may import integrations (decisions/outbound-clients.md).
+    "**.adapters.** -> integrations.**",
+    # Existing violations, seeded 2026-09-28 by TASK-18 (decisions/outbound-clients.md Migration).
+    # Shrink-only: remove an entry when its import is fixed; never add one.
+    "features.incident.scribe.service -> integrations.openai",
+]
+
+[[tool.importlinter.contracts]]
+id = "feature-independence"
+name = "(f) Top-level packages are independent of each other"
+type = "independence"
+modules = [
+    "packages.access",
+    "packages.aws_platform",
+    "packages.geolocate",
+    "features.cloud_operations",
+    "features.incident",
+    "features.talent",
+    "packages.oncall_sync",
+    "packages.rant",
+    "packages.talent",
+    "packages.user_rotations",
+]
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Existing violations, seeded 2026-09-28 by TASK-18 (decisions/feature-packages.md; TASK-146.1 removes the oncall_sync -> user_rotations coupling).
+    # Shrink-only: remove an entry when its import is fixed; never add one.
+    "packages.oncall_sync -> packages.user_rotations.settings",
+    "packages.oncall_sync.ports -> packages.user_rotations.service",
+    "packages.oncall_sync.providers -> packages.user_rotations.providers",
+]
+
+[[tool.importlinter.contracts]]
+id = "no-legacy-imports"
+name = "(g) Nothing outside the legacy tree imports modules"
+type = "forbidden"
+source_modules = ["packages", "features", "infrastructure", "integrations"]
+forbidden_modules = ["modules"]
+
+[[tool.importlinter.contracts]]
+id = "access-umbrella"
+name = "(h) Access subdomains are independent siblings over a shared kernel"
+type = "layers"
+containers = ["packages.access"]
+layers = [
+    "catalog | request | sync",
+    "common",
+]
+exhaustive = true
+
+[[tool.importlinter.contracts]]
+id = "incident-umbrella"
+name = "(i) Incident subdomains are independent siblings over core"
+type = "layers"
+containers = ["features.incident"]
+layers = [
+    "comms | documents | drive | meet | postmortem | response | scheduling | scribe",
+    "core",
+    "common",
+]
+exhaustive = true
+
+[[tool.importlinter.contracts]]
+id = "slack-bolt-in-entrypoints"
+name = "(j) slack_bolt is imported only by the Slack runtime, legacy modules and entrypoints/slack.py"
+type = "protected"
+protected_modules = ["slack_bolt"]
+# The Slack runtime (server, integrations until it moves) and legacy modules hold
+# the Bolt app; a feature's Slack entry point handles interactions with Bolt's own
+# listener arguments (decisions/platform-entrypoints.md rule 3, transport-slack.md
+# Checks). Direct imports only: chains through integrations are tracked by (e).
+allowed_importers = ["server", "integrations", "modules", "packages.**.entrypoints.slack"]
+
+[[tool.importlinter.contracts]]
+id = "no-provider-imports"
+name = "(k) Nothing outside server imports provider modules or infrastructure implementations"
+type = "forbidden"
+# decisions/dependency-injection.md: the host registers each contract's implementation
+# in the svcs registry (server/services.py) and entry points resolve the Protocol.
+# A service family joins forbidden_modules when its contract is registered. The
+# infrastructure siblings are listed one by one: "infrastructure" as a source would
+# flag a family importing its own modules. Direct imports only.
+source_modules = ["packages", "features", "api", "jobs", "models", "utils", "modules", "integrations", "contracts", "infrastructure.audit", "infrastructure.configuration", "infrastructure.directory", "infrastructure.drive", "infrastructure.events", "infrastructure.i18n", "infrastructure.logging", "infrastructure.security", "infrastructure.spreadsheets"]
+forbidden_modules = ["infrastructure.records", "infrastructure.coordination"]
+allow_indirect_imports = true
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Seeded 2026-10-14 by TASK-109. Shrink-only: each entry names the task that removes it.
+    "packages.access.request.providers -> infrastructure.records",  # TASK-124.1
+    "packages.access.sync.providers -> infrastructure.records",  # TASK-124.1
+    "packages.access.sync.providers -> infrastructure.coordination",  # TASK-124.1
+    "jobs.scheduled_tasks -> infrastructure.coordination",  # TASK-64
+    "infrastructure.audit.service -> infrastructure.records",  # TASK-122
+]
+
+[[tool.importlinter.contracts]]
+id = "contracts-no-svcs"
+name = "(l) contracts imports no svcs"
+type = "forbidden"
+# decisions/plugin-architecture.md: contracts/ stays free of container libraries; the
+# host implements ServiceScopeOpener over svcs in server/services.py.
+source_modules = ["contracts"]
+forbidden_modules = ["svcs"]
+
+[[tool.importlinter.contracts]]
+id = "protected-plugins"
+name = "(m) A plugin's modules are imported only from inside the plugin"
+# A disabled plugin is blocked before loading and never imported (decisions/plugins.md),
+# which holds only if no host, legacy or sibling code imports it. One module per
+# entry point in [project.entry-points.sre_bot]; a boot test keeps the two lists equal.
+type = "protected"
+protected_modules = [
+    "packages.access.catalog",
+    "packages.access.request",
+    "packages.access.sync",
+    "packages.geolocate",
+    "features.incident.comms",
+    "features.incident.scribe",
+    "packages.oncall_sync",
+    "packages.rant",
+    "packages.user_rotations",
+]
+allowed_importers = []
+unmatched_ignore_imports_alerting = "error"
+ignore_imports = [
+    # Existing violations, seeded 2026-10-26 by TASK-112.2. Shrink-only: remove an entry when its import is fixed; never add one.
+    # TASK-146.1 deletes user_rotations.
+    "packages.oncall_sync -> packages.user_rotations.settings",
+    "packages.oncall_sync.ports -> packages.user_rotations.service",
+    "packages.oncall_sync.providers -> packages.user_rotations.providers",
+    # TASK-124.6 moves or retires the legacy GET /geolocate/{ip} route.
+    "api.v1.routes.geolocate -> packages.geolocate.schemas",
+]

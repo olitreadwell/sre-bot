@@ -8,7 +8,7 @@ Manages the full lifecycle of user access requests: submission, approval, reject
 
 1. User submits a request with `platform` and `group_slug` (e.g. `sg-aws-scratch`).
 2. The service resolves the group in the IDP and derives the `entitlement_id` token server-side (`scratch`).
-3. Approver candidates are resolved from the group's owners, falling back to `sg-org-admins`.
+3. Approver candidates are resolved from the group's owners, falling back to the configured `ACCESS_REQUESTS_FALLBACK_APPROVER_SLUG` group.
 4. On approval threshold met, the service writes the membership directly to the IDP (Google Workspace) — the source of truth.
 5. An `access_request_approved` event is dispatched, triggering Access Sync to propagate the change to the external platform (e.g. AWS Identity Center).
 6. When Access Sync completes, the request transitions to `completed` (or `failed`).
@@ -71,21 +71,13 @@ Terminal states (no further transitions without operator action): `rejected`, `c
 
 ## Settings
 
-All request settings are in `AccessRequestsSettings` (a slice of `AccessSettings` in `packages/access/common/settings.py`):
+The plugin runs when its `[plugins.platform_access]` key `access.request` is true (off by default; see `packages/access/README.md`). Its settings are in `AccessRequestsSettings` (`packages/access/common/settings.py`), built only when the plugin is enabled:
 
 | Env var | Default | Description |
 |---|---|---|
-| `ACCESS_REQUESTS_ENABLED` | `false` | Master on/off switch. All routes return `503` when disabled. |
-| `ACCESS_REQUESTS_MANAGER_GROUP_SLUG` | `sg-managers` | Primary approver group slug |
-| `ACCESS_REQUESTS_FALLBACK_APPROVER_SLUG` | `sg-org-admins` | Fallback approver group slug |
+| `ACCESS_REQUESTS_FALLBACK_APPROVER_SLUG` | none (required) | Fallback approver group slug (e.g. `sg-org-admins`) |
 | `ACCESS_REQUESTS_MIN_APPROVER_COUNT` | `1` | Approval threshold |
 | `ACCESS_REQUESTS_REQUEST_TTL_HOURS` | `72` | Hours before an open request expires |
-
-May also be set as a single JSON env var:
-
-```bash
-ACCESS_REQUESTS='{"enabled": true, "min_approver_count": 2}'
-```
 
 ---
 
@@ -97,15 +89,17 @@ ACCESS_REQUESTS='{"enabled": true, "min_approver_count": 2}'
 | `schemas.py` | Pydantic HTTP boundary models (request bodies / responses) |
 | `service.py` | Lifecycle orchestration — the canonical place to understand the flow |
 | `policies.py` | Pure policy functions: auto-approval, self-approval guard, approver resolution |
-| `store.py` | DynamoDB repository (`sre_bot_access_requests` table) |
-| `providers.py` | `get_access_request_settings()` — thin slice provider returning `AccessRequestsSettings` |
+| `store.py` | Record repository; table named by `ACCESS_REQUESTS_TABLE_NAME` (default `sre_bot_access_requests`) |
+| `providers.py` | `get_access_request_settings()` — singleton `AccessRequestsSettings`, built only when the plugin is enabled |
 | `providers.py` | `@lru_cache` singletons — object graph wiring |
 | `events.py` | Event name constants for this package |
 | `transport/routes.py` | FastAPI route handlers — HTTP mapping only, no business logic |
 
 ---
 
-## DynamoDB table: `sre_bot_access_requests`
+## Record table: `sre_bot_access_requests`
+
+The name is the default of `ACCESS_REQUESTS_TABLE_NAME`.
 
 | Key | Pattern | Used for |
 |---|---|---|

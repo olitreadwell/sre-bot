@@ -14,9 +14,9 @@ from typing import Protocol
 
 import structlog
 
-from infrastructure.idempotency import IdempotencyStore
-from infrastructure.operations import OperationResult, OperationStatus
-from packages.access.sync.application import AccessSyncApplicationServicePort
+from contracts.coordination import LeaseStore
+from contracts.operations import OperationResult
+from packages.access.sync.application import AccessSynchronizer
 from packages.access.sync.job_runner import (
     spawn_platform_sync_thread,
     spawn_user_sync_thread,
@@ -35,7 +35,6 @@ logger = structlog.get_logger()
 class _IngressSettings(Protocol):
     """Structural contract for the settings object consumed by ingress functions."""
 
-    enabled: bool
     job_ttl_seconds: int
 
 
@@ -52,9 +51,9 @@ class EnqueuedJob:
 
 
 def enqueue_user_sync(
-    coordinator: AccessSyncApplicationServicePort,
+    coordinator: AccessSynchronizer,
     job_status_store: JobStatusStore,
-    lock_store: IdempotencyStore,
+    lock_store: LeaseStore,
     settings: _IngressSettings,
     user_email: str,
     platform: str,
@@ -63,19 +62,9 @@ def enqueue_user_sync(
 ) -> OperationResult:
     """Admit a user sync request through the shared ingress path.
 
-    Checks the feature flag, detects duplicate runs, and spawns the background
-    job.  Returns ``OperationResult[EnqueuedJob]``.
-
-    Error codes:
-        FEATURE_DISABLED — feature flag is off.
+    Detects duplicate runs and spawns the background job.  Returns
+    ``OperationResult[EnqueuedJob]``.
     """
-    if not settings.enabled:
-        return OperationResult.error(
-            OperationStatus.PERMANENT_ERROR,
-            message="Access Sync is not enabled",
-            error_code="FEATURE_DISABLED",
-        )
-
     lock_key = user_lock_key(platform, user_email)
     lock_payload = {
         "job_id": "",
@@ -88,13 +77,14 @@ def enqueue_user_sync(
     lock_payload["job_id"] = job_id
     lock_payload["started_at"] = started_at
 
-    if not acquire_lock(
+    claim_token = acquire_lock(
         lock_key=lock_key,
         payload=lock_payload,
         lock_store=lock_store,
         job_status_store=job_status_store,
         ttl_seconds=settings.job_ttl_seconds,
-    ):
+    )
+    if claim_token is None:
         running = current_holder(lock_key, job_status_store) or {}
         existing_job_id = running.get("job_id", "")
         logger.bind(platform=platform, user_email=user_email).info("user_sync_already_running", existing_job_id=existing_job_id)
@@ -113,6 +103,7 @@ def enqueue_user_sync(
         coordinator=coordinator,
         job_status_store=job_status_store,
         lock_store=lock_store,
+        claim_token=claim_token,
         job_id=job_id,
         user_email=user_email,
         platform=platform,
@@ -134,9 +125,9 @@ def enqueue_user_sync(
 
 
 def enqueue_platform_sync(
-    coordinator: AccessSyncApplicationServicePort,
+    coordinator: AccessSynchronizer,
     job_status_store: JobStatusStore,
-    lock_store: IdempotencyStore,
+    lock_store: LeaseStore,
     settings: _IngressSettings,
     platform: str,
     dry_run: bool = False,
@@ -144,19 +135,9 @@ def enqueue_platform_sync(
 ) -> OperationResult:
     """Admit a platform sync request through the shared ingress path.
 
-    Checks the feature flag, detects duplicate runs, and spawns the background
-    job.  Returns ``OperationResult[EnqueuedJob]``.
-
-    Error codes:
-        FEATURE_DISABLED — feature flag is off.
+    Detects duplicate runs and spawns the background job.  Returns
+    ``OperationResult[EnqueuedJob]``.
     """
-    if not settings.enabled:
-        return OperationResult.error(
-            OperationStatus.PERMANENT_ERROR,
-            message="Access Sync is not enabled",
-            error_code="FEATURE_DISABLED",
-        )
-
     lock_key = platform_lock_key(platform)
     lock_payload = {
         "job_id": "",
@@ -169,13 +150,14 @@ def enqueue_platform_sync(
     lock_payload["job_id"] = job_id
     lock_payload["started_at"] = started_at
 
-    if not acquire_lock(
+    claim_token = acquire_lock(
         lock_key=lock_key,
         payload=lock_payload,
         lock_store=lock_store,
         job_status_store=job_status_store,
         ttl_seconds=settings.job_ttl_seconds,
-    ):
+    )
+    if claim_token is None:
         running = current_holder(lock_key, job_status_store) or {}
         existing_job_id = running.get("job_id", "")
         logger.bind(platform=platform).info("platform_sync_already_running", existing_job_id=existing_job_id)
@@ -194,6 +176,7 @@ def enqueue_platform_sync(
         coordinator=coordinator,
         job_status_store=job_status_store,
         lock_store=lock_store,
+        claim_token=claim_token,
         job_id=job_id,
         platform=platform,
         dry_run=dry_run,

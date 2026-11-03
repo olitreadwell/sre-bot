@@ -13,12 +13,6 @@ variable "fargate_memory" {
   default = 2048
 }
 
-variable "gcp_sre_service_account_key" {
-  description = "(Required) The GCP SRE service account key"
-  type        = string
-  sensitive   = true
-}
-
 variable "error_threshold" {
   description = "CloudWatch alarm threshold for the SRE Bot ERROR logs"
   type        = string
@@ -31,16 +25,16 @@ variable "warning_threshold" {
   default     = "10"
 }
 
+variable "landing_page_max_query_string_bytes" {
+  description = "Largest query string, in bytes, the WAF allows on the landing page before blocking the request"
+  type        = number
+  default     = 256
+}
+
 variable "slack_webhook_url" {
   description = "The URL of the Slack webhook."
   type        = string
   sensitive   = true
-}
-
-variable "cors_allowed_origins" {
-  description = "List of allowed browser origins for CORS in production."
-  type        = list(string)
-  default     = []
 }
 
 variable "authorized_endpoints_with_constraints" {

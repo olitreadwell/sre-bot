@@ -2,13 +2,14 @@
 
 from typing import Protocol, runtime_checkable
 
+from contracts.operations import OperationResult
 from infrastructure.directory.models import (
     DirectoryGroup,
+    DirectoryGroupsWithMembers,
     DirectoryMember,
     DirectoryUser,
     MembershipCheckResult,
 )
-from infrastructure.operations import OperationResult
 
 
 @runtime_checkable
@@ -17,8 +18,12 @@ class DirectoryProvider(Protocol):
 
     All method arguments that represent canonical group emails or user emails
     are normalised to lowercase by implementors before calling the underlying
-    IDP. All return values are wrapped in OperationResult — no exceptions cross
-    the boundary.
+    IDP, and so are the emails carried on returned DirectoryUser,
+    DirectoryMember and DirectoryGroup values — the IDP's original casing is
+    not preserved. Consumers comparing returned emails against addresses
+    sourced elsewhere (Slack profiles, command arguments, records stored in
+    another system) must compare case-insensitively. All return values are
+    wrapped in OperationResult — no exceptions cross the boundary.
     """
 
     def warmup(self) -> OperationResult[None]:
@@ -50,7 +55,7 @@ class DirectoryProvider(Protocol):
         """
         ...
 
-    def list_users(self, query: str = "", limit: int = 100) -> OperationResult[list[DirectoryUser]]:
+    def list_users(self, query: str = "", limit: int | None = None) -> OperationResult[list[DirectoryUser]]:
         """Return canonical users for a directory query.
 
         Args:
@@ -58,9 +63,9 @@ class DirectoryProvider(Protocol):
                 this into backend-specific filter/search parameters when
                 supported. Empty string requests an unfiltered list where
                 supported.
-            limit: Maximum number of canonical users to return. Implementors
-                should enforce this at the API layer when possible and
-                truncate locally when provider pagination semantics differ.
+            limit: Maximum number of canonical users to return. None or not
+                provided requests all users (unbounded pagination).
+                Implementors should stop paginating as soon as limit is reached.
 
         Returns:
             OperationResult: success with the canonical DirectoryUser list.
@@ -75,7 +80,7 @@ class DirectoryProvider(Protocol):
         """Return all members of a group.
 
         Args:
-            group_key: Canonical managed-group email (normalised to lowercase).
+            group_key: Fully-qualified group email (normalised to lowercase).
             include_member_types: Optional set of member types to include
                 (for example ``{"USER"}``, ``{"GROUP"}``, or both). If not
                 provided, providers should return all member types.
@@ -86,11 +91,10 @@ class DirectoryProvider(Protocol):
         ...
 
     def get_group(self, group_key: str) -> OperationResult[DirectoryGroup]:
-        """Return a canonical managed group by key.
+        """Return a canonical group by key.
 
         Args:
-            group_key: Canonical managed-group email or provider-agnostic
-                managed-group slug (for example, ``sg-aws-authn``).
+            group_key: Fully-qualified group email (normalised to lowercase).
 
         Returns:
             OperationResult: success with the canonical DirectoryGroup.
@@ -103,11 +107,10 @@ class DirectoryProvider(Protocol):
         user_email: str,
         role: str = "MEMBER",
     ) -> OperationResult[DirectoryMember]:
-        """Add a user membership to a managed group.
+        """Add a user membership to a group.
 
         Args:
-            group_key: Canonical managed-group email or provider-agnostic
-                managed-group slug (for example, ``sg-aws-authn``).
+            group_key: Fully-qualified group email (normalised to lowercase).
             user_email: User email to add (normalised to lowercase).
             role: Provider-agnostic membership role hint (default: MEMBER).
 
@@ -121,11 +124,10 @@ class DirectoryProvider(Protocol):
         group_key: str,
         user_email: str,
     ) -> OperationResult[None]:
-        """Remove a user membership from a managed group.
+        """Remove a user membership from a group.
 
         Args:
-            group_key: Canonical managed-group email or provider-agnostic
-                managed-group slug (for example, ``sg-aws-authn``).
+            group_key: Fully-qualified group email (normalised to lowercase).
             user_email: User email to remove (normalised to lowercase).
 
         Returns:
@@ -137,8 +139,7 @@ class DirectoryProvider(Protocol):
         """Check whether a user is a member of a group.
 
         Args:
-            group_key: Canonical managed-group email or provider-agnostic
-                managed-group slug (for example, ``sg-aws-authn``).
+            group_key: Fully-qualified group email (normalised to lowercase).
             user_email: User email to check (compared case-insensitively).
 
         Returns:
@@ -146,15 +147,44 @@ class DirectoryProvider(Protocol):
         """
         ...
 
-    def list_groups(self, query: str) -> OperationResult[list[DirectoryGroup]]:
+    def list_groups(self, query: str = "", limit: int | None = None) -> OperationResult[list[DirectoryGroup]]:
         """List groups matching a query expression.
 
         Args:
             query: Provider-agnostic query expression translated by each
-                implementor into backend-specific list parameters.
+                implementor into backend-specific list parameters. Empty
+                string requests an unfiltered list of all groups.
+            limit: Maximum number of canonical groups to return. None or not
+                provided requests all groups (unbounded pagination).
 
         Returns:
             OperationResult: success with the matching DirectoryGroup list.
+        """
+        ...
+
+    def list_groups_with_members(
+        self,
+        query: str = "",
+        limit: int | None = None,
+        include_member_types: set[str] | None = None,
+    ) -> OperationResult[DirectoryGroupsWithMembers]:
+        """List groups together with their members in one composition.
+
+        Implementors should use a provider-native batch API so the cost stays
+        proportional to the number of member pages rather than the number of
+        groups.  Groups whose members could not be fetched are returned in
+        ``failures`` rather than failing the whole result, because the
+        OperationStatus set is closed (decisions/operation-result.md).  Groups
+        with zero members are included.
+
+        Args:
+            query: Provider-agnostic query expression, as for ``list_groups``.
+            limit: Maximum number of groups to return, or None for all groups.
+            include_member_types: Optional set of member types to include
+                (for example ``{"USER"}``). If not provided, return all types.
+
+        Returns:
+            OperationResult: success with the DirectoryGroupsWithMembers payload.
         """
         ...
 
@@ -166,8 +196,7 @@ class DirectoryProvider(Protocol):
         single-user sync path.
 
         Note: Returns direct memberships only — transitive membership through
-        nested sub-groups is not expanded.  Managed ``sg-*`` security groups
-        use flat membership, making this safe for the single-user sync hot path.
+        nested sub-groups is not expanded.
 
         Args:
             user_email: Canonical user email, normalised to lowercase.
@@ -191,7 +220,7 @@ class DirectoryProvider(Protocol):
         batching.
 
         Args:
-            group_keys: Canonical managed-group emails (normalised to lowercase).
+            group_keys: Fully-qualified group emails (normalised to lowercase).
             include_member_types: Optional set of member types to include
                 (for example ``{"USER"}``). If not provided, return all types.
 

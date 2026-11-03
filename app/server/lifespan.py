@@ -1,48 +1,38 @@
 import sys
 import threading
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import cast
 
+import structlog
+import svcs
 from fastapi import FastAPI
-from pluggy import PluginManager
 from slack_bolt import App
 from structlog.stdlib import BoundLogger
 
-from infrastructure.configuration.app import AppSettings, get_app_settings
-from infrastructure.configuration.features.sre_ops import (
-    SreOpsSettings,
-    get_sre_ops_settings,
-)
-from infrastructure.configuration.infrastructure.directory import (
+from contracts.configuration import HostInfo
+from contracts.i18n.resources import I18nResourceSpec
+from contracts.services import ServiceScopeOpener
+from contracts.slack.registrar import SlackCommandRegistrar
+from infrastructure.directory import (
     DirectorySettings,
-    get_directory_settings,
+    get_directory_provider,
 )
-from infrastructure.configuration.infrastructure.server import (
-    ServerSettings,
-    get_server_settings,
-)
-from infrastructure.directory import get_directory_provider
 from infrastructure.i18n import (
     I18nResourceRegistry,
-    I18nResourceSpec,
     TranslationService,
     get_translation_service,
 )
-from infrastructure.logging.settings import LoggingSettings, get_logging_settings
-from infrastructure.logging.setup import configure_logging
-from infrastructure.plugins import (
-    auto_discover_plugins,
-    get_plugin_manager,
-    register_feature_integrations,
-)
 from infrastructure.security import get_jwks_manager
+from infrastructure.security.settings import SecuritySettings
 from integrations.slack.provider import get_slack_provider
 from jobs import scheduled_tasks
+from jobs.settings import SchedulerSettings
 from modules import (
     atip,
     aws,
+    dev,
     incident,
     incident_helper,
     role,
@@ -50,6 +40,18 @@ from modules import (
     sre,
     webhook_helper,
 )
+from server.configuration import HostConfiguration
+from server.configuration.summary import summarize
+from server.plugins.boot import call_hook_per_plugin, plugin_built_slices, reset_plugin_built_slices
+from server.plugins.manager import (
+    FeaturePluginManager,
+    get_plugin_manager,
+    load_plugins,
+    register_background_jobs,
+    register_feature_integrations,
+    resolve_plugin_requirements,
+)
+from server.services import SvcsServiceScopeOpener, initialize_core_services
 
 
 def _is_test_environment() -> bool:
@@ -57,40 +59,24 @@ def _is_test_environment() -> bool:
     return "pytest" in sys.modules
 
 
-def _get_logger_from_app(
-    app_settings: AppSettings,
-    logging_settings: LoggingSettings | None = None,
-) -> BoundLogger:
-    resolved_logging_settings = logging_settings or get_logging_settings()
-    return configure_logging(
-        settings=app_settings,
-        logging_settings=resolved_logging_settings,
-    )
+def _get_logger_from_app() -> BoundLogger:
+    # The configuration phase in the app factory already configured logging.
+    return structlog.stdlib.get_logger()
 
 
-def _list_configs_from_sections(
-    app_settings: AppSettings,
-    server_settings: ServerSettings,
-    directory_settings: DirectorySettings,
-    sre_ops_settings: SreOpsSettings,
-    logger: BoundLogger,
-) -> None:
-    config_settings: dict[str, tuple[object, ...]] = {
-        "settings": (
-            {"LOG_LEVEL": app_settings.LOG_LEVEL},
-            {"GIT_SHA": app_settings.GIT_SHA},
-        )
-    }
+def _log_plugin_configuration_summary(logger: BoundLogger) -> None:
+    """Log one configuration_slice event per slice each plugin's boot first built, then the summary naming them.
 
-    config_settings["app"] = tuple(app_settings.model_dump().keys())
-    config_settings["server"] = tuple(server_settings.model_dump().keys())
-    config_settings["directory"] = tuple(directory_settings.model_dump().keys())
-    config_settings["sre_ops"] = tuple(sre_ops_settings.model_dump().keys())
-
-    logger.info("configuration_initialized", base_settings=config_settings["settings"])
-    for key, value in config_settings.items():
-        if key != "settings":
-            logger.info("configuration_loaded", config_setting=key, keys=value)
+    A disabled plugin never builds its slices, so it has no entry.
+    """
+    plugins: list[dict[str, object]] = []
+    for plugin, built in plugin_built_slices().items():
+        summary = summarize(built)
+        events = summary.slice_events()
+        for event in events:
+            logger.info("configuration_slice", phase="plugin_boot", plugin=plugin, **event)
+        plugins.append({"plugin": plugin, "config_hash": summary.config_hash, "slices": [event["slice"] for event in events]})
+    logger.info("plugin_configuration_summary", phase="plugin_boot", plugins=plugins)
 
 
 def _register_legacy_handlers(bot: App, logger: BoundLogger) -> None:
@@ -99,24 +85,29 @@ def _register_legacy_handlers(bot: App, logger: BoundLogger) -> None:
     atip.register(bot)
     aws.register(bot)
     secret.register(bot)
-    sre.register(bot)
     webhook_helper.register(bot)
     incident.register(bot)
     incident_helper.register(bot)
 
 
+def _register_legacy_slack_commands(registrar: SlackCommandRegistrar, logger: BoundLogger) -> None:
+    sre.register_commands(registrar)
+    dev.register_commands(registrar)
+    logger.info("legacy_slack_commands_registered", modules=["sre", "dev"])
+
+
 def _start_scheduled_tasks(
-    bot: App,
-    app_settings: AppSettings,
+    scheduler: SchedulerSettings,
     logger: BoundLogger,
+    service_scopes: ServiceScopeOpener,
 ) -> threading.Event | None:
-    # This gate suppresses side-effecting jobs outside production; Tier-2 leases
-    # are the duplicate-prevention mechanism across production replicas.
-    if app_settings.ENVIRONMENT != "production":
-        logger.info("scheduled_tasks_skipped", reason="environment_is_not_production")
+    # [scheduler] enabled is the run switch; Tier-2 leases are the duplicate-prevention
+    # mechanism across replicas.
+    if not scheduler.enabled:
+        logger.info("scheduled_tasks_skipped", reason="scheduler_disabled")
         return None
 
-    scheduled_tasks.init(bot)
+    scheduled_tasks.init(register_background_jobs, service_scopes)
     stop_event = cast(threading.Event | None, scheduled_tasks.run_continuously())
     logger.info("scheduled_tasks_started")
     return stop_event
@@ -129,24 +120,19 @@ def _stop_scheduled_tasks(stop_event: threading.Event | None) -> None:
 
 
 def _initialize_security_services(
-    app: FastAPI,
-    settings: ServerSettings,
+    settings: SecuritySettings,
     logger: BoundLogger,
 ) -> None:
     """Pre-initialize JWT/JWKS security infrastructure at startup.
 
-    If ISSUER_CONFIG is not set the application starts in a degraded state:
-    authenticated endpoints will return 500 at runtime.  A startup warning is
-    logged so the misconfiguration is visible without blocking the process.
+    If [security] lists no issuers the application starts in a degraded state:
+    authenticated endpoints will return 500 at runtime. The configuration phase
+    already logged the security_setting_weakened warning, so the warmup is skipped.
     """
     log = logger.bind(phase="security")
     log.info("security_services_initialization_started")
-    issuer_config = settings.ISSUER_CONFIG
+    issuer_config = settings.issuer_config
     if not issuer_config:
-        log.warning(
-            "security_services_no_issuer_config",
-            detail="ISSUER_CONFIG not set; authenticated endpoints will fail at runtime",
-        )
         return
 
     jwks_manager = get_jwks_manager()
@@ -180,19 +166,17 @@ def _initialize_directory_provider(
     log.info("directory_provider_initialization_completed")
 
 
-def _initialize_translation_service(pm: PluginManager, logger: BoundLogger) -> TranslationService:
-    """"""
-    # Phase 1: Discover feature plugins and collect i18n resource registrations.
-    log = logger.bind(phase="i18n_resource_collection")
+def _initialize_translation_service(pm: FeaturePluginManager, logger: BoundLogger) -> TranslationService:
+    """Collect the plugins' i18n resources, then initialize and health-check the translation service.
 
-    auto_discover_plugins(pm, base_paths=["packages", "modules"])
-    logger.info("feature_plugins_discovered", plugin_count=len(pm.get_plugins()))
-
+    Plugins must already be loaded so every feature's locale path is included.
+    """
     i18n_registry = I18nResourceRegistry()
-    pm.hook.register_i18n_resources(registry=i18n_registry)
-    logger.info("i18n_resources_collected", resource_count=i18n_registry.get_resource_count())
+    call_hook_per_plugin(pm, "register_i18n_resources", logger, registry=i18n_registry)
+    logger.bind(phase="i18n_resource_collection").info(
+        "i18n_resources_collected", resource_count=i18n_registry.get_resource_count()
+    )
 
-    # Phase 2: Initialize translation service with all registered resources.
     log = logger.bind(phase="i18n_initialization")
     translation_service = get_translation_service()
     i18n_resources = i18n_registry.list_specs()
@@ -226,38 +210,58 @@ def _initialize_translation_service(pm: PluginManager, logger: BoundLogger) -> T
     return translation_service
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app_settings = get_app_settings()
-    server_settings = get_server_settings()
-    directory_settings = get_directory_settings()
-    sre_ops_settings = get_sre_ops_settings()
-    logging_settings = get_logging_settings()
-    logger = _get_logger_from_app(app_settings, logging_settings)
+def build_lifespan(configuration: HostConfiguration) -> Callable[[FastAPI], AbstractAsyncContextManager[dict[str, object]]]:
+    """Return the app lifespan bound to the configuration the app factory loaded."""
 
-    app.state.settings = app_settings
+    @svcs.fastapi.lifespan
+    async def lifespan(app: FastAPI, registry: svcs.Registry) -> AsyncGenerator[None]:
+        async with asynccontextmanager(_serve)(app, registry, configuration):
+            yield
+
+    return lifespan
+
+
+async def _serve(app: FastAPI, registry: svcs.Registry, configuration: HostConfiguration) -> AsyncGenerator[None]:
+    # Phase 1 (configuration) ran in the app factory: the files are installed and every host
+    # slice is validated. This phase only reads what it loaded.
+    host = configuration.host_info
+    server_settings = configuration.server
+    security_settings = configuration.security
+    directory_settings = configuration.directory
+    sre_ops_settings = configuration.sre_ops
+    logger = _get_logger_from_app()
+
+    app.state.host_info = host
     app.state.logger = logger
+    registry.register_value(HostInfo, host)
 
     logger.info("application_startup")
-    _list_configs_from_sections(
-        app_settings,
-        server_settings,
-        directory_settings,
-        sre_ops_settings,
-        logger,
-    )
+    # Phase 2: build every core service once; a failing factory stops startup here.
+    await initialize_core_services(registry, logger)
+    service_scopes = SvcsServiceScopeOpener(registry)
 
-    _initialize_security_services(app, server_settings, logger)
+    _initialize_security_services(security_settings, logger)
     _initialize_directory_provider(app, directory_settings, logger)
 
-    app.state.slack_provider = get_slack_provider()
+    slack_transport = configuration.slack_transport
+    app.state.slack_provider = get_slack_provider(
+        enabled=slack_transport.enabled,
+        socket_mode=slack_transport.socket_mode,
+        command_prefix=slack_transport.command_prefix,
+    )
 
     pm = get_plugin_manager()
+    reset_plugin_built_slices()
+    # Any plugin that fails to load stops startup here, before the app serves.
+    load_plugins(pm, configuration.disabled_plugins, logger.bind(phase="plugin_loading"))
+    # An enabled plugin whose required vendor or capability is not configured stops startup here.
+    resolve_plugin_requirements(pm, logger.bind(phase="plugin_requirements"))
 
     translation_service = _initialize_translation_service(pm, logger)
     # Inject translation service into all platform providers and their formatters
     # before command registration so help-text translations work at startup.
     app.state.slack_provider.set_translator(translation_service.translator)
+    app.state.slack_provider.set_scope_opener(service_scopes)
     # Phase 3: Register feature commands, routes, and run startup warmup.
     # Providers now have the translator set, so description_key translations
     # resolve correctly at registration time.
@@ -268,6 +272,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         slack_provider=app.state.slack_provider,
     )
     log.info("feature_integrations_registered")
+    _log_plugin_configuration_summary(logger)
+    # Legacy sre and dev subcommands must be in the provider's registry before
+    # initialize_app binds the root slash commands.
+    _register_legacy_slack_commands(app.state.slack_provider, logger)
 
     app.state.slack_provider.initialize_app()
     if app.state.slack_provider and getattr(app.state.slack_provider, "app", None):
@@ -281,26 +289,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 channel=sre_ops_settings.SRE_OPS_CHANNEL_ID,
                 text="SRE Bot has started up and is ready to receive commands.",
             )
-        if server_settings.SRE_TEST_CHANNEL_ID:
+        if server_settings.sre_test_channel_id:
             app.state.bot.client.chat_postMessage(
-                channel=server_settings.SRE_TEST_CHANNEL_ID,
+                channel=server_settings.sre_test_channel_id,
                 text="SRE Bot has started up in test mode.",
             )
-        scheduled_stop_event = (
-            _start_scheduled_tasks(
-                slack_app,
-                app_settings,
-                logger,
-            )
-            if not _is_test_environment()
-            else None
-        )
-
     else:
         logger.warning("slack_provider_app_unavailable", reason="initialization_failed")
         app.state.bot = None
         app.state.socket_mode_handler = None
-        scheduled_stop_event = None
 
     if not _is_test_environment():
         start_slack_result = app.state.slack_provider.start()
@@ -309,10 +306,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "slack_provider_start_failed",
                 error=start_slack_result.message,
             )
-        else:
-            logger.info("slack_provider_start_skipped", reason="test_environment")
+    else:
+        logger.info("slack_provider_start_skipped", reason="test_environment")
 
-    app.state.scheduled_stop_event = scheduled_stop_event
+    # Phase 6 starts the scheduler alongside the transports, never through one of them.
+    app.state.scheduled_stop_event = _start_scheduled_tasks(configuration.scheduler, logger, service_scopes)
 
     yield
 

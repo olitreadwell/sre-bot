@@ -1,10 +1,10 @@
 """Unit tests for the AWS Identity Center access-sync adapter.
 
-The adapter is injected with a typed boto3 ``identitystore`` client — never
-an ``AWSClients`` facade. Fakes here are ``MagicMock(spec=...)`` instances
-restricted to the real boto3 IdentityStore operation surface (plus
-``get_paginator``), so any facade-only helper (e.g. ``list_groups_with_memberships``)
-is absent by construction, matching production.
+The adapter is injected with a typed boto3 ``identitystore`` client. Fakes
+here are ``MagicMock(spec=...)`` instances restricted to the real boto3
+IdentityStore operation surface (plus ``get_paginator``), so any helper that
+is not a boto3 operation (e.g. ``list_groups_with_memberships``) is absent by
+construction, matching production.
 """
 
 from typing import Any
@@ -13,10 +13,15 @@ from unittest.mock import MagicMock, call
 import pytest
 from botocore.exceptions import ClientError
 
+from contracts.operations import OperationResult, OperationStatus
+from packages.access.common.config import EntitlementRule
+from packages.access.sync.adapters import aws_identity_center
 from packages.access.sync.adapters.aws_identity_center import (
     AwsIdentityCenterAdapter,
     normalize_group_name,
 )
+from packages.access.sync.domain import AdapterAssessment, DesiredUserState
+from packages.access.sync.policies import PlanningContext
 
 _IDENTITY_STORE_ID = "d-1234567890"
 
@@ -448,7 +453,7 @@ def test_resolve_group_id_token_direct_lookup() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_aws_identity_center_adapter() factory tests (AC#1, AC#5)
+# build_aws_identity_center_adapter() factory tests
 # ---------------------------------------------------------------------------
 
 
@@ -456,15 +461,13 @@ class _FakeAwsSettings:
     """Minimal AwsSettings stand-in for factory-wiring tests."""
 
     def __init__(self, instance_id: str, identitystore_role_arn: str) -> None:
-        self.INSTANCE_ID = instance_id
-        self.SERVICE_ROLE_MAP = {"identitystore": identitystore_role_arn}
+        self.identity_store_id = instance_id
+        self.service_role_map = {"identitystore": identitystore_role_arn}
 
 
 @pytest.mark.unit
 def test_build_aws_identity_center_adapter_wires_typed_client_no_facade(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC#1: the factory must build the adapter from get_aws_client("identitystore"), not an AWSClients facade."""
-    from packages.access.sync.adapters import aws_identity_center as module
-
+    """The factory builds the adapter from get_aws_client("identitystore") and the configured instance id."""
     fake_client = make_client()
     fake_client.get_user_id.return_value = {"UserId": "user-123"}
     captured: dict[str, Any] = {}
@@ -473,14 +476,14 @@ def test_build_aws_identity_center_adapter_wires_typed_client_no_facade(monkeypa
         captured["service_name"] = service_name
         return fake_client
 
-    monkeypatch.setattr(module, "get_aws_client", _fake_get_aws_client)
+    monkeypatch.setattr(aws_identity_center, "get_aws_client", _fake_get_aws_client)
     monkeypatch.setattr(
-        module,
+        aws_identity_center,
         "get_aws_settings",
         lambda: _FakeAwsSettings(instance_id="d-9876543210", identitystore_role_arn="arn:aws:iam::111111111111:role/org-role"),
     )
 
-    adapter = module.build_aws_identity_center_adapter()
+    adapter = aws_identity_center.build_aws_identity_center_adapter()
 
     assert isinstance(adapter, AwsIdentityCenterAdapter)
     assert captured["service_name"] == "identitystore"
@@ -490,49 +493,99 @@ def test_build_aws_identity_center_adapter_wires_typed_client_no_facade(monkeypa
 
 @pytest.mark.unit
 def test_build_aws_identity_center_adapter_assumes_org_role_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC#5: identitystore must be assumed under SERVICE_ROLE_MAP's org role, not the bot's own credentials."""
-    from packages.access.sync.adapters import aws_identity_center as module
-
+    """identitystore must be assumed under service_role_map's org role, not the bot's own credentials."""
     captured: dict[str, Any] = {}
 
     def _fake_get_aws_client(service_name: str, role_arn: str | None = None) -> MagicMock:
         captured["role_arn"] = role_arn
         return make_client()
 
-    monkeypatch.setattr(module, "get_aws_client", _fake_get_aws_client)
+    monkeypatch.setattr(aws_identity_center, "get_aws_client", _fake_get_aws_client)
     monkeypatch.setattr(
-        module,
+        aws_identity_center,
         "get_aws_settings",
         lambda: _FakeAwsSettings(instance_id="d-9876543210", identitystore_role_arn="arn:aws:iam::111111111111:role/org-role"),
     )
 
-    module.build_aws_identity_center_adapter()
+    aws_identity_center.build_aws_identity_center_adapter()
 
     assert captured["role_arn"] == "arn:aws:iam::111111111111:role/org-role"
 
 
 @pytest.mark.unit
 def test_build_aws_identity_center_adapter_omits_role_arn_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When SERVICE_ROLE_MAP has no identitystore role configured, role_arn must be None.
+    """When service_role_map has no identitystore role configured, role_arn must be None.
 
     Prevents a spurious STS AssumeRole call with an empty-string RoleArn in
     default/test configuration.
     """
-    from packages.access.sync.adapters import aws_identity_center as module
-
     captured: dict[str, Any] = {}
 
     def _fake_get_aws_client(service_name: str, role_arn: str | None = None) -> MagicMock:
         captured["role_arn"] = role_arn
         return make_client()
 
-    monkeypatch.setattr(module, "get_aws_client", _fake_get_aws_client)
+    monkeypatch.setattr(aws_identity_center, "get_aws_client", _fake_get_aws_client)
     monkeypatch.setattr(
-        module,
+        aws_identity_center,
         "get_aws_settings",
         lambda: _FakeAwsSettings(instance_id="d-9876543210", identitystore_role_arn=""),
     )
 
-    module.build_aws_identity_center_adapter()
+    aws_identity_center.build_aws_identity_center_adapter()
 
     assert captured["role_arn"] is None
+
+
+def _error_without_message(error_code: str) -> OperationResult:
+    return OperationResult(status=OperationStatus.TRANSIENT_ERROR, message=None, error_code=error_code)
+
+
+@pytest.mark.unit
+def test_reconcile_user_falls_back_to_default_message_when_group_resolution_error_has_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hard group-resolution failure with no message yields a fixed operator message.
+
+    _resolve_group_id is stubbed to return a non-skippable error built with
+    message=None; the reconcile result keeps its status and error_code and only
+    fills in the missing message.
+    """
+    adapter = make_adapter(make_client())
+    monkeypatch.setattr(adapter, "_resolve_group_id", lambda _entitlement_id: _error_without_message("TIMEOUT"))
+    context = PlanningContext(
+        platform="aws",
+        authn_removal_mode="delete",
+        entitlement_rules=[EntitlementRule(group_slug="aws-admins", entitlement_id="Admins")],
+    )
+
+    result = adapter.reconcile_user("user@example.com", DesiredUserState(user_should_exist=True), context)
+
+    assert result.status == OperationStatus.TRANSIENT_ERROR
+    assert result.message == "Failed to resolve group"
+    assert result.error_code == "TIMEOUT"
+
+
+@pytest.mark.unit
+def test_reconcile_user_falls_back_to_default_message_when_action_error_has_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed planned action with no message yields a fixed operator message.
+
+    Live assessment is stubbed to report an unprovisioned user so the plan is a
+    single provision_user, and ensure_user is stubbed to fail with message=None.
+    """
+    adapter = make_adapter(make_client())
+    monkeypatch.setattr(
+        adapter,
+        "_assess_live",
+        lambda _email: OperationResult.success(data=AdapterAssessment(platform_user_exists=False)),
+    )
+    monkeypatch.setattr(adapter, "ensure_user", lambda _email: _error_without_message("RATE_LIMITED"))
+    context = PlanningContext(platform="aws", authn_removal_mode="delete", entitlement_rules=[])
+
+    result = adapter.reconcile_user("user@example.com", DesiredUserState(user_should_exist=True), context)
+
+    assert result.status == OperationStatus.TRANSIENT_ERROR
+    assert result.message == "Action execution failed"
+    assert result.error_code == "RATE_LIMITED"

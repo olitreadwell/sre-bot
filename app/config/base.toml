@@ -1,0 +1,265 @@
+# Defaults for every settings slice, one table per slice (decisions/configuration.md).
+# Secure and production-shaped; an environment file overrides it key by key.
+# Never put a secret here: secrets come from the environment as <SLICE>__<FIELD>.
+
+[logging]
+log_level = "INFO"
+redaction_extra_keys = []
+
+[server]
+public_base_url = "http://127.0.0.1:8000"
+sre_test_channel_id = ""
+webhook_max_body_bytes = 262144
+
+[security]
+# Trusted JWT issuers: one [[security.issuers]] entry each, with issuer,
+# jwks_uri (https), algorithms (asymmetric) and audience. None by default.
+issuers = []
+cors_allowed_origins = []
+cors_allowed_methods = ["GET", "POST"]
+cors_allowed_headers = ["Authorization", "Content-Type", "X-Request-ID", "traceparent"]
+# The dev bypass is for local development only: a developer opts in with
+# SECURITY__DEV_BYPASS_ENABLED and SECURITY__DEV_BYPASS_TOKEN in app/.env.
+dev_bypass_enabled = false
+
+[slack]
+# The Slack client's per-call timeout, retry budget and error-code catalogues.
+# Each deployment that works with a workspace names it in [slack.tenant] team_id in
+# its own file; the tokens come from the environment as SLACK__<FIELD>.
+request_timeout_seconds = 10
+retry_max_attempts = 2
+transient_retry_after_seconds = 30
+unauthorized_errors = [
+    "not_authed",
+    "invalid_auth",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "missing_scope",
+    "no_permission",
+    "not_allowed_token_type",
+    "access_denied",
+    "permission_denied",
+    "ekm_access_denied",
+    "team_access_not_granted",
+]
+not_found_errors = ["channel_not_found", "user_not_found", "users_not_found", "message_not_found", "no_such_subteam"]
+transient_errors = ["ratelimited", "internal_error", "fatal_error", "service_unavailable", "request_timeout"]
+
+[slack_transport]
+# Each deployment that runs Slack switches the transport on in its own file.
+enabled = false
+# Socket Mode needs no inbound exposure; false selects HTTP Events mode, which needs SLACK__SIGNING_SECRET.
+socket_mode = true
+command_prefix = ""
+
+[google_workspace]
+# The Google API client's retries and per-attempt timeout. The tenant entry is never in
+# a file: its customer id and delegated user (non-public values) and its service-account
+# key (a secret) come from the environment as GOOGLE_WORKSPACE__TENANT__<FIELD>.
+api_num_retries = 3
+api_timeout_seconds = 10.0
+
+[aws]
+# The AWS clients' retry policy, per-attempt timeouts and error-code catalogues; hosting
+# reaches DynamoDB through the same clients. The region and the dynamodb-local endpoint are the
+# SDK's: AWS_DEFAULT_REGION (or the shared config file) and AWS_ENDPOINT_URL_DYNAMODB.
+# The tenant entry is never in a file: the Identity Center identity store id and instance ARN
+# (internal tenant identifiers, non-public values) and the optional audit, org and logging role
+# ARNs come from the environment as AWS__TENANT__<FIELD>: INSTANCE_ID, INSTANCE_ARN,
+# AUDIT_ROLE_ARN, ORG_ROLE_ARN, LOGGING_ROLE_ARN.
+retry_max_attempts = 3
+retry_mode = "standard"
+connect_timeout_seconds = 10
+read_timeout_seconds = 10
+transient_retry_after_seconds = 60
+not_found_codes = [
+    "ResourceNotFoundException",
+    "NoSuchEntity",
+    "NoSuchBucket",
+    "NoSuchKey",
+    "NotFoundException",
+    "AccountNotFoundException",
+    "TargetNotFoundException",
+    "NoSuchConfigurationAggregatorException",
+]
+unauthorized_codes = [
+    "AccessDenied",
+    "AccessDeniedException",
+    "UnauthorizedOperation",
+    "InvalidClientTokenId",
+    "SignatureDoesNotMatch",
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "TokenRefreshRequired",
+    "InvalidAccessException",
+]
+transient_codes = [
+    "Throttling",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+    "ProvisionedThroughputExceededException",
+    "TooManyRequestsException",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ServiceUnavailable",
+    "ServiceUnavailableException",
+    "InternalFailure",
+    "InternalServerError",
+    "InternalServerErrorException",
+    "InternalException",
+    "ServiceException",
+    "LimitExceededException",
+]
+
+[access_permission_sets]
+# The AWS SSO permission set ARNs the access "write" and "read" aliases resolve to. They embed the
+# Identity Center instance id (a non-public value), so a deployment supplies them from the environment
+# as ACCESS_PERMISSION_SETS__SYSTEM_ADMIN_PERMISSIONS and ACCESS_PERMISSION_SETS__VIEW_ONLY_PERMISSIONS.
+system_admin_permissions = ""
+view_only_permissions = ""
+
+[openai]
+# The completion budget, temperature (negative omits it) and request timeout. The model endpoint is
+# the [openai.tenant] entry (base_url, model), named in the deployment's environment file; with no
+# entry OpenAI is not configured. The key is a secret from OPENAI__API_KEY.
+max_output_tokens = 3000
+temperature = -1.0
+timeout_seconds = 180.0
+
+[directory]
+# Which directory answers a lookup is data (the IdP in a group reference, available when its tenant
+# entry is configured), never a setting; Google is the only adapter today. true fails startup when
+# the directory warmup fails.
+require_startup_warmup = false
+
+[audit]
+# The record table holding audit events; the default is the table this repository's terraform
+# creates, and a deployment that names its own overrides it in its environment file.
+table_name = "sre_bot_audit_trail"
+
+[coordination]
+# The conditional-write store behind idempotency and leases: its table (the default is the one this
+# repository's terraform creates), how long a completed record lives, and how long an in-progress
+# claim lives before another worker may take it over. A lease passes its own in-progress TTL.
+table_name = "sre_bot_idempotency"
+record_ttl_seconds = 3600
+in_progress_ttl_seconds = 300
+
+[notify]
+# The GC Notify request timeout. The API host is the [notify.tenant] entry (api_url), named in the
+# deployment's environment file; with no entry Notify is not configured. The credentials are secrets
+# from NOTIFY__SRE_USER_NAME and NOTIFY__SRE_CLIENT_SECRET.
+timeout_seconds = 60.0
+
+[opsgenie]
+# The Opsgenie request timeout. The account's regional API host is the [opsgenie.tenant] entry
+# (api_url), named in the deployment's environment file; with no entry Opsgenie is not configured.
+# The key is a secret from OPSGENIE__INTEGRATIONS_KEY.
+timeout_seconds = 30.0
+
+[trello]
+# No key: the SDK fixes Trello's host, so the tenant entry is the credentials, never in a file:
+# TRELLO__TENANT__APP_KEY and TRELLO__TENANT__TOKEN. The ATIP board (a non-public value) comes
+# from TRELLO__ATIP_BOARD.
+
+[sentinel]
+# The custom log table events are written to; each deployment that sends names its own. The
+# workspace id (non-public) and its shared key (secret) come from the environment only:
+# SENTINEL__CUSTOMER_ID and SENTINEL__SHARED_KEY; with either unset nothing is sent.
+log_type = "DevSREBot"
+
+[maxmind]
+# No key: the GeoIP2 database file is the [maxmind.tenant] entry (database_path), named in the
+# deployment's environment file; with no entry MaxMind is not configured.
+
+[scheduler]
+# Each deployment that runs the scheduled jobs switches them on in its own file;
+# a developer opts in with SCHEDULER__ENABLED=true in app/.env.
+enabled = false
+default_tier2_lease_ttl_seconds = 1800
+
+[notify_api_key_leak]
+channel_id = ""
+oncall_group_id = ""
+
+[atip]
+# The channel a new ATIP request is announced in; empty means none.
+announce_channel_id = ""
+
+[incident_core]
+# The incident record tables (terraform/dynamodb.tf) and the system that hosts a new
+# incident (new_incident_system: slack or google; absent means the only configured one).
+# The incident folder, report template and list sheet ids are non-public values: set
+# from the environment as INCIDENT_CORE__FOLDER_ID, INCIDENT_CORE__REPORT_TEMPLATE_ID and
+# INCIDENT_CORE__LIST_SHEET_ID, never in a configuration file.
+incidents_table = "incidents"
+timeline_table = "sre_bot_incident_timeline"
+folder_id = ""
+report_template_id = ""
+list_sheet_id = ""
+
+[incident_response]
+# Where the declare path announces an incident and which user groups it invites. Slack ids
+# are deployment configuration, never a secret; empty means none. Local shares the
+# production workspace, so no production id is a default here.
+announcement_channel_id = ""
+security_group_id = ""
+notify_management_group_id = ""
+# Non-public: set from the environment as INCIDENT_RESPONSE__HANDBOOK_ID.
+handbook_id = ""
+
+[incident_postmortem]
+# Non-public: set from the environment as INCIDENT_POSTMORTEM__CALENDAR_ID.
+calendar_id = ""
+
+[talent]
+# Non-public: each id is set from the environment as TALENT__<KEY>.
+internal_folder_id = ""
+templates_folder_id = ""
+scoring_guide_template_id = ""
+core_values_interview_notes_id = ""
+technical_interview_notes_id = ""
+intake_form_template_id = ""
+phone_screen_template_id = ""
+recruitment_feedback_template_id = ""
+panelist_guidebook_template_id = ""
+
+[sre_ops]
+# The channel the startup message and ops notifications go to; empty means none.
+sre_ops_channel_id = ""
+
+[cloud_operations]
+# Google group addresses whose members may run the legacy /aws admin commands; empty
+# denies every caller. A developer sets CLOUD_OPERATIONS__AWS_ADMIN_GROUPS='["..."]' in app/.env.
+aws_admin_groups = []
+
+[cloud_operations_spending]
+# Non-public: set from the environment as CLOUD_OPERATIONS_SPENDING__SHEET_ID.
+sheet_id = ""
+
+# Plugin enablement (decisions/plugins.md): one table per product area
+# (decisions/product-scope.md), one key per entry point, named as in
+# pyproject.toml. Boot fails when an installed entry point has no key, a key
+# names no entry point, or a name sits under two areas. A disabled plugin is
+# never imported. An environment file overrides a key; a developer can switch
+# one on from app/.env, for example PLUGINS__PLATFORM_ACCESS='{"access.sync": true}'.
+
+[plugins.incident_response]
+"incident.comms" = true
+"incident.scribe" = true
+oncall_sync = true
+user_rotations = true
+
+[plugins.cloud_operations]
+# No plugin yet: the AWS surfaces are still legacy modules (TASK-88).
+
+[plugins.platform_access]
+# Off everywhere, as production runs them today (TASK-112.3 deletes their ACCESS_*_ENABLED switches).
+"access.catalog" = false
+"access.request" = false
+"access.sync" = false
+
+[plugins.workplace_utilities]
+geolocate = true
+rant = true

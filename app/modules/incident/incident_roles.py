@@ -1,10 +1,11 @@
 import json
 import re
+from typing import Any
 
 from slack_sdk.web import WebClient
 from structlog import get_logger
 
-from integrations.google_workspace import google_drive
+from features.incident.drive.adapters import google_drive as incident_drive
 
 logger = get_logger()
 
@@ -16,8 +17,8 @@ def save_incident_roles(client: WebClient, ack, view):
     metadata = json.loads(view["private_metadata"])
     log = logger.bind(operation="save_incident_roles", channel_id=metadata.get("channel_id"))
     file_id = metadata["id"]
-    google_drive.add_metadata(file_id, "ic_id", selected_ic)
-    google_drive.add_metadata(file_id, "ol_id", selected_ol)
+    incident_drive.add_metadata(file_id, "ic_id", selected_ic)
+    incident_drive.add_metadata(file_id, "ol_id", selected_ol)
     log.info("incident_roles_saved", ic=selected_ic, ol=selected_ol)
     if metadata["ic_id"] != selected_ic:
         client.chat_postMessage(
@@ -59,14 +60,13 @@ def manage_roles(client: WebClient, body, ack, respond):
     channel_name = body["channel_name"]
     channel_name = channel_name[channel_name.startswith("incident-") and len("incident-") :]
     channel_name = channel_name[channel_name.startswith("dev-") and len("dev-") :]
-    documents = google_drive.find_files_by_name(channel_name)
+    document = incident_drive.find_document_by_channel_name(channel_name)
 
-    if len(documents) == 0:
+    if document is None:
         log.warning("no_incident_document_found", channel_name=channel_name)
         respond(f"No incident document found for `{channel_name}`. Please make sure the channel matches the document name.")
         return
 
-    document = documents[0]
     current_ic = (
         document["appProperties"]["ic_id"] if "appProperties" in document and "ic_id" in document["appProperties"] else False
     )
@@ -74,7 +74,7 @@ def manage_roles(client: WebClient, body, ack, respond):
         document["appProperties"]["ol_id"] if "appProperties" in document and "ol_id" in document["appProperties"] else False
     )
 
-    ic_element = {
+    ic_element: dict[str, Any] = {
         "type": "users_select",
         "placeholder": {
             "type": "plain_text",
@@ -85,7 +85,7 @@ def manage_roles(client: WebClient, body, ack, respond):
     if current_ic:
         ic_element["initial_user"] = current_ic
 
-    ol_element = {
+    ol_element: dict[str, Any] = {
         "type": "users_select",
         "placeholder": {
             "type": "plain_text",

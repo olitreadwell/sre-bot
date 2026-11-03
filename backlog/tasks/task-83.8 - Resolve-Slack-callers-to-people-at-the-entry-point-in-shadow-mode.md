@@ -1,0 +1,46 @@
+---
+id: TASK-83.8
+title: Resolve Slack callers to people at the entry point in shadow mode
+status: To Do
+assignee: []
+created_date: '2026-09-10 16:18'
+updated_date: '2026-10-15 17:47'
+labels:
+  - identity
+dependencies:
+  - TASK-83.6
+  - TASK-26.2
+references:
+  - decisions/platform-entrypoints.md
+  - decisions/observability.md
+  - 'https://github.com/cds-snc/sre-bot/issues/1632'
+parent_task_id: TASK-83
+priority: medium
+ordinal: 175000
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+decisions/platform-entrypoints.md (Accepted 2026-09-25) moves caller resolution to the platform entry point in app/server/<platform>/.
+
+In shadow mode, handlers receive the resolved person as optional context, but no behavior changes, so resolution coverage can be measured safely. A first-seen full SSO member is linked on the request through the sso_email rule (decisions/people-and-accounts.md). An unlinked caller is never refused at the entry point. This depends on TASK-26 being completed under the entry point split.
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 The Slack entry point resolves each caller's account and passes handlers the resolved person or an unlinked marker
+- [ ] #2 No handler changes its behavior based on the result
+- [ ] #3 Resolution outcomes (resolved, unlinked, unknown account) are counted in logs or metrics using ids only, never emails or names
+- [ ] #4 A setting disables resolution entirely
+- [ ] #5 Full test suite, ruff and mypy pass
+<!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-09-24 20:08
+---
+2026-09-24: depends on TASK-26.2, the slice of the rescoped TASK-26 that puts the Slack entry point in app/server/slack/ (decisions/platform-entrypoints.md). The resolved person or unlinked marker reaches handlers through the Slack handler contract in app/contracts/slack/ (TASK-26.1).
+---
+<!-- COMMENTS:END -->

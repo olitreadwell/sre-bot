@@ -1,7 +1,6 @@
 """AWS Module
 
 This module provides the following features:
-- Access to AWS accounts
 - Health check of AWS accounts
 - Provisioning and deprovisioning of AWS users
 - Group management (syncing, listing)
@@ -12,12 +11,9 @@ import structlog
 from slack_bolt import Ack, App, Respond
 from slack_sdk.web import WebClient
 
-from infrastructure.slack.settings import get_slack_transport_settings
-from integrations.aws import identity_store
-from integrations.aws.organizations import get_account_id_by_name
+from contracts.slack.transport import slack_transport_info
 from integrations.slack import commands as slack_commands
 from modules.aws import (
-    aws_access_requests,
     aws_account_health,
     groups,
     lambdas,
@@ -45,10 +41,6 @@ help_text = """
 \n      - Show this help text | montre le dialogue d'aide
 \n `/aws health`
 \n      - Query the health of an AWS account | Demander l'état de santé d'un compte AWS
-\n
-\n (currently disabled)
-\n `/aws access`
-\n      - starts the process to access an AWS account | débute le processus pour accéder à un compte AWS
 """
 
 
@@ -59,10 +51,10 @@ def register(bot: App) -> None:
         bot (SlackBot): The SlackBot instance to which the module
             will be registered.
     """
-    transport_settings = get_slack_transport_settings()
-    bot.command(f"/{transport_settings.COMMAND_PREFIX}aws")(aws_command)
-    bot.view("aws_access_view")(aws_access_requests.access_view_handler)
+    transport_settings = slack_transport_info()
+    bot.command(f"/{transport_settings.command_prefix}aws")(aws_command)
     bot.view("aws_health_view")(aws_account_health.health_view_handler)
+    bot.block_suggestion(aws_account_health.ACCOUNT_SELECT_ACTION_ID)(aws_account_health.account_options_handler)
 
 
 def aws_command(ack: Ack, command, respond: Respond, client: WebClient, body) -> None:
@@ -99,10 +91,8 @@ def aws_command(ack: Ack, command, respond: Respond, client: WebClient, body) ->
     match action:
         case "help" | "aide":
             respond(help_text)
-        case "access":
-            aws_access_requests.request_access_modal(client, body)
         case "health":
-            aws_account_health.request_health_modal(client, body)
+            aws_account_health.request_health_modal(client, body, respond)
         case "users":
             users.command_handler(client, body, respond, args)
         case "groups":
@@ -112,57 +102,22 @@ def aws_command(ack: Ack, command, respond: Respond, client: WebClient, body) ->
         case "spending":
             respond("Generating spending data...\nGénération des données de dépenses...")
             spending_df = spending.generate_spending_data()
-            if spending_df is None:
+            # An empty report is never written: it would replace the whole sheet.
+            if spending_df is None or spending_df.empty:
                 respond(
                     "Failed to generate spending data. Please try again later.\n"
                     "Échec de la génération des données de dépenses. Veuillez réessayer plus tard."
                 )
                 return
-            spending.update_spending_data(spending_df)
+            if not spending.update_spending_data(spending_df):
+                respond(
+                    "Failed to update spending data. Please try again later.\n"
+                    "Échec de la mise à jour des données de dépenses. Veuillez réessayer plus tard."
+                )
+                return
             respond("Spending data has been updated.\nLes données de dépenses ont été mises à jour.")
         case _:
             respond(
                 f"Unknown command: `{action}`. Type `/aws help` to see a list of commands.\n"
                 f"Commande inconnue: `{action}`. Tapez `/aws help` pour voir une liste des commandes."
             )
-
-
-def request_aws_account_access(account_name, rationale, start_date, end_date, user_email, access_type):
-    """
-    Request AWS account access for a user.
-
-    This function initiates a request for access to an AWS account for
-    a specified user.
-    It performs the following steps:
-    1. Retrieves the account ID associated with the given account name.
-    2. Retrieves the user ID associated with the given user email.
-    3. Creates an AWS access request with the provided details.
-
-    Args:
-        account_name (str): The name of the AWS account to which access
-            is requested.
-        rationale (str): The reason for requesting access to the AWS account.
-        start_date (datetime): The start date and time for the requested
-            access period.
-        end_date (datetime): The end date and time for the requested
-            access period.
-        user_email (str): The email address of the user requesting access.
-        access_type (str): The type of access requested
-            (e.g., 'read', 'write').
-
-    Returns:
-        bool: True if the access request was successfully created,
-            False otherwise.
-    """
-    account_id = get_account_id_by_name(account_name)
-    user_id = identity_store.get_user_id(user_email)
-    return aws_access_requests.create_aws_access_request(
-        account_id,
-        account_name,
-        user_id,
-        user_email,
-        start_date,
-        end_date,
-        access_type,
-        rationale,
-    )

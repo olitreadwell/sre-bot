@@ -1,10 +1,21 @@
 """Tests for recreate_missing_resources functionality."""
 
+from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modules.incident import core
+from modules.incident import core, incident_folder
+
+
+@pytest.fixture(autouse=True)
+def _slack_tenant() -> Iterator[None]:
+    """The channel link names the configured workspace."""
+    with patch(
+        "modules.incident.core.get_slack_settings", return_value=SimpleNamespace(tenant=SimpleNamespace(team_id="T0TEAM"))
+    ):
+        yield
 
 
 @pytest.fixture
@@ -42,10 +53,10 @@ def basic_params():
 def test_contract_create_database_record_uses_environment_not_prefix(
     set_environment,
 ):
-    """Database environment value must come from app_settings.ENVIRONMENT."""
+    """Database environment value must come from the installed HostInfo environment."""
     results = {"success": [], "errors": [], "skipped": []}
 
-    set_environment(core.app_settings, "dev")
+    set_environment("local")
 
     with patch("modules.incident.core.db_operations.create_incident") as mock_create:
         mock_create.return_value = "incident-id"
@@ -66,16 +77,65 @@ def test_contract_create_database_record_uses_environment_not_prefix(
     assert incident_data["environment"] == "dev"
 
 
+def test_add_incident_to_sheet_dev_channel_uses_consistent_slug():
+    results = {"success": [], "errors": [], "skipped": []}
+    channel_name = "incident-dev-2024-01-01-foo"
+
+    with patch.object(core, "incident_folder") as mock_incident_folder:
+        mock_incident_folder.channel_slug = incident_folder.channel_slug
+        mock_incident_folder.get_incidents_from_sheet.return_value = []
+
+        core._add_incident_to_sheet(
+            MagicMock(),
+            "C123",
+            channel_name,
+            "https://docs.example/report",
+            "Incident name",
+            "Product",
+            results,
+        )
+
+    mock_incident_folder.add_new_incident_to_list.assert_called_once_with(
+        "https://docs.example/report",
+        "Incident name",
+        "2024-01-01-foo",
+        "Product",
+        "https://slack.com/app_redirect?channel=C123&team=T0TEAM",
+    )
+
+
+def test_create_document_bookmark_dev_channel_uses_consistent_slug():
+    results = {"success": [], "errors": [], "skipped": []}
+    with (
+        patch.object(core.incident_drive, "list_folder_files", return_value=[]),
+        patch.object(core.incident_document, "create_incident_document", return_value="doc-123") as mock_create,
+        patch.object(core.incident_document, "update_boilerplate_text"),
+        patch.object(core.on_call, "get_on_call_users_from_folder", return_value=[]),
+    ):
+        core._create_document_bookmark(
+            MagicMock(),
+            "C123",
+            "incident-dev-2024-01-01-foo",
+            {},
+            "folder-123",
+            "Incident name",
+            "Product",
+            results,
+        )
+
+    mock_create.assert_called_once_with("2024-01-01-foo", "folder-123")
+
+
 @patch("modules.incident.core.db_operations")
 @patch("modules.incident.core.incident_folder")
 @patch("modules.incident.core.incident_document")
 @patch("modules.incident.core.on_call")
 @patch("modules.incident.core.meet")
-@patch("modules.incident.core.google_drive")
+@patch("modules.incident.core.incident_drive")
 @patch("modules.incident.core.logger")
 def test_recreate_missing_resources_all_missing(
     mock_logger,
-    mock_google_drive,
+    mock_incident_drive,
     mock_meet,
     mock_on_call,
     mock_incident_document,
@@ -88,7 +148,7 @@ def test_recreate_missing_resources_all_missing(
     # Setup mocks
     mock_db_operations.get_incident_by_channel_id.return_value = None
     mock_incident_folder.list_incident_folders.return_value = [{"id": "folder_123", "name": "Test Product"}]
-    mock_google_drive.list_files_in_folder.return_value = []
+    mock_incident_drive.list_folder_files.return_value = []
     mock_incident_document.create_incident_document.return_value = "doc_123"
     mock_on_call.get_on_call_users_from_folder.return_value = [
         {
@@ -146,11 +206,11 @@ def test_recreate_missing_resources_all_missing(
 @patch("modules.incident.core.incident_document")
 @patch("modules.incident.core.on_call")
 @patch("modules.incident.core.meet")
-@patch("modules.incident.core.google_drive")
+@patch("modules.incident.core.incident_drive")
 @patch("modules.incident.core.logger")
 def test_recreate_missing_resources_all_exist(
     mock_logger,
-    mock_google_drive,
+    mock_incident_drive,
     mock_meet,
     mock_on_call,
     mock_incident_document,
@@ -209,11 +269,11 @@ def test_recreate_missing_resources_all_exist(
 @patch("modules.incident.core.incident_document")
 @patch("modules.incident.core.on_call")
 @patch("modules.incident.core.meet")
-@patch("modules.incident.core.google_drive")
+@patch("modules.incident.core.incident_drive")
 @patch("modules.incident.core.logger")
 def test_recreate_missing_resources_partial_missing(
     mock_logger,
-    mock_google_drive,
+    mock_incident_drive,
     mock_meet,
     mock_on_call,
     mock_incident_document,
@@ -238,7 +298,7 @@ def test_recreate_missing_resources_partial_missing(
         "channel_id": {"S": basic_params["channel_id"]},
     }
     mock_incident_folder.list_incident_folders.return_value = [{"id": "folder_123", "name": "Test Product"}]
-    mock_google_drive.list_files_in_folder.return_value = [{"id": "existing_doc_123", "name": "2024-001 Incident Report"}]
+    mock_incident_drive.list_folder_files.return_value = [{"id": "existing_doc_123", "name": "2024-001 Incident Report"}]
     mock_incident_folder.get_incidents_from_sheet.return_value = []
 
     # Execute
@@ -294,11 +354,11 @@ def test_recreate_missing_resources_channel_info_error(
 @patch("modules.incident.core.incident_document")
 @patch("modules.incident.core.on_call")
 @patch("modules.incident.core.meet")
-@patch("modules.incident.core.google_drive")
+@patch("modules.incident.core.incident_drive")
 @patch("modules.incident.core.logger")
 def test_recreate_missing_resources_unknown_product(
     mock_logger,
-    mock_google_drive,
+    mock_incident_drive,
     mock_meet,
     mock_on_call,
     mock_incident_document,
@@ -336,11 +396,11 @@ def test_recreate_missing_resources_unknown_product(
 @patch("modules.incident.core.incident_document")
 @patch("modules.incident.core.on_call")
 @patch("modules.incident.core.meet")
-@patch("modules.incident.core.google_drive")
+@patch("modules.incident.core.incident_drive")
 @patch("modules.incident.core.logger")
 def test_recreate_missing_resources_meet_creation_fails(
     mock_logger,
-    mock_google_drive,
+    mock_incident_drive,
     mock_meet,
     mock_on_call,
     mock_incident_document,
