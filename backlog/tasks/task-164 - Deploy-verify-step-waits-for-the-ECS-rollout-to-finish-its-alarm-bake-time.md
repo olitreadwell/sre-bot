@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-23T18:47:00Z'
-updated_date: '2026-10-29T18:44:00Z'
+updated_date: '2026-11-03T20:45:00Z'
 labels:
   - deployment
   - ci
@@ -59,6 +59,7 @@ Security:
 - [ ] #8 No CI output contains a secret value, checked by a test over the scripts' output with a canary
 - [ ] #9 The delivery-session process and docs/runbooks no longer ask the human to run the automated checks by hand
 - [ ] #10 The bin tests and ruff pass for the moved or changed scripts
+- [ ] #11 The TASK-163 edge post check (bin/deploy-checks.zsh post edge) runs in CI with the other post-deploy checks, or is recorded as retired
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -67,4 +68,6 @@ Security:
 2026-10-29: TASK-177 folded in (human): one PR with a size exception; ACs #5 to #10 are TASK-177's ACs #1 to #6. Stays doc-11 row Z.
 
 2026-10-29 scope line: TASK-175's production and local configuration check (pytest, configuration semantics and requirement resolution) is separate from this task's CI env-name audit; no overlap.
+
+2026-11-03 (from TASK-28.4's approved plan): bin/deploy-checks.zsh boot detection moves from configured_systems_built (now DEBUG) to core_services_initialized (INFO, one per boot); the CI port keys boot on core_services_initialized.
 <!-- SECTION:NOTES:END -->

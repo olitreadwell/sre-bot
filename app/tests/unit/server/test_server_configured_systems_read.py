@@ -77,6 +77,13 @@ def test_slack_without_a_team_id_is_not_configured() -> None:
     assert slack_tenant(_slack()) is None
 
 
+def test_slack_tenant_is_the_enterprise_id_when_one_is_set() -> None:
+    """Slack keys org data by the Enterprise org id, so it wins over the workspace id."""
+    settings = SlackSettings.model_construct(tenant=SlackTenant(team_id="T0123", enterprise_id="E0ORG"))
+
+    assert slack_tenant(settings) == "E0ORG"
+
+
 def test_slack_tenant_entry_configures_the_system() -> None:
     """A tenant entry is what configures a system; [slack_transport] enabled only switches the transport."""
     assert slack_tenant(_slack("T0123")) == "T0123"
@@ -129,7 +136,7 @@ def test_reading_logs_nothing_so_a_second_read_adds_no_boot_event() -> None:
 
 
 def test_boot_event_names_the_systems_and_no_tenant_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The core-service build logs one configured_systems_built event naming the systems, never a tenant id."""
+    """The core-service build logs one debug configured_systems_built event naming the systems, never a tenant id."""
     systems = StaticConfiguredSystems({WorkplaceSystem.SLACK: "T0123", WorkplaceSystem.GOOGLE: "C0abc"})
     monkeypatch.setattr(services, "read_configured_systems", lambda: systems)
 
@@ -138,4 +145,4 @@ def test_boot_event_names_the_systems_and_no_tenant_id(monkeypatch: pytest.Monke
 
     assert built is systems
     events = [entry for entry in logs if entry["event"] == "configured_systems_built"]
-    assert events == [{"event": "configured_systems_built", "log_level": "info", "systems": ["slack", "google"]}]
+    assert events == [{"event": "configured_systems_built", "log_level": "debug", "systems": ["slack", "google"]}]

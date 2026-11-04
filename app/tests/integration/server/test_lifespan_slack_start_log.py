@@ -1,10 +1,10 @@
 """Integration tests for the Slack provider start logs emitted by the lifespan.
 
 Every startup service is stubbed and the lifespan logger is replaced by a mock,
-so the only behaviour observed is which start event is logged. The test
-environment check is forced off for the production cases: the provider is
-started there, and only a failed start is reported. Under pytest the provider
-is never started and the skip is logged instead.
+so the only behaviour observed is whether the provider is started and which start
+event is logged. The provider is started only when it has a Bolt app, which means
+Slack is enabled and initialised; otherwise the start is skipped with a debug event
+and a boot with Slack off logs no start failure.
 """
 
 from collections.abc import Iterator
@@ -25,7 +25,7 @@ def logger() -> MagicMock:
 @pytest.fixture
 def provider() -> MagicMock:
     provider = MagicMock()
-    provider.app = None
+    provider.app = MagicMock(name="bolt_app")
     return provider
 
 
@@ -42,6 +42,7 @@ def stubbed_startup(logger: MagicMock, provider: MagicMock) -> Iterator[None]:
         stack.enter_context(patch("server.lifespan.get_slack_provider", return_value=provider))
         stack.enter_context(patch("server.lifespan.register_feature_integrations"))
         stack.enter_context(patch("server.lifespan._register_legacy_slack_commands"))
+        stack.enter_context(patch("server.lifespan.install_slack_tenant_guard"))
         yield
 
 
@@ -54,12 +55,11 @@ def _events(log_method: MagicMock) -> list[str]:
 async def test_successful_slack_start_logs_neither_failure_nor_skip(logger: MagicMock, provider: MagicMock) -> None:
     provider.start.return_value.is_success = True
 
-    with patch("server.lifespan._is_test_environment", return_value=False):
-        async with lifespan(FastAPI()):
-            pass
+    async with lifespan(FastAPI()):
+        pass
 
     provider.start.assert_called_once_with()
-    assert "slack_provider_start_skipped" not in _events(logger.info)
+    assert "slack_provider_start_skipped" not in _events(logger.debug)
     assert "slack_provider_start_failed" not in _events(logger.warning)
 
 
@@ -69,19 +69,23 @@ async def test_failed_slack_start_logs_the_failure(logger: MagicMock, provider: 
     provider.start.return_value.is_success = False
     provider.start.return_value.message = "socket refused"
 
-    with patch("server.lifespan._is_test_environment", return_value=False):
-        async with lifespan(FastAPI()):
-            pass
+    async with lifespan(FastAPI()):
+        pass
 
     logger.warning.assert_any_call("slack_provider_start_failed", error="socket refused")
-    assert "slack_provider_start_skipped" not in _events(logger.info)
+    assert "slack_provider_start_skipped" not in _events(logger.debug)
 
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("stubbed_startup")
-async def test_test_environment_skips_the_slack_start_and_logs_the_skip(logger: MagicMock, provider: MagicMock) -> None:
+async def test_a_provider_without_an_app_is_not_started_and_the_skip_is_logged_at_debug(
+    logger: MagicMock, provider: MagicMock
+) -> None:
+    provider.app = None
+
     async with lifespan(FastAPI()):
         pass
 
     provider.start.assert_not_called()
-    logger.info.assert_any_call("slack_provider_start_skipped", reason="test_environment")
+    logger.debug.assert_any_call("slack_provider_start_skipped", reason="slack_disabled")
+    assert "slack_provider_start_failed" not in _events(logger.warning)

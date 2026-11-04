@@ -27,7 +27,11 @@ from infrastructure.configuration.features.sre_ops import SreOpsSettings, get_sr
 from infrastructure.coordination.settings import get_conditional_write_settings
 from infrastructure.directory import DirectorySettings, get_directory_settings
 from infrastructure.logging.settings import get_logging_settings
-from infrastructure.logging.setup import configure_logging
+from infrastructure.logging.setup import (
+    configure_bootstrap_logging,
+    configure_logging,
+    install_uncaught_exception_hook,
+)
 from infrastructure.security.settings import SecuritySettings, get_security_settings
 from integrations.aws.settings import get_aws_settings
 from integrations.google_workspace.settings import GoogleWorkspaceSettings, get_google_workspace_settings
@@ -53,7 +57,7 @@ from server.slack.settings import SlackTransportSettings, get_slack_transport_se
 class SlackKey(StrEnum):
     """The Slack slice keys the transport rules name."""
 
-    TEAM_ID = "[slack.tenant] team_id"
+    TENANT = "[slack.tenant] team_id or enterprise_id"
     BOT = "SLACK__BOT_TOKEN"
     APP = "SLACK__APP_TOKEN"
     SIGNING = "SLACK__SIGNING_SECRET"
@@ -115,12 +119,12 @@ def validate_slack_transport(transport: SlackTransportSettings, slack: SlackSett
 
     The rules join the [slack_transport] slice with the Slack vendor slice, so they run here
     rather than in either slice. Messages name the key, never a value. Socket Mode without
-    the signing secret is production's shape: it boots, with an info notice.
+    the signing secret is production's shape: it boots, with a debug notice; the configuration summary shows the secret set or unset.
     """
     if not transport.enabled:
         return
     if slack.tenant is None:
-        raise ConfigurationError(f"{SlackKey.TEAM_ID} is required when [slack_transport] enabled is true")
+        raise ConfigurationError(f"{SlackKey.TENANT} is required when [slack_transport] enabled is true")
     if not slack.bot_token:
         raise ConfigurationError(f"{SlackKey.BOT} is required when [slack_transport] enabled is true")
     if transport.socket_mode and not slack.app_token:
@@ -128,7 +132,7 @@ def validate_slack_transport(transport: SlackTransportSettings, slack: SlackSett
     if not transport.socket_mode and not slack.signing_secret:
         raise ConfigurationError(f"{SlackKey.SIGNING} is required when [slack_transport] socket_mode is false")
     if transport.socket_mode and not slack.signing_secret:
-        structlog.get_logger(__name__).info(
+        structlog.get_logger(__name__).debug(
             "slack_signing_secret_not_set_in_socket_mode",
             detail=(
                 f"{SlackKey.SIGNING} is not set. Socket Mode does not need it for request authenticity "
@@ -158,15 +162,26 @@ def validate_legacy_incident_google_tenant(transport: SlackTransportSettings, go
 def load_host_configuration(directory: Path | None = None) -> HostConfiguration:
     """Run the configuration phase once: select, check and install the files, validate every host slice.
 
-    Logging is configured right after the identity and [logging] slices, so every later
+    A bootstrap pipeline renders a failure before the [logging] slice loads as one JSON line.
+    Logging is then configured right after the identity and [logging] slices, so every later
     configuration event, a failure included, renders through the one pipeline
     (decisions/observability.md). Any invalid environment, file, table or key raises
     here, before the app is built.
     """
-    identity = get_identity_settings()
-    files = load_configuration_files(identity.environment, directory)
-    install_configuration_files(files)
-    logging_settings = get_logging_settings()
+    configure_bootstrap_logging()
+    install_uncaught_exception_hook(reported=(ConfigurationError, ValidationError))
+    try:
+        identity = get_identity_settings()
+        files = load_configuration_files(identity.environment, directory)
+        install_configuration_files(files)
+        logging_settings = get_logging_settings()
+    except ValidationError as error:
+        # Logged once here and re-raised unchanged; the uncaught-exception hook skips both types.
+        _log_invalid(ConfigurationError(describe_validation_error(error)))
+        raise
+    except ConfigurationError as error:
+        _log_invalid(error)
+        raise
     configure_logging(identity.environment, logging_settings, static_fields=build_service_identity(identity).log_fields())
     try:
         configuration = _validate_slices(identity)

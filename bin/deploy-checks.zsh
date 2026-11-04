@@ -13,13 +13,18 @@
 #   summary     post: every running task logged configuration_summary since the rollout, service.instance.id is distinct
 #               per task, config_hash is identical across tasks (drift is a FAIL), the security_setting_weakened count
 #               (informational), and no token-shaped value (xox*-, xapp-, -----BEGIN) in any boot line (TASK-156)
+#   edge        post: the app, not the WAF, answers an /api/v1 path (EDGE_PROBE_PATH, default an unmounted one: 404 JSON,
+#               or 401 with WWW-Authenticate: Bearer on an authenticated route); /docs and /openapi.json answer 200;
+#               on an authenticated route a bad token gets 401; with SREBOT_PROBE_TOKEN in the environment (a Backstage
+#               token, never printed) a valid token gets neither 401 nor 403; jwt_validation_failed count (informational).
+#               Kept until the first authenticated /api/v1 route has run it with a token (TASK-163; TASK-164 moves it to CI)
 # Output: tmp/deploy-checks/<phase>-<UTC timestamp>.txt (gitignored, never commit it)
 # Rollback: docs/runbooks/roll-back-a-deployment.md, with the image_tag printed by pre.
 
 setopt no_unset
 unsetopt xtrace verbose
 
-TASK_CHECKS=(summary)
+TASK_CHECKS=(summary edge)
 PRE_CHECKS=()  # task checks with a pre part
 phase=${1:-}
 [[ $phase == pre || $phase == post ]] || { print -u2 "usage: $0 pre | post [${(j:|:)TASK_CHECKS} ...]"; exit 2 }
@@ -60,6 +65,16 @@ li() {
     | jq -c '.results[] | map({(.field): .value}) | add | del(."@ptr")'
 }
 li_count() { local v; v=$(li $1 "$2 | stats count() as n" ${3:-} | jq -r '.n // empty' | head -1); print -r -- ${v:-0}; }
+# HTTP probe: probe <path> [bearer token]; prints "<status> <content type> <WWW-Authenticate>". The token goes to curl
+# on stdin as a header line, so it never appears in the process list or the output.
+probe() {
+  local fmt='%{http_code} %{content_type} %header{www-authenticate}'
+  if (( $# > 1 )); then
+    print -r -- "Authorization: Bearer $2" | curl -s -o /dev/null -H @- -w $fmt $BASE_URL$1
+  else
+    curl -s -o /dev/null -w $fmt $BASE_URL$1
+  fi
+}
 
 primary_deployment() {
   aws ecs describe-services --region $REGION --cluster $CLUSTER --services $SERVICE --output json \
@@ -92,7 +107,7 @@ if [[ $phase == pre ]]; then
   print "slack_app_initialized: $(li_count $since 'filter event = "slack_app_initialized"')"
   print "error or critical lines: $(li_count $since 'filter level in ["error","critical"]')"
   li $since 'filter level in ["error","critical"] | stats count() as n by event, level | sort n desc | limit 10'
-  li $since 'filter event = "configured_systems_built" | fields @timestamp, @message | sort @timestamp desc | limit 3'
+  li $since 'filter event = "core_services_initialized" | fields @timestamp, @message | sort @timestamp desc | limit 3'
 
 fi
 
@@ -109,8 +124,8 @@ if [[ $phase == post ]]; then
   since=$(print -r -- $dep | jq -r '.createdAt | if type=="number" then floor else (sub("\\.[0-9]+";"") | sub("[+-][0-9:]+$";"Z") | fromdateiso8601) end')
   print "window_start=$(date -u -d @$since +%FT%TZ)"
 
-  # Boot ends 5 minutes after the last configured_systems_built (10 minutes after the rollout started if none).
-  booted=$(li $since 'filter event = "configured_systems_built" | stats max(toMillis(@timestamp)) as t' | jq -r '.t // empty' | head -1)
+  # Boot ends 5 minutes after the last core_services_initialized (10 minutes after the rollout started if none).
+  booted=$(li $since 'filter event = "core_services_initialized" | stats max(toMillis(@timestamp)) as t' | jq -r '.t // empty' | head -1)
   if [[ -n $booted ]]; then boot_end=$(( ${booted%%.*} / 1000 + 300 )); else boot_end=$(( since + 600 )); fi
   now=$(date -u +%s); (( boot_end > now )) && boot_end=$now
 
@@ -141,16 +156,20 @@ if [[ $phase == post ]]; then
   elif (( reconnected > 0 )); then result runtime_errors "WARN (Socket Mode reconnected on $reconnected task(s))"
   else result runtime_errors PASS; fi
 
-  section "Non-JSON lines since the deploy (uvicorn lines expected until TASK-28.2)"
-  print "count=$(li_count $since 'filter @message not like /^\s*\{/')"
-  li $since 'filter @message not like /^\s*\{/ | fields @message | limit 15' | mask
+  section "Non-JSON lines since the deploy (every line is JSON except import-time output: webhook pattern events and warnings)"
+  # The webhook pattern events and Python warnings raised while modules import are printed before the app factory
+  # configures logging, so they stay plain. TASK-168 removes the import-time discovery and this exclusion with it.
+  nonjson='filter @message not like /^\s*\{/ and @message not like /registered_notification_pattern|registered_pattern|no_handlers_found_in_module|notification_handlers_initialization_complete/ and @message not like /[A-Za-z]*Warning: /'
+  nonjson_count=$(li_count $since $nonjson)
+  print "count=$nonjson_count"
+  li $since "$nonjson | fields @message | limit 15" | mask
+  [[ $nonjson_count == 0 ]] && result non_json_lines PASS || result non_json_lines "WARN ($nonjson_count plain lines; read the samples above)"
 
   tasks=$(print -r -- $dep | jq -r .runningCount)
 
   section "Slack up"
   print "slack_app_initialized: $(li_count $since 'filter event = "slack_app_initialized"')"
   print "socket session established: $(li_count $since 'filter @message like /session has been established/')"
-  li $since 'filter event = "configured_systems_built" | fields @timestamp, @message | limit 4'
   bad=$(li_count $since 'filter event in ["slack_disabled_skipping_init","slack_app_initialization_failed","slack_provider_app_unavailable","incident_comms_registration_skipped"] or @message like /missing_bot_token|missing_app_token|invalid_auth|not_authed/')
   [[ $bad == 0 ]] && result slack_up PASS || result slack_up "FAIL ($bad lines; rerun the samples above)"
 
@@ -169,11 +188,39 @@ if [[ $phase == post ]]; then
     [[ $leaked == 0 ]] && result summary_no_token_in_boot PASS || result summary_no_token_in_boot "FAIL ($leaked boot lines carry a token-shaped value; rerun the query by hand)"
   fi
 
-  section "HTTP (allowed paths only; /api/v1/* answers 403 at the WAF until TASK-163)"
+  section "HTTP"
   version=$(curl -s $BASE_URL/version)
   print "version=$version head_sha=$head_sha"
   [[ $version == *${head_sha[1,7]}* ]] && result version PASS || result version "CHECK (compare with the run's head sha)"
   print "health=$(curl -s -o /dev/null -w '%{http_code}' $BASE_URL/health) root=$(curl -s -o /dev/null -w '%{http_code}' $BASE_URL/)"
+
+  if (( ${checks[(Ie)edge]} )); then  # TASK-163
+    edge_path=${EDGE_PROBE_PATH:-/api/v1/edge-probe}
+    section "Edge (TASK-163: the WAF allow-list follows the route table; statuses and header names only)"
+    read -r code ctype auth <<< "$(probe $edge_path)"
+    print "GET $edge_path (no token): $code $ctype ${auth:-no WWW-Authenticate}"
+    if [[ $code == 404 && $ctype == application/json* ]]; then result edge_api_reaches_app "PASS (no route at $edge_path; the app answered)"; authenticated=0
+    elif [[ $code == 401 && $auth == Bearer* ]]; then result edge_api_reaches_app PASS; authenticated=1
+    else result edge_api_reaches_app "FAIL ($code $ctype: a WAF 403 is text/html)"; authenticated=0
+    fi
+    for p in /docs /openapi.json; do
+      c=$(curl -s -o /dev/null -w '%{http_code}' $BASE_URL$p)
+      [[ $c == 200 ]] && result edge_docs${p//[^a-z]/_} PASS || result edge_docs${p//[^a-z]/_} "FAIL ($c)"
+    done
+    if (( authenticated )); then
+      read -r code ctype auth <<< "$(probe $edge_path not-a-valid-token)"
+      [[ $code == 401 && $auth == Bearer* ]] && result edge_bad_token PASS || result edge_bad_token "FAIL ($code, ${auth:-no WWW-Authenticate})"
+      if [[ -n ${SREBOT_PROBE_TOKEN:-} ]]; then
+        read -r code ctype auth <<< "$(probe $edge_path $SREBOT_PROBE_TOKEN)"
+        [[ $code != 401 && $code != 403 ]] && result edge_valid_token "PASS ($code)" || result edge_valid_token "FAIL ($code; check jwt_validation_failed and the jwks_uri egress)"
+      else
+        result edge_valid_token "SKIPPED (SREBOT_PROBE_TOKEN not set)"
+      fi
+    else
+      result edge_bad_token "SKIPPED (set EDGE_PROBE_PATH to an authenticated /api/v1 route once one is live)"
+    fi
+    print "jwt_validation_failed lines since the rollout (informational): $(li_count $since 'filter event = "jwt_validation_failed"')"
+  fi
 fi
 
 print "\nwritten: $OUT"
