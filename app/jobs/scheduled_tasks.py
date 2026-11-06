@@ -9,7 +9,7 @@ from structlog import get_logger
 
 from contracts.scheduler.registry import BackgroundJobRegistry
 from contracts.services import ServiceScopeOpener
-from features.incident.drive.adapters import google_drive as incident_drive
+from features.incident.core.adapters import google_docs as incident_drive
 from infrastructure.coordination import get_lease_store, run_if_leased
 from integrations import maxmind, opsgenie
 from integrations.slack.client import get_slack_web_client
@@ -105,8 +105,10 @@ def safe_run(job: Callable[..., Any]) -> Callable[..., None]:
         try:
             job(*args, **kwargs)
         except Exception as e:
+            # The one log of a failed run, traceback included (decisions/reliability.md).
             logger.error(
                 "safe_run_error",
+                exc_info=e,
                 error=str(e),
                 module=job.__module__,
                 function=job.__name__,

@@ -3,10 +3,10 @@ id: TASK-145.6.2
 title: >-
   IncidentReport in core/api.py with its Google Docs adapter on the gateway
   factories
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-05T00:44:00Z'
-updated_date: '2026-11-05T01:17:00Z'
+updated_date: '2026-11-05T19:11:00Z'
 labels:
   - incident
   - features
@@ -26,16 +26,16 @@ Layer 12b of Stack K (TASK-145.6 plan, approved 2026-11-05). IncidentReport Prot
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 IncidentReport is a Protocol in core/api.py whose methods take a ReportReference; GoogleDocsIncidentReport implements it and InMemoryIncidentReport is its fake, with a parity test
-- [ ] #2 No incident module imports infrastructure.drive; the incident ignore entries for it are deleted from pyproject.toml
-- [ ] #3 A test pins that the adapter calls the gateway factories with scopes only (no delegated_user_email) and that core/adapters imports no google.oauth2 or google.auth
-- [ ] #4 scribe uses IncidentReport from core.api; IncidentDocumentStore and get_incident_document_store no longer exist
-- [ ] #5 With folder_id or report_template_id empty, a subdomain that uses the report fails boot with one plugin_boot_failed event naming the key
-- [ ] #6 No user-visible command, reply or log event changes; the legacy_surface, scribe and comms suites pass
-- [ ] #7 ruff, mypy (no new errors in touched files), lint-imports, make check-import-contracts, make check-settings-key-ownership and pytest tests --ignore=tests/smoke pass
-- [ ] #8 A new report is filed in [incident_core] folder_id; the Protocol takes no placement; legacy declare and recreate keep filing in the folder they pass (C2); empty folder_id or report_template_id returns CONFIG_NOT_CONFIGURED naming the key
+- [x] #1 IncidentReport is a Protocol in core/api.py whose methods take a ReportReference; GoogleDocsIncidentReport implements it and InMemoryIncidentReport is its fake, with a parity test
+- [x] #2 No incident module imports infrastructure.drive; the incident ignore entries for it are deleted from pyproject.toml
+- [x] #3 A test pins that the adapter calls the gateway factories with scopes only (no delegated_user_email) and that core/adapters imports no google.oauth2 or google.auth
+- [x] #4 scribe uses IncidentReport from core.api; IncidentDocumentStore and get_incident_document_store no longer exist
+- [x] #5 With folder_id or report_template_id empty, a subdomain that uses the report fails boot with one plugin_boot_failed event naming the key
+- [x] #6 No user-visible command, reply or log event changes; the legacy_surface, scribe and comms suites pass
+- [x] #7 ruff, mypy (no new errors in touched files), lint-imports, make check-import-contracts, make check-settings-key-ownership and pytest tests --ignore=tests/smoke pass
+- [x] #8 A new report is filed in [incident_core] folder_id; the Protocol takes no placement; legacy declare and recreate keep filing in the folder they pass (C2); empty folder_id or report_template_id returns CONFIG_NOT_CONFIGURED naming the key
 - [x] #9 Before merge, a read-only count of incident items without report_url whose channel has an 'Incident report' bookmark is recorded in the notes; if not zero, the fallback decision (D1) is taken before merge
-- [ ] #10 rg finds no IncidentReportLinkLookup, _DOC_ID_PATTERN or scribe/adapters/slack.py in app/; scribe resolves the incident with find_incident_for_conversation and takes the report from incident.report (C3)
+- [x] #10 rg finds no IncidentReportLinkLookup, _DOC_ID_PATTERN or scribe/adapters/slack.py in app/; scribe resolves the incident with find_incident_for_conversation and takes the report from incident.report (C3)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -56,7 +56,7 @@ Full plan 2026-11-05, grounded at main 5deb8406 + #1823 and the TASK-145.6.1 pla
 4. pyproject.toml: delete the core adapter's ignore entries to infrastructure.drive, infrastructure.drive.factory, infrastructure.drive.models (renamed there by 145.6.1). No incident module imports infrastructure.drive (TASK-120 AC #2).
 5. core/adapters/in_memory.py: InMemoryIncidentReport (stores created reports, placeholders applied, sections, draft copies; returns references for a test tenant; parity suite shared with the adapter).
 6. scribe: ports.py loses IncidentDocumentStore and IncidentReportLinkLookup; providers.py loses get_incident_document_store and get_incident_report_link_lookup; service.py takes IncidentReport and the incident's ReportReference (:260, :286, :317, :319, :396 rewired; :173 _DOC_ID_PATTERN and :527 _find_report_document_id deleted); scribe/adapters/slack.py deleted; the scribe entry point (scribe/entrypoints/slack.py, as comms/entrypoints/slack.py:178-190 builds the store) resolves the incident through find_incident_for_conversation with the store from build_incident_store and replies as today when the channel is not an incident or the record has no report (i18n keys unchanged).
-7. scribe/__init__.py register_requirements adds the two incident_core requirements (after C4's host task).
+7. scribe/__init__.py register_requirements adds the two incident_core requirements (after C4's host task) (TASK-184, approved 2026-11-05; it must merge before this step). TASK-184 OQ1 (human, 2026-11-05): the CI configuration check is fixed here, not in TASK-184: tests/integration/server/test_server_plugins_configuration_requirements.py builds only the vendor slices, so extend it to build the incident_core slice (get_incident_core_settings, or the configuration phase) and supply placeholders for the env_only INCIDENT_CORE__FOLDER_ID and INCIDENT_CORE__REPORT_TEMPLATE_ID names, checked against terraform/ssm.tf or the Codespaces secrets per the plugins.md CI rule (TASK-175); production SSM must hold both values before merge (deploy-checks pre).
 8. tests/integration/legacy_surface/conftest.py: the report-link patch (:49, :179) replaced by a seeded InMemoryIncidentStore with a report reference.
 
 ## Domain-model evolution gate
@@ -110,6 +110,18 @@ AC numbering in the task after the rewording: plan rows 1-3 = ACs #1-#3, 5 = #4,
 2026-11-05 D1 decided (human): accept. The 2 items without report_url are open test incidents; no bookmark fallback, no backfill; /incident draft there answers 'no report'. AC #9 checked.
 
 2026-11-05 handoff from the TASK-184 plan: tests/integration/server/test_server_plugins_configuration_requirements.py builds only the vendor slices (lines 40-48), so once scribe declares incident_core.folder_id and report_template_id (AC #5) that production/local configuration check reports them unmet unless it also builds get_incident_core_settings (and supplies placeholders for any env_only names). Fold into step 7 at TDD.
+
+2026-11-05 implemented with TDD on stack-k/task-145.6.2-incident-report (layer 12b, above #1825), uncommitted, In Progress; ACs #1-#8 and #10 checked one by one as each was verified (AC #9 checked at plan approval).
+- AC #1: IncidentReport Protocol and get_incident_report (lru_cache) in core/api.py; GoogleDocsIncidentReport and InMemoryIncidentReport; test_incident_core_report_protocol_parity.py runs one suite on both (create names a Google reference under the configured tenant with its Docs link, sections read back in order, unknown report NOT_FOUND, another system UNSUPPORTED_OPERATION, empty draft copy fails, link is the stored url).
+- AC #2: the Drive functions use the gateway's get_drive_service(scopes=...) with the provider's query, pageSize 100, supportsAllDrives, includeItemsFromAllDrives, corpora user and list_next paging; the provider's google_drive_operation_failed log is kept beside the incident events; an unclassified status still raises. The three infrastructure.drive ignore entries are deleted (lint-imports 13 kept). TASK-120 AC #2 lands here.
+- AC #3: test_incident_core_report_no_delegation.py: every report operation and Drive function calls the factories with scopes only; no core adapter imports google.auth or google.oauth2.
+- AC #4 / #10: scribe ports.py, providers.py and adapters/ deleted; service takes the IncidentStore and ConversationReference, resolves with find_incident_for_conversation and drafts from incident.report; draft_incident_document takes the ReportReference and an IncidentReport (default get_incident_report). rg finds no IncidentReportLinkLookup, IncidentDocumentStore, _DOC_ID_PATTERN or scribe adapters in app/.
+- AC #5: scribe declares incident_core.folder_id and incident_core.report_template_id; test_incident_scribe_requirements_report_ids.py (one plugin_boot_failed naming the empty key). Step 7 (TASK-184 OQ1): the CI configuration check builds the [incident_core] slice as the configuration phase does, and fails production when either id is missing from terraform/ssm.tf (both are there today).
+- AC #6: replies unchanged (not-an-incident and no-report both answer the existing no_document text); legacy declare and recreate call the module functions with the same signatures and return shapes. Log events: the two bookmark-lookup events (incident_draft_bookmarks_fetch_failed, incident_draft_bookmark_link_invalid) go with the lookup (C3); new events only on new failure paths (incident_draft_incident_lookup_failed, incident_report_system_unsupported). No terraform metric filter reads any of them.
+- AC #8: create_from_template copies report_template_id into folder_id (test_incident_core_report_create.py); empty id or no Google tenant is CONFIG_NOT_CONFIGURED naming incident_core.folder_id, incident_core.report_template_id or google_workspace.tenant, with no Drive call.
+- Choices within the plan: the section reader and draft writer stay module functions (read_document_sections returns an OperationResult so the adapter passes the classified status on; write_draft_document unchanged), so the section-writer tests stay as pinned; the new report's tenant is read at call time from the Google Workspace entry (the value the configured-systems read reports), keeping get_incident_report() argument-free as planned. Size: ~440 production lines changed incl. ~120 lines dedented from methods to functions and the 140-line fake; 12 production files plus 3 deleted.
+- Gates: ruff OK; make check-import-contracts 13 kept, 0 broken; make check-settings-key-ownership OK; mypy 41 errors in 14 files (pre-existing, none in touched files; a first run found 6 in my generic helpers, fixed); pytest tests --ignore=tests/smoke 6316 passed (a first run found the fake's literal '404' error code unregistered, fixed).
+- Merge: no terraform, IAM, SSM or env change, so no deploy-checks. Production SSM already holds INCIDENT_CORE__FOLDER_ID and INCIDENT_CORE__REPORT_TEMPLATE_ID: if either is empty the bot stops at boot naming it (the plugin requirement). Confirm both are non-empty before merge.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -120,6 +132,22 @@ created: 2026-11-05T01:03:00Z
 ---
 
 2026-11-05 full plan, proposed: corrections C1 (status text and timeline entry join with 145.8/145.9), C2 (no placement on the Protocol; legacy filing unchanged), C3 (the report from the record and IncidentReportLinkLookup deletion move here from 145.6.3), C4 (new host task: requirements resolve a feature's own settings table; AC #6 waits on it). AC #4 (product-folder placement) replaced by the new AC on folder_id (renumbered), AC for the D1 count added. Awaiting approval.
+
+---
+
+created: 2026-11-05T15:45:00Z
+
+---
+
+2026-11-05 (12a, TASK-145.6.1): step 1's type move is done. DocumentSection, SectionDraft, DocumentField and DraftWriteResult now live in core/domain.py and are exported by core/api.py; scribe ports.py and service.py import them from core.api. 12a needed the move because the section writer is now in core, and core may not import scribe (incident-umbrella contract). In 12b, step 1 only adds the Protocol and the provider. Scope drops by about 4 lines; file count unchanged (core/domain.py and scribe/domain.py are no longer touched; core/api.py still is).
+
+---
+
+created: 2026-11-05T15:54:00Z
+
+---
+
+2026-11-05 (human): write_draft_copy keeps its planned signature (drafts, fields, links) here. TASK-145.11 (step 3a, AC #6) changes it to a neutral block body plus a template profile when the draft rules leave the adapter for postmortem. One consumer, so the change is local, and 12b's scope is unchanged.
 
 ---
 <!-- COMMENTS:END -->
