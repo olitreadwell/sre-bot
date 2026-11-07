@@ -32,16 +32,18 @@ app/features/<feature>/
 ├── api.py             # capabilities only: public Protocol, domain types, provider function
 ├── hookspecs.py       # capabilities only: the extension points it owns (optional)
 ├── service.py         # business logic; the only orchestrator
-├── domain.py          # frozen dataclasses, enums, invariants (optional)
+├── interfaces.py      # the Protocols service.py depends on, implemented in adapters/ (optional)
+├── domain.py          # frozen dataclasses, enums, invariants and pure rules over them (optional)
 ├── schemas.py         # Pydantic models at trust boundaries (optional)
 ├── store.py           # persistence through the records contract (optional)
 ├── providers.py       # local wiring: builds services from registry-provided contracts (optional)
+├── plugin.py          # the hookimpls, when the host reads the package's settings before plugins load; the entry point names it (optional)
 ├── adapters/          # Path B adapters: the ONLY files importing app.integrations
 ├── entrypoints/       # inbound handlers: slack.py, teams.py, http.py for the package's API
 └── locales/           # EN/FR catalogues (see i18n.md)
 ```
 
-A package's `__init__.py` declares each vendor or capability it cannot run without in a `register_requirements` hookimpl that returns `Requirement` values, and declares none it uses optionally ([plugins.md](plugins.md)); the generator's template includes the hook, returning an empty list. A package generator creates new packages in this shape. A CI shape check rejects any top-level name outside the table; the table grows by amending this record. A complex feature holds subdomains, each shaped like the table above.
+A package's `__init__.py` declares each vendor or capability it cannot run without in a `register_requirements` hookimpl that returns `Requirement` values, and declares none it uses optionally ([plugins.md](plugins.md)); the generator's template includes the hook, returning an empty list. `service.py` and `domain.py` may each grow into a package of the same name (`service/`, `domain/`) when one module no longer reads well, as Django lets `models.py` become `models/`; nothing else gains a sibling module. A `service/` package holds one module per use case, named in the domain's words as rule 2 names subdomains (`incident/comms`: `draft`, `form`, `approval`, `publication`, `history`), and keeps the helpers they share private inside it; its `__init__.py` re-exports nothing. A pure rule several adapters or surfaces apply, such as rendering a status update through a comms profile, lives in `domain.py`, never inside one adapter: adapters do not import each other. A package generator (`make new-package`) creates new packages in this shape. A CI shape check rejects any top-level name outside the table; the table grows by amending this record. A complex feature holds subdomains, each shaped like the table above.
 
 ### Complex features: an umbrella directory, never a flat prefix
 
@@ -89,7 +91,7 @@ A handler (any platform) does five things and nothing else: receive the platform
 
 ## Consequences
 
-- A new contributor runs the generator and is productive in an afternoon; that is this record's success criterion. For a complex feature, the reference is `access/`.
+- A new contributor runs the generator (`make new-package`, `bin/new_package.py`, templates in `bin/package_templates/`) and is productive in an afternoon; that is this record's success criterion. For a complex feature, the reference is `access/`.
 - Features and capabilities share one shape, so moving a need from a feature into a capability changes paths and imports, not structure.
 - Subdomains stay small: a handler, a service and little else. Adapters, wiring and the record are written once per feature, in `core/`.
 - Cost, accepted: every current package moves and renames `platforms/` and `interactions/` to `entrypoints/`. These are import-path and entry-point-name changes with no runtime surface change.
@@ -98,9 +100,9 @@ A handler (any platform) does five things and nothing else: receive the platform
 
 ## Checks
 
-- CI shape check: every package under `features/` and `capabilities/` uses only names from the layout table.
+- CI shape check (`bin/check_package_shape.py`, `make check-package-shape`; known violations in `bin/baselines/package_shape.txt`, each naming the task that removes it): every package under `features/` and `capabilities/` uses only names from the layout table; `plugin.py` only where an entry point names it.
 - import-linter `independence` across `features/`; `integrations` imported only under `adapters/`; no package imports `infrastructure` or `server` ([plugin-architecture.md](plugin-architecture.md)).
-- Umbrella `__init__.py` files are empty and have no entry point; every subdomain entry-point name is `<feature>.<subdomain>` (grep and review).
+- CI shape check: umbrella `__init__.py` files are empty and have no entry point; every subdomain entry-point name is `<feature>.<subdomain>`.
 - Each umbrella has an import-linter `layers` contract with `containers = ["features.<feature>"]`, subdomains as pipe-separated independent siblings above `core` (when present) above `common`, and `exhaustive = true`, so an undeclared subdirectory fails CI.
 - CI shape check: an umbrella's `core/` has no `entrypoints/`, no hookimpls and no entry point; `common/` imports no `adapters/`, store or provider module.
 - Subdomains import `core/` only through `core/api.py` (an import-linter `forbidden` contract on `core`'s other modules; review until it exists).
@@ -132,3 +134,7 @@ Tolerated until then:
 - 2026-10-13: the storage contract is the records contract (`RecordStore`, TASK-27.4).
 - 2026-10-29: a package states the vendors and capabilities it requires in a `register_requirements` hookimpl, per plugins.md; the generator template includes it (TASK-172).
 - 2026-10-29: `register_requirements` returns `Requirement` declarations the host resolves, per plugins.md (TASK-175 planning); the generator template returns an empty list.
+- 2026-11-06: the layout table gains `interfaces.py` (a package's own Protocols; `ports.py` was the drift) and `plugin.py` (per plugins.md 2026-11-04); `service.py` and `domain.py` may grow into packages; the shape check (TASK-114.1) also enforces the umbrella and dotted-name rules, with a ratcheting baseline (TASK-114 planning, human).
+- 2026-11-06: the generator (`make new-package`) creates a feature, capability, umbrella, subdomain, `core/` or `common/` in this shape, with its entry point, protected-plugins and independence or umbrella contract entries and its enablement key; a capability takes its classification and at least one existing feature consumer, so it passes the shape check from the start (TASK-114.2).
+- 2026-11-06: `make new-package ARGS="promote <feature> --subdomain <name>"` turns a flat feature into an umbrella in place, keeping its name: its code becomes the first subdomain, `settings.py` moves to `common/` with its table and environment names unchanged, references are rewritten, and the entry point and enablement keys become `<feature>.<subdomain>`; generated `core/` and `common/` get a README (TASK-114.2).
+- 2026-11-06: a `service/` package splits one module per use case in the domain's words with private shared helpers and no re-exports; `domain.py` also holds pure rules over its types, and a pure rule several adapters apply lives there, never in one adapter (TASK-186, which reshaped `incident/comms` into the table and removed its package-shape baseline entries).
