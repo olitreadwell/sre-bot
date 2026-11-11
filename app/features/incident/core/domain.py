@@ -1,7 +1,7 @@
 """Domain types every incident subdomain works on."""
 
-from dataclasses import dataclass, fields
-from datetime import datetime
+from dataclasses import dataclass, field, fields
+from datetime import date, datetime
 from enum import StrEnum
 
 from contracts.workplace import WorkplaceSystem
@@ -188,6 +188,24 @@ class ReportReference(ResourceReference):
 
 
 @dataclass(frozen=True)
+class ReportPlacement(ResourceReference):
+    """A labelled folder a new incident report can be filed in (a Drive folder for Google).
+
+    Read live from the report system, never stored on the record: the record
+    keeps only the created report's ``ReportReference``.
+
+    Attributes:
+        label: The folder's name as people choose it.
+    """
+
+    label: str = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _require_text(self, "label")
+
+
+@dataclass(frozen=True)
 class VideoCallReference(ResourceReference):
     """The incident video call."""
 
@@ -203,8 +221,26 @@ class ExternalCaseReference(ResourceReference):
 
 
 @dataclass(frozen=True)
-class SourceAlertReference(ResourceReference):
-    """The alert the incident was declared from."""
+class MessageReference:
+    """A message in a conversation: the alert an incident was declared from, or a captured timeline message.
+
+    Attributes:
+        system: The workplace system that holds the message.
+        tenant: The vendor's own tenant id.
+        conversation_id: The conversation the message was posted in.
+        message_id: The message's id in that conversation (a Slack ``ts``).
+        url: The vendor link to the message, a hint only.
+    """
+
+    system: WorkplaceSystem
+    tenant: str
+    conversation_id: str
+    message_id: str
+    url: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_system(self.system)
+        _require_text(self, "tenant", "conversation_id", "message_id")
 
 
 @dataclass(frozen=True)
@@ -234,7 +270,7 @@ class Incident:
         video_call: The incident video call.
         postmortem_meeting: The postmortem meeting.
         external_case: The external case.
-        source_alert: The alert it was declared from.
+        source_alert: The alert message it was declared from.
 
     Role fields are named by ``IncidentRole`` values. Every time is
     timezone-aware.
@@ -261,7 +297,7 @@ class Incident:
     video_call: VideoCallReference | None = None
     postmortem_meeting: PostmortemMeetingReference | None = None
     external_case: ExternalCaseReference | None = None
-    source_alert: SourceAlertReference | None = None
+    source_alert: MessageReference | None = None
 
     def __post_init__(self) -> None:
         _require_text(self, "id", "title")
@@ -274,25 +310,17 @@ class Incident:
         _require_aware(self, *(field.name for field in fields(self) if field.name.endswith("_at")))
 
 
-@dataclass(frozen=True)
-class MessageReference:
-    """The message a timeline entry was captured from.
+class ReferenceKind(StrEnum):
+    """A resource reference ``set_reference`` replaces after declare; the value is the record field and stored attribute.
 
-    Attributes:
-        system: The workplace system that holds the message.
-        tenant: The vendor's own tenant id.
-        conversation_id: The conversation the message was posted in.
-        message_id: The message's id in that conversation (a Slack ``ts``).
+    The conversation and the source alert are set only when the incident is
+    created: a recreated channel never moves the record's conversation.
     """
 
-    system: WorkplaceSystem
-    tenant: str
-    conversation_id: str
-    message_id: str
-
-    def __post_init__(self) -> None:
-        _require_system(self.system)
-        _require_text(self, "tenant", "conversation_id", "message_id")
+    REPORT = "report"
+    VIDEO_CALL = "video_call"
+    POSTMORTEM_MEETING = "postmortem_meeting"
+    EXTERNAL_CASE = "external_case"
 
 
 class BindingKind(StrEnum):
@@ -429,3 +457,56 @@ class DraftWriteResult:
 
     document_id: str
     created: bool
+
+
+CONVERSATION_NAME_ATTEMPTS = 5
+"""How many names declare and recreate try for one incident's conversation: the first, then attempts 2 to 5."""
+
+
+@dataclass(frozen=True)
+class ConversationName:
+    """The name an incident's conversation is created under, before a chat platform renders it.
+
+    The incident's naming policy, platform-neutral: ``incident-`` (``incident-dev-``
+    outside production), the opening date, the title, and from the second attempt a
+    ``-<attempt>`` suffix. Each conversation adapter renders it under its own
+    platform's rules (length, allowed characters, case) in ``core/adapters/``.
+
+    Attributes:
+        title: The incident title, as declared.
+        opened_on: The day the incident opened.
+        production: Whether this instance is production.
+        attempt: Which candidate this is, 1 to ``CONVERSATION_NAME_ATTEMPTS``.
+    """
+
+    title: str
+    opened_on: date
+    production: bool
+    attempt: int = 1
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.attempt <= CONVERSATION_NAME_ATTEMPTS:
+            raise ValueError(f"attempt must be 1 to {CONVERSATION_NAME_ATTEMPTS}, got {self.attempt}")
+
+    @property
+    def prefix(self) -> str:
+        """``incident-`` in production, ``incident-dev-`` elsewhere, followed by the opening date."""
+        return f"{'incident-' if self.production else 'incident-dev-'}{self.opened_on.isoformat()}"
+
+    @property
+    def suffix(self) -> str:
+        """Empty for the first attempt, ``-<attempt>`` after it."""
+        return "" if self.attempt == 1 else f"-{self.attempt}"
+
+
+def incident_conversation_names(title: str, opened_on: date, *, production: bool) -> tuple[ConversationName, ...]:
+    """Return the names to try, in order, for an incident's conversation.
+
+    Which one an incident ends up with, and when an existing conversation is its
+    own, is the caller's decision (decisions/incident-management.md, one
+    conversation per incident).
+    """
+    return tuple(
+        ConversationName(title=title, opened_on=opened_on, production=production, attempt=attempt)
+        for attempt in range(1, CONVERSATION_NAME_ATTEMPTS + 1)
+    )

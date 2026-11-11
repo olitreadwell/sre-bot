@@ -17,6 +17,10 @@ reporting an ``UpgradeReport``) from the services its job resolves per run.
 (``ConversationReference``); ``get_incident_conversation`` provides the Slack one,
 and ``conversation_is_writable`` is the check every caller applies before a write.
 ``IncidentTranscriptReader`` reads what was said in a conversation.
+``VideoCall`` creates the incident's video call (``VideoCallReference``);
+``get_video_call`` provides the Google Meet one.
+``resolve_new_incident_system`` resolves the new-incident policy against the
+configured systems; the declare path's plugin calls it at startup.
 """
 
 from collections.abc import Mapping, Sequence
@@ -24,16 +28,20 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Protocol, runtime_checkable
 
+from contracts.configuration import SettingError
 from contracts.operations.result import OperationResult
 from contracts.records import RecordStore
-from contracts.workplace import ConfiguredSystems, TenantVerifier
+from contracts.workplace import ConfiguredSystems, TenantVerifier, WorkplaceSystem
 from features.incident.common.settings import IncidentCoreSettings
 from features.incident.common.vocabulary import StatusUpdateStage
 from features.incident.core.adapters.google_docs import GoogleDocsIncidentReport
+from features.incident.core.adapters.google_meet import GoogleMeetVideoCall
 from features.incident.core.adapters.i18n import translate
 from features.incident.core.adapters.slack import build_incident_conversation, build_incident_transcript_reader
 from features.incident.core.domain import (
+    CONVERSATION_NAME_ATTEMPTS,
     BindingKind,
+    ConversationName,
     ConversationReference,
     DocumentField,
     DocumentSection,
@@ -43,9 +51,10 @@ from features.incident.core.domain import (
     IncidentBinding,
     MessageReference,
     PostmortemMeetingReference,
+    ReferenceKind,
+    ReportPlacement,
     ReportReference,
     SectionDraft,
-    SourceAlertReference,
     StatusUpdate,
     StatusUpdateOrigin,
     StatusUpdateState,
@@ -53,6 +62,7 @@ from features.incident.core.domain import (
     TimelineEntry,
     TranscriptMessage,
     VideoCallReference,
+    incident_conversation_names,
 )
 from features.incident.core.legacy_upgrade import LegacyUpgrade, UpgradeReport
 from features.incident.core.store import (
@@ -66,7 +76,9 @@ from features.incident.core.store import (
 )
 
 __all__ = [
+    "CONVERSATION_NAME_ATTEMPTS",
     "BindingKind",
+    "ConversationName",
     "ConversationReference",
     "DocumentField",
     "DocumentSection",
@@ -81,9 +93,10 @@ __all__ = [
     "LegacyUpgrade",
     "MessageReference",
     "PostmortemMeetingReference",
+    "ReferenceKind",
+    "ReportPlacement",
     "ReportReference",
     "SectionDraft",
-    "SourceAlertReference",
     "StatusUpdate",
     "StatusUpdateOrigin",
     "StatusUpdateStage",
@@ -93,6 +106,7 @@ __all__ = [
     "TimelineEntry",
     "TranscriptMessage",
     "UpgradeReport",
+    "VideoCall",
     "VideoCallReference",
     "build_incident_store",
     "build_legacy_upgrade",
@@ -102,6 +116,9 @@ __all__ = [
     "get_incident_conversation",
     "get_incident_report",
     "get_incident_transcript_reader",
+    "get_video_call",
+    "incident_conversation_names",
+    "resolve_new_incident_system",
     "translate",
 ]
 
@@ -162,12 +179,57 @@ class IncidentConversation(Protocol):
     not a member, read-only) refuses writes with ``CONVERSATION_NOT_WRITABLE``;
     other platform failures are classified results, and an error the platform's
     table does not name raises. Writes are not replayed after a failure that
-    may have been applied. Creating a conversation is not part of the interface
-    yet: it arrives with declare's first working-surface binding.
+    may have been applied.
+
+    ``create`` makes one attempt under the name it is given, rendered under the
+    platform's own naming rules, and reports a taken name as an expected
+    outcome; ``find_own`` finds the bot's own conversation of a name. Choosing
+    the next name, and deciding that an existing
+    conversation is the incident's own, belong to the caller
+    (decisions/incident-management.md, one conversation per incident).
     """
 
-    async def post(self, conversation: ConversationReference, text: str) -> OperationResult[MessageReference]:
-        """Post ``text`` as the bot and return the posted message's reference."""
+    async def create(self, name: ConversationName, *, private: bool) -> OperationResult[ConversationReference]:
+        """Create a conversation named after ``name``, the bot its first member, private when ``private``.
+
+        A name already in use (by any conversation, archived ones included) is a
+        PERMANENT_ERROR with ``CONVERSATION_NAME_TAKEN``, logged at info only: the
+        caller tries its next name. Platform refusals to create are
+        ``CONVERSATION_NOT_WRITABLE``; no configured tenant is
+        ``CONFIG_NOT_CONFIGURED``. The call is never replayed.
+        """
+        ...
+
+    async def find_own(self, name: ConversationName) -> OperationResult[ConversationReference | None]:
+        """Return the bot's own open conversation named exactly as ``name`` renders, or ``None``.
+
+        Run after a create that did not succeed, before trying another name: the
+        platform may have created the conversation before the failure.
+        """
+        ...
+
+    async def post(
+        self, conversation: ConversationReference, text: str, *, blocks: Sequence[Mapping[str, object]] = ()
+    ) -> OperationResult[MessageReference]:
+        """Post ``text`` as the bot and return the posted message's reference.
+
+        ``blocks`` lays the message out; ``text`` stays its notification fallback.
+        """
+        ...
+
+    async def set_topic(self, conversation: ConversationReference, text: str) -> OperationResult[None]:
+        """Set the conversation's topic to ``text``."""
+        ...
+
+    async def create_canvas(self, conversation: ConversationReference, markdown: str) -> OperationResult[None]:
+        """Give the conversation its canvas, written from ``markdown``; a conversation that has one counts as done."""
+        ...
+
+    async def group_members(self, conversation: ConversationReference, group_id: str) -> OperationResult[tuple[str, ...]]:
+        """Return the account ids in the user group ``group_id``, in the conversation's system and tenant.
+
+        The ids are ready for ``invite``; an unknown group is NOT_FOUND.
+        """
         ...
 
     async def set_purpose(self, conversation: ConversationReference, text: str) -> OperationResult[None]:
@@ -206,13 +268,23 @@ class IncidentReport(Protocol):
     exceptions.
     """
 
-    def create_from_template(self, title: str) -> OperationResult[ReportReference]:
-        """Create a new report titled ``title`` from the configured template, filed in the configured folder.
+    def list_placements(self) -> OperationResult[tuple[ReportPlacement, ...]]:
+        """Return the places a new report can be filed in, sorted by label.
 
-        Returns the new report's reference, link included. An empty
-        [incident_core] ``folder_id`` or ``report_template_id``, or no tenant to
-        name the reference with, is a PERMANENT_ERROR with ``CONFIG_NOT_CONFIGURED``
-        whose message names the key.
+        For Google, the subfolders of [incident_core] ``folder_id`` other than the
+        templates folder, read live. An empty ``folder_id`` is
+        ``CONFIG_NOT_CONFIGURED``; a failed read is a classified result.
+        """
+        ...
+
+    def create_from_template(self, title: str, placement: ReportPlacement | None = None) -> OperationResult[ReportReference]:
+        """Create a new report titled ``title`` from the configured template, filed in ``placement``.
+
+        No placement files it in the configured folder. Returns the new report's
+        reference, link included. An empty [incident_core] ``folder_id`` or
+        ``report_template_id``, or no tenant to name the reference with, is a
+        PERMANENT_ERROR with ``CONFIG_NOT_CONFIGURED`` whose message names the key;
+        a placement of another system is ``UNSUPPORTED_OPERATION``.
         """
         ...
 
@@ -280,8 +352,8 @@ def build_legacy_upgrade(
     """Return the incident legacy upgrade over the resolved ``RecordStore``.
 
     A plain function, called by the upgrade job inside its service scope with the
-    services it resolved there. The table name and the whole-table read cap come
-    from the incident core settings; the tenants are copied from the
+    services it resolved there. The incidents and bindings table names and the
+    whole-table read cap come from the incident core settings; the tenants are copied from the
     configured-systems read, as for the read path's bridge, and the verifier
     confirms the Slack one before any write.
     """
@@ -291,6 +363,7 @@ def build_legacy_upgrade(
         dict(systems.tenants()),
         verifier,
         settings.full_read_max_items,
+        bindings=bindings_table(settings.bindings_table),
     )
 
 
@@ -298,6 +371,37 @@ def build_legacy_upgrade(
 def get_incident_report() -> IncidentReport:
     """Return the process-wide Google-Docs-backed ``IncidentReport``."""
     return GoogleDocsIncidentReport()
+
+
+@runtime_checkable
+class VideoCall(Protocol):
+    """Interface creating an incident's video call, named by the record's ``VideoCallReference``.
+
+    Who the calls run as and how the vendor is reached stay behind the interface;
+    no method takes a delegation subject or credentials. ``create`` is async: an
+    implementation over a blocking SDK offloads inside its own methods, callers
+    never do (decisions/outbound-clients.md). Platform failures are classified
+    results, never exceptions.
+    """
+
+    async def create(self) -> OperationResult[VideoCallReference]:
+        """Create a new video call and return its reference, link included.
+
+        One attempt: the vendor offers no idempotency key, so a failed create is
+        not retried behind the caller. No tenant to name the reference with is a
+        PERMANENT_ERROR with ``CONFIG_NOT_CONFIGURED`` whose message names the key.
+        """
+        ...
+
+    def link(self, call: VideoCallReference) -> str | None:
+        """Return the stored link of the call; a reference of a system the implementation does not serve has none."""
+        ...
+
+
+@lru_cache(maxsize=1)
+def get_video_call() -> VideoCall:
+    """Return the process-wide Google-Meet-backed ``VideoCall``."""
+    return GoogleMeetVideoCall()
 
 
 @lru_cache(maxsize=1)
@@ -310,6 +414,33 @@ def get_incident_conversation() -> IncidentConversation:
 def get_incident_transcript_reader() -> IncidentTranscriptReader:
     """Return the process-wide Slack-backed ``IncidentTranscriptReader``."""
     return build_incident_transcript_reader()
+
+
+NEW_INCIDENT_SYSTEM_SETTING = "incident_core.new_incident_system"
+
+
+def resolve_new_incident_system(policy: WorkplaceSystem | None, systems: ConfiguredSystems) -> WorkplaceSystem:
+    """Return the system that creates a new incident's report and video call (decisions/incident-management.md).
+
+    A set policy resolves to that system when it is configured; an unset policy
+    resolves to the only configured system. No implicit choice is made among
+    several configured systems.
+
+    Raises:
+        SettingError: The named system is not configured, no system is configured,
+            or the policy is unset while several are; it names the policy's setting.
+    """
+    configured = list(systems.tenants())
+    if policy is not None:
+        if policy in configured:
+            return policy
+        raise SettingError(NEW_INCIDENT_SYSTEM_SETTING, f"names {policy.value}, which is not configured")
+    if len(configured) == 1:
+        return configured[0]
+    if not configured:
+        raise SettingError(NEW_INCIDENT_SYSTEM_SETTING, "no workplace system is configured")
+    names = ", ".join(sorted(system.value for system in configured))
+    raise SettingError(NEW_INCIDENT_SYSTEM_SETTING, f"is unset while several systems are configured ({names}); name one")
 
 
 def find_incident_for_conversation(store: IncidentStore, conversation: ConversationReference) -> OperationResult[Incident]:

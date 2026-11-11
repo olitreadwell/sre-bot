@@ -9,19 +9,22 @@ found, empty document ids refused naming the key, no draft copy without content)
 ``InMemoryIncidentConversation``: the ``SlackIncidentConversation`` rules (Slack
 references only, unknown conversations not found, archived or non-member
 conversations not writable and refusing writes, repeated archives and empty
-invites succeeding).
+invites succeeding). ``InMemoryVideoCall``: the ``GoogleMeetVideoCall`` rules
+(Google references under the tenant, a link only for Google references).
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from contracts.operations.codes import ErrorCode
 from contracts.operations.result import OperationResult
 from contracts.operations.status import OperationStatus
 from contracts.workplace import WorkplaceSystem
+from features.incident.core.adapters.slack import slack_channel_name
 from features.incident.core.domain import (
     BindingKind,
+    ConversationName,
     ConversationReference,
     DocumentField,
     DocumentSection,
@@ -29,10 +32,14 @@ from features.incident.core.domain import (
     Incident,
     IncidentBinding,
     MessageReference,
+    ReferenceKind,
+    ReportPlacement,
     ReportReference,
+    ResourceReference,
     SectionDraft,
     StatusUpdate,
     StatusUpdateState,
+    VideoCallReference,
 )
 from features.incident.core.store import (
     IncidentStore,
@@ -40,7 +47,11 @@ from features.incident.core.store import (
     ambiguous_conversation,
     no_such_incident,
     not_an_incident,
+    record_conflict,
     select_active_bindings,
+    validate_attachment,
+    validate_new_incident,
+    validate_reference,
 )
 
 
@@ -98,6 +109,8 @@ class InMemoryIncidentStore(IncidentStore):
 
     Open incidents are listed by ``declared_at``, a stand-in for the
     ``opened_at`` time the real store orders by and this fake does not hold.
+    ``create``, ``attach_conversation`` and ``set_reference`` share the real store's
+    validation; the fake holds no record version, so only a different conversation conflicts.
     """
 
     def __init__(self) -> None:
@@ -164,6 +177,66 @@ class InMemoryIncidentStore(IncidentStore):
         incident = self._incidents.get(incident_id)
         return OperationResult.success(data=incident.security_incident) if incident is not None else no_such_incident()
 
+    def create(self, incident: Incident) -> OperationResult[Incident]:
+        """Store the incident; a stored incident under the id is a replay that changes nothing.
+
+        Raises:
+            ValueError: see ``IncidentStore.create``.
+        """
+        validate_new_incident(incident)
+        stored = self._incidents.get(incident.id)
+        if stored is not None:
+            return OperationResult.success(data=stored)
+        self.seed(incident)
+        return OperationResult.success(data=incident)
+
+    def attach_conversation(self, incident_id: str, binding: IncidentBinding) -> OperationResult[Incident]:
+        """Store the binding and, for a primary one, make its conversation the incident's.
+
+        Raises:
+            ValueError: see ``IncidentStore.attach_conversation``.
+        """
+        validate_attachment(incident_id, binding)
+        stored = self._incidents.get(incident_id)
+        if stored is None:
+            return no_such_incident()
+        conversation = ConversationReference(
+            system=binding.system, tenant=binding.tenant, vendor_id=binding.vendor_id, url=binding.url
+        )
+        current = stored.conversation
+        if (
+            binding.primary
+            and current is not None
+            and (current.system, current.tenant, current.vendor_id)
+            != (
+                conversation.system,
+                conversation.tenant,
+                conversation.vendor_id,
+            )
+        ):
+            return record_conflict()
+        self.bind(binding)
+        if binding.primary and current is None:
+            stored = replace(stored, conversation=conversation)
+            self._incidents[incident_id] = stored
+        return OperationResult.success(data=stored)
+
+    def set_reference(self, incident_id: str, kind: ReferenceKind, reference: ResourceReference) -> OperationResult[Incident]:
+        """Replace the incident's reference of ``kind``.
+
+        Raises:
+            ValueError: see ``IncidentStore.set_reference``.
+        """
+        validate_reference(kind, reference)
+        stored = self._incidents.get(incident_id)
+        if stored is None:
+            return no_such_incident()
+        # The field is chosen at runtime; validate_reference has checked its type.
+        changes: dict[str, Any] = {kind.value: reference}
+        updated = replace(stored, **changes)
+        self._incidents[incident_id] = updated
+        return OperationResult.success(data=updated)
+
 
 @dataclass
 class _StoredReport:
@@ -189,6 +262,8 @@ class InMemoryIncidentReport:
     Built with the Google tenant and the [incident_core] document ids it stands in
     for. ``next_ids`` fixes the ids of the reports it creates, in order; past them
     ids are ``report-<n>``. ``seed_sections`` makes an existing report known.
+    ``placements`` are the (folder id, label) pairs ``list_placements`` returns,
+    sorted by label.
     """
 
     def __init__(
@@ -198,8 +273,10 @@ class InMemoryIncidentReport:
         folder_id: str = "F0INCIDENTS",
         report_template_id: str = "T0TEMPLATE",
         next_ids: Sequence[str] = (),
+        placements: Sequence[tuple[str, str]] = (),
     ) -> None:
         self._tenant = tenant
+        self._placements = tuple(placements)
         self._folder_id = folder_id
         self._report_template_id = report_template_id
         self._next_ids = list(next_ids)
@@ -220,14 +297,35 @@ class InMemoryIncidentReport:
         """Return the placeholder values applied to ``report`` so far."""
         return dict(self._reports[report.vendor_id].placeholders)
 
-    def create_from_template(self, title: str) -> OperationResult[ReportReference]:
-        """Create a known report filed in the configured folder; an empty document id refuses naming its key."""
+    def list_placements(self) -> OperationResult[tuple[ReportPlacement, ...]]:
+        """Return the seeded placements sorted by label; no incident folder refuses naming its key."""
+        if not self._folder_id:
+            return _report_not_configured("incident_core.folder_id")
+        placements = (
+            ReportPlacement(
+                system=WorkplaceSystem.GOOGLE,
+                tenant=self._tenant,
+                vendor_id=folder_id,
+                url=f"https://drive.google.com/drive/folders/{folder_id}",
+                label=label,
+            )
+            for folder_id, label in self._placements
+        )
+        return OperationResult.success(tuple(sorted(placements, key=lambda placement: placement.label)))
+
+    def create_from_template(self, title: str, placement: ReportPlacement | None = None) -> OperationResult[ReportReference]:
+        """Create a known report filed in ``placement`` or the configured folder; an empty document id refuses naming its key."""
+        if placement is not None and placement.system is not WorkplaceSystem.GOOGLE:
+            return OperationResult.permanent_error(
+                f"Google Docs cannot file a report on {placement.system.value}", ErrorCode.UNSUPPORTED_OPERATION
+            )
         if not self._folder_id:
             return _report_not_configured("incident_core.folder_id")
         if not self._report_template_id:
             return _report_not_configured("incident_core.report_template_id")
         document_id = self._next_ids.pop(0) if self._next_ids else f"report-{len(self._reports) + 1}"
-        self._reports[document_id] = _StoredReport(title=title, folder_id=self._folder_id)
+        folder_id = placement.vendor_id if placement is not None else self._folder_id
+        self._reports[document_id] = _StoredReport(title=title, folder_id=folder_id)
         return OperationResult.success(
             data=ReportReference(
                 system=WorkplaceSystem.GOOGLE,
@@ -304,6 +402,10 @@ class _StoredConversation:
     posts: list[str] = field(default_factory=list)
     bookmarks: list[tuple[str, str]] = field(default_factory=list)
     invited: list[str] = field(default_factory=list)
+    topic: str | None = None
+    canvas: str | None = None
+    private: bool = False
+    blocks: list[tuple[Mapping[str, object], ...]] = field(default_factory=list)
 
 
 class InMemoryIncidentConversation:
@@ -313,6 +415,13 @@ class InMemoryIncidentConversation:
     non-member conversations; any other id is not found. Posts get ``ts`` values
     ``1700000000.00000<n>`` in order. ``checked`` lists the conversations whose
     writability was asked.
+
+    ``names`` names some of those conversations (Slack channel name to id) and
+    ``foreign_names`` are names the bot cannot see; creating under any of them is
+    ``CONVERSATION_NAME_TAKEN``. A ``ConversationName`` is rendered with the Slack
+    adapter's ``slack_channel_name``, the platform this fake stands in for. A created conversation is open, the bot a member,
+    with id ``C0NEW<n>``. ``find_own`` finds named conversations that are open and
+    where the bot is a member. ``groups`` maps a user group id to its members.
     """
 
     def __init__(
@@ -322,6 +431,9 @@ class InMemoryIncidentConversation:
         open_ids: Sequence[str] = (),
         archived_ids: Sequence[str] = (),
         non_member_ids: Sequence[str] = (),
+        names: Mapping[str, str] | None = None,
+        foreign_names: Sequence[str] = (),
+        groups: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._tenant = tenant
         self._conversations: dict[str, _StoredConversation] = {}
@@ -332,7 +444,50 @@ class InMemoryIncidentConversation:
         for vendor_id in non_member_ids:
             self._conversations[vendor_id] = _StoredConversation(archived=False, member=False)
         self._posted = 0
+        self._created = 0
+        self._names = dict(names or {})
+        self._foreign_names = frozenset(foreign_names)
+        self._groups = {group_id: tuple(members) for group_id, members in (groups or {}).items()}
         self.checked: list[ConversationReference] = []
+
+    def topic_of(self, conversation: ConversationReference) -> str | None:
+        """Return the topic last set on ``conversation``."""
+        return self._conversations[conversation.vendor_id].topic
+
+    def canvas_of(self, conversation: ConversationReference) -> str | None:
+        """Return the markdown ``conversation``'s canvas was created from."""
+        return self._conversations[conversation.vendor_id].canvas
+
+    def is_private(self, conversation: ConversationReference) -> bool:
+        """Say whether ``conversation`` was created private."""
+        return self._conversations[conversation.vendor_id].private
+
+    def blocks_in(self, conversation: ConversationReference) -> Sequence[tuple[Mapping[str, object], ...]]:
+        """Return the blocks of each post to ``conversation``, in order (empty for a text-only post)."""
+        return tuple(self._conversations[conversation.vendor_id].blocks)
+
+    async def create(self, name: ConversationName, *, private: bool) -> OperationResult[ConversationReference]:
+        """Create an open conversation the bot belongs to; a name in use is ``CONVERSATION_NAME_TAKEN``."""
+        channel_name = slack_channel_name(name)
+        if channel_name in self._names or channel_name in self._foreign_names:
+            return OperationResult.permanent_error(f"Slack channel name taken: {channel_name}", ErrorCode.CONVERSATION_NAME_TAKEN)
+        self._created += 1
+        vendor_id = f"C0NEW{self._created}"
+        self._conversations[vendor_id] = _StoredConversation(archived=False, member=True, private=private)
+        self._names[channel_name] = vendor_id
+        return OperationResult.success(
+            ConversationReference(system=WorkplaceSystem.SLACK, tenant=self._tenant, vendor_id=vendor_id)
+        )
+
+    async def find_own(self, name: ConversationName) -> OperationResult[ConversationReference | None]:
+        """Return the open conversation named as ``name`` renders where the bot is a member, or ``None``."""
+        vendor_id = self._names.get(slack_channel_name(name))
+        stored = self._conversations.get(vendor_id) if vendor_id is not None else None
+        if vendor_id is None or stored is None or stored.archived or not stored.member:
+            return OperationResult.success(None)
+        return OperationResult.success(
+            ConversationReference(system=WorkplaceSystem.SLACK, tenant=self._tenant, vendor_id=vendor_id)
+        )
 
     def posts_in(self, conversation: ConversationReference) -> Sequence[str]:
         """Return the texts posted to ``conversation``, in order."""
@@ -350,13 +505,16 @@ class InMemoryIncidentConversation:
         """Return the account ids invited to ``conversation``, in order."""
         return tuple(self._conversations[conversation.vendor_id].invited)
 
-    async def post(self, conversation: ConversationReference, text: str) -> OperationResult[MessageReference]:
-        """Record ``text`` and return its reference; refused where the bot cannot write."""
+    async def post(
+        self, conversation: ConversationReference, text: str, *, blocks: Sequence[Mapping[str, object]] = ()
+    ) -> OperationResult[MessageReference]:
+        """Record ``text`` and its blocks and return its reference; refused where the bot cannot write."""
         stored = self._writable(conversation)
         if isinstance(stored, OperationResult):
             return stored
         self._posted += 1
         stored.posts.append(text)
+        stored.blocks.append(tuple(blocks))
         return OperationResult.success(
             MessageReference(
                 system=WorkplaceSystem.SLACK,
@@ -373,6 +531,34 @@ class InMemoryIncidentConversation:
             return stored
         stored.purpose = text
         return OperationResult.success()
+
+    async def set_topic(self, conversation: ConversationReference, text: str) -> OperationResult[None]:
+        """Record the topic; refused where the bot cannot write."""
+        stored = self._writable(conversation)
+        if isinstance(stored, OperationResult):
+            return stored
+        stored.topic = text
+        return OperationResult.success()
+
+    async def create_canvas(self, conversation: ConversationReference, markdown: str) -> OperationResult[None]:
+        """Record the canvas once; a conversation that has one keeps it and succeeds."""
+        stored = self._writable(conversation)
+        if isinstance(stored, OperationResult):
+            return stored
+        if stored.canvas is None:
+            stored.canvas = markdown
+        return OperationResult.success()
+
+    async def group_members(self, conversation: ConversationReference, group_id: str) -> OperationResult[tuple[str, ...]]:
+        """Return the seeded members of ``group_id``; an unknown group is not found."""
+        if conversation.system is not WorkplaceSystem.SLACK:
+            return _conversation_unsupported(conversation)
+        members = self._groups.get(group_id)
+        if members is None:
+            return OperationResult.error(
+                OperationStatus.NOT_FOUND, "Slack user group not found: no_such_subteam", "no_such_subteam"
+            )
+        return OperationResult.success(members)
 
     async def add_bookmark(self, conversation: ConversationReference, title: str, link: str) -> OperationResult[None]:
         """Record the bookmark; refused where the bot cannot write."""
@@ -443,3 +629,34 @@ def _conversation_unsupported[T](conversation: ConversationReference) -> Operati
 
 def _not_writable[T](slack_code: str) -> OperationResult[T]:
     return OperationResult.permanent_error(f"Slack write failed: {slack_code}", ErrorCode.CONVERSATION_NOT_WRITABLE)
+
+
+class InMemoryVideoCall:
+    """Create video calls under the Google tenant it is built with; every created call is recorded.
+
+    Calls are ``spaces/call-<n>`` with a meet.google.com link. ``fail_with`` makes
+    every create return that error result instead.
+    """
+
+    def __init__(self, *, tenant: str = "C0GOOGLE", fail_with: OperationResult[VideoCallReference] | None = None) -> None:
+        self._tenant = tenant
+        self._fail_with = fail_with
+        self.created: list[VideoCallReference] = []
+
+    async def create(self) -> OperationResult[VideoCallReference]:
+        """Return a new Google call reference, or the configured failure."""
+        if self._fail_with is not None:
+            return self._fail_with
+        n = len(self.created) + 1
+        call = VideoCallReference(
+            system=WorkplaceSystem.GOOGLE,
+            tenant=self._tenant,
+            vendor_id=f"spaces/call-{n}",
+            url=f"https://meet.google.com/call-{n}",
+        )
+        self.created.append(call)
+        return OperationResult.success(call)
+
+    def link(self, call: VideoCallReference) -> str | None:
+        """Return the stored link of a Google call; a call of another system has none here."""
+        return call.url if call.system is WorkplaceSystem.GOOGLE else None

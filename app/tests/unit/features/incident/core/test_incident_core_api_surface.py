@@ -17,6 +17,7 @@ from features.incident.common import vocabulary
 from features.incident.core import api
 from features.incident.core.adapters import slack as slack_adapter
 from features.incident.core.adapters.in_memory import InMemoryIncidentStore
+from features.incident.core.domain import ResourceReference
 from tests.factories.incident import incident_on, slack_conversation
 
 pytestmark = pytest.mark.unit
@@ -36,6 +37,8 @@ def test_api_exports_exactly_the_public_names() -> None:
     """Subdomains reach core through these names only; a new export is a deliberate change."""
     assert sorted(api.__all__) == [
         "BindingKind",
+        "CONVERSATION_NAME_ATTEMPTS",
+        "ConversationName",
         "ConversationReference",
         "DocumentField",
         "DocumentSection",
@@ -50,9 +53,10 @@ def test_api_exports_exactly_the_public_names() -> None:
         "LegacyUpgrade",
         "MessageReference",
         "PostmortemMeetingReference",
+        "ReferenceKind",
+        "ReportPlacement",
         "ReportReference",
         "SectionDraft",
-        "SourceAlertReference",
         "StatusUpdate",
         "StatusUpdateOrigin",
         "StatusUpdateStage",
@@ -62,6 +66,7 @@ def test_api_exports_exactly_the_public_names() -> None:
         "TimelineEntry",
         "TranscriptMessage",
         "UpgradeReport",
+        "VideoCall",
         "VideoCallReference",
         "build_incident_store",
         "build_legacy_upgrade",
@@ -71,6 +76,9 @@ def test_api_exports_exactly_the_public_names() -> None:
         "get_incident_conversation",
         "get_incident_report",
         "get_incident_transcript_reader",
+        "get_video_call",
+        "incident_conversation_names",
+        "resolve_new_incident_system",
         "translate",
     ]
     assert all(hasattr(api, name) for name in api.__all__)
@@ -111,13 +119,33 @@ def test_interface_signatures_carry_only_plain_and_domain_types() -> None:
 
 
 def test_conversation_interface_is_async_on_the_reference_with_operation_results() -> None:
-    """Every IncidentConversation method is a coroutine taking the conversation reference; none creates one."""
+    """Every IncidentConversation method is a coroutine; all but create and find_own take the conversation reference."""
     methods = {
         name: getattr(api.IncidentConversation, name)
-        for name in ("post", "set_purpose", "add_bookmark", "invite", "archive", "is_writable")
+        for name in (
+            "post",
+            "set_purpose",
+            "add_bookmark",
+            "invite",
+            "archive",
+            "is_writable",
+            "set_topic",
+            "create_canvas",
+            "group_members",
+        )
     }
 
-    assert not hasattr(api.IncidentConversation, "create")
+    create = inspect.signature(api.IncidentConversation.create)
+    assert inspect.iscoroutinefunction(api.IncidentConversation.create)
+    assert create.parameters["name"].annotation is api.ConversationName
+    assert create.parameters["private"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert create.return_annotation == OperationResult[api.ConversationReference]
+    find_own = inspect.signature(api.IncidentConversation.find_own)
+    assert inspect.iscoroutinefunction(api.IncidentConversation.find_own)
+    assert find_own.parameters["name"].annotation is api.ConversationName
+    assert find_own.return_annotation == OperationResult[api.ConversationReference | None]
+    assert inspect.signature(methods["group_members"]).return_annotation == OperationResult[tuple[str, ...]]
+    assert inspect.signature(methods["post"]).parameters["blocks"].kind is inspect.Parameter.KEYWORD_ONLY
     for method in methods.values():
         signature = inspect.signature(method)
         assert inspect.iscoroutinefunction(method)
@@ -200,7 +228,7 @@ def test_status_update_store_signatures_carry_only_domain_types_and_operation_re
 
 
 def test_incident_store_signatures_carry_only_domain_types_and_operation_results() -> None:
-    """No table, item or SDK shape crosses the store interface, and it has no write operation in this slice."""
+    """No table, item or SDK shape crosses the store interface; its only writes are create, attach_conversation and set_reference."""
     store = api.IncidentStore
 
     def params(method: object) -> dict[str, object]:
@@ -214,11 +242,24 @@ def test_incident_store_signatures_carry_only_domain_types_and_operation_results
     assert inspect.signature(store.find_by_conversation).return_annotation == OperationResult[api.Incident]
     assert inspect.signature(store.list_open).return_annotation == OperationResult[Sequence[api.Incident]]
     assert inspect.signature(store.read_security_flag).return_annotation == OperationResult[bool]
+    assert params(store.create) == {"incident": api.Incident}
+    assert params(store.attach_conversation) == {"incident_id": str, "binding": api.IncidentBinding}
+    assert params(store.set_reference) == {
+        "incident_id": str,
+        "kind": api.ReferenceKind,
+        "reference": ResourceReference,
+    }
+    assert inspect.signature(store.create).return_annotation == OperationResult[api.Incident]
+    assert inspect.signature(store.attach_conversation).return_annotation == OperationResult[api.Incident]
+    assert inspect.signature(store.set_reference).return_annotation == OperationResult[api.Incident]
     assert sorted(name for name in vars(store) if not name.startswith("_")) == [
+        "attach_conversation",
+        "create",
         "find_by_conversation",
         "get",
         "list_open",
         "read_security_flag",
+        "set_reference",
     ]
 
 
