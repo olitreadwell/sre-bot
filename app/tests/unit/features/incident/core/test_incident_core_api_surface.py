@@ -5,10 +5,10 @@ import inspect
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from slack_sdk import WebClient
+from slack_sdk.web.async_client import AsyncWebClient
 
 import features.incident.core as core
 from contracts.operations.result import OperationResult
@@ -16,9 +16,15 @@ from contracts.plugins.namespace import PLUGIN_NAMESPACE
 from features.incident.common import vocabulary
 from features.incident.common.vocabulary import IncidentRole, IncidentStatus
 from features.incident.core import api
+from features.incident.core.adapters import google_docs
 from features.incident.core.adapters import slack as slack_adapter
-from features.incident.core.adapters.in_memory import InMemoryIncidentStore
+from features.incident.core.adapters.in_memory import (
+    InMemoryIncidentReport,
+    InMemoryIncidentStore,
+    InMemoryStatusUpdateStore,
+)
 from features.incident.core.domain import ResourceReference
+from features.incident.core.store import RecordIncidentStore, RecordStatusUpdateStore
 from tests.factories.incident import incident_on, slack_conversation
 
 pytestmark = pytest.mark.unit
@@ -126,6 +132,28 @@ def test_interface_signatures_carry_only_plain_and_domain_types() -> None:
     assert read.return_annotation == OperationResult[Sequence[api.TranscriptMessage]]
 
 
+_REPORT_METHODS = ("list_placements", "create_from_template", "replace_placeholders", "read_sections", "write_draft_copy")
+_READER_METHODS = ("conversation_started_at", "read_transcript")
+
+
+@pytest.mark.parametrize(
+    ("owner", "names"),
+    [
+        (api.IncidentReport, _REPORT_METHODS),
+        (google_docs.GoogleDocsIncidentReport, _REPORT_METHODS),
+        (InMemoryIncidentReport, _REPORT_METHODS),
+        (api.IncidentTranscriptReader, _READER_METHODS),
+        (slack_adapter.SlackIncidentTranscriptReader, _READER_METHODS),
+    ],
+)
+def test_report_and_transcript_reader_methods_are_awaited(owner: type, names: tuple[str, ...]) -> None:
+    """Async callers await the report and the reader; only the report's pure link stays a plain call."""
+    for name in names:
+        assert inspect.iscoroutinefunction(getattr(owner, name)), name
+    if hasattr(owner, "link"):
+        assert not inspect.iscoroutinefunction(owner.link)
+
+
 def test_conversation_interface_is_async_on_the_reference_with_operation_results() -> None:
     """Every IncidentConversation method is a coroutine; all but create and find_own take the conversation reference."""
     methods = {
@@ -166,20 +194,20 @@ def test_conversation_interface_is_async_on_the_reference_with_operation_results
     )
 
 
-def test_provider_returns_one_cached_reader_built_on_the_slack_web_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The provider hands out a single reader that satisfies the interface and calls the shared client factory's client."""
-    client = MagicMock(spec=WebClient)
+async def test_provider_returns_one_cached_reader_built_on_the_async_slack_read_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The provider hands out a single reader that satisfies the interface and calls the shared async read client."""
+    client = AsyncMock(spec=AsyncWebClient)
     client.conversations_info.return_value = {"ok": True, "channel": {"created": 1}}
     factory = MagicMock(return_value=client)
-    monkeypatch.setattr(slack_adapter, "get_slack_web_client", factory)
+    monkeypatch.setattr(slack_adapter, "get_async_slack_web_client", factory)
 
     reader = api.get_incident_transcript_reader()
 
     assert isinstance(reader, api.IncidentTranscriptReader)
     assert api.get_incident_transcript_reader() is reader
     factory.assert_called_once_with()
-    reader.conversation_started_at(slack_conversation("C123"))
-    client.conversations_info.assert_called_once_with(channel="C123")
+    await reader.conversation_started_at(slack_conversation("C123"))
+    client.conversations_info.assert_awaited_once_with(channel="C123")
 
 
 def test_conversation_provider_reads_on_the_shared_client_and_writes_on_the_write_handle(
@@ -199,20 +227,20 @@ def test_conversation_provider_reads_on_the_shared_client_and_writes_on_the_writ
     write_factory.assert_called_once_with()
 
 
-def test_find_incident_for_conversation_answers_with_the_store_for_the_reference() -> None:
+async def test_find_incident_for_conversation_answers_with_the_store_for_the_reference() -> None:
     """The command check every command calls asks the given store for the conversation reference it was handed."""
     incident = incident_on("C0INCIDENT", "7f0c3a52-3d0e-4d55-9a4e-6f1f2b9c0a11")
     asked: list[api.ConversationReference] = []
 
     class _RecordingStore(InMemoryIncidentStore):
-        def find_by_conversation(self, conversation: api.ConversationReference) -> OperationResult[api.Incident]:
+        async def find_by_conversation(self, conversation: api.ConversationReference) -> OperationResult[api.Incident]:
             asked.append(conversation)
-            return super().find_by_conversation(conversation)
+            return await super().find_by_conversation(conversation)
 
     store = _RecordingStore()
     store.seed(incident)
 
-    result = api.find_incident_for_conversation(store, slack_conversation("C0INCIDENT"))
+    result = await api.find_incident_for_conversation(store, slack_conversation("C0INCIDENT"))
 
     assert result.data == incident
     assert asked == [slack_conversation("C0INCIDENT")]
@@ -277,6 +305,42 @@ def test_incident_store_signatures_carry_only_domain_types_and_operation_results
         "set_status",
         "update_fields",
     ]
+
+
+INCIDENT_STORE_METHODS = (
+    "get",
+    "find_by_conversation",
+    "list_open",
+    "read_security_flag",
+    "create",
+    "attach_conversation",
+    "set_reference",
+    "update_fields",
+    "set_roles",
+    "set_status",
+)
+STATUS_UPDATE_STORE_METHODS = ("append", "latest", "list_for_incident", "transition")
+
+
+@pytest.mark.parametrize(
+    ("store", "methods"),
+    [
+        (api.IncidentStore, INCIDENT_STORE_METHODS),
+        (RecordIncidentStore, INCIDENT_STORE_METHODS),
+        (InMemoryIncidentStore, INCIDENT_STORE_METHODS),
+        (api.StatusUpdateStore, STATUS_UPDATE_STORE_METHODS),
+        (RecordStatusUpdateStore, STATUS_UPDATE_STORE_METHODS),
+        (InMemoryStatusUpdateStore, STATUS_UPDATE_STORE_METHODS),
+    ],
+    ids=lambda value: getattr(value, "__name__", "methods"),
+)
+def test_the_stores_their_adapters_and_fakes_are_async(store: type, methods: tuple[str, ...]) -> None:
+    """The stores are consumed from async code, so every method is a coroutine (outbound-clients.md async-port rule)."""
+    assert [name for name in methods if not inspect.iscoroutinefunction(getattr(store, name))] == []
+
+
+def test_the_command_check_is_async() -> None:
+    assert inspect.iscoroutinefunction(api.find_incident_for_conversation)
 
 
 def test_core_is_not_a_plugin() -> None:

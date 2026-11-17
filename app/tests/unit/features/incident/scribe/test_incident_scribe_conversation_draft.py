@@ -75,13 +75,13 @@ class FakeTranscriptReader:
         self._start_fails = start_fails
         self.reads: list[dict[str, Any]] = []
 
-    def conversation_started_at(self, conversation: ConversationReference) -> OperationResult[datetime | None]:
+    async def conversation_started_at(self, conversation: ConversationReference) -> OperationResult[datetime | None]:
         self._events.append("conversation_started_at")
         if self._start_fails:
             return OperationResult.transient_error("Slack transcript read failed: ratelimited", "ratelimited")
         return OperationResult.success(self._started_at)
 
-    def read_transcript(
+    async def read_transcript(
         self,
         conversation: ConversationReference,
         *,
@@ -113,10 +113,10 @@ class RecordingIncidentStore(InMemoryIncidentStore):
         if seeded:
             self.seed(replace(incident_on("C123", "inc-1"), report=report, conversation=_RECORDED_CONVERSATION))
 
-    def find_by_conversation(self, conversation: ConversationReference) -> OperationResult:
+    async def find_by_conversation(self, conversation: ConversationReference) -> OperationResult:
         self._events.append("find_incident")
         self.lookups.append(conversation)
-        return super().find_by_conversation(conversation)
+        return await super().find_by_conversation(conversation)
 
 
 @pytest.fixture(autouse=True)
@@ -191,7 +191,7 @@ class TestReportDocument:
         """A store failure other than not-an-incident keeps its classification; nothing is read or drafted."""
         failure: OperationResult[Any] = OperationResult.transient_error(message="store down", error_code="STORE")
         store = MagicMock()
-        store.find_by_conversation.return_value = failure
+        store.find_by_conversation = AsyncMock(return_value=failure)
 
         result = await draft_incident_document_from_conversation(store, _CONVERSATION, reader=FakeTranscriptReader(events))
 

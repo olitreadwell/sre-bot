@@ -19,6 +19,7 @@ Assertions read the exact Web API calls in order (only ``views.update``, never
 a channel post), the one model call and the records left in the store.
 """
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Iterator, Sequence
@@ -150,10 +151,10 @@ def _records() -> InMemoryRecordStore:
 
 
 class _StubReader:
-    def conversation_started_at(self, conversation: ConversationReference) -> OperationResult[datetime | None]:
+    async def conversation_started_at(self, conversation: ConversationReference) -> OperationResult[datetime | None]:
         return OperationResult.success(_NOW - timedelta(hours=10))
 
-    def read_transcript(
+    async def read_transcript(
         self,
         conversation: ConversationReference,
         *,
@@ -192,8 +193,8 @@ def records() -> InMemoryRecordStore:
 @pytest.fixture
 def store(monkeypatch: pytest.MonkeyPatch, generator: _StubGenerator, records: InMemoryRecordStore) -> StatusUpdateStore:
     status_updates = status_update_store_in(records)
-    status_updates.append(_APPROVED)
-    status_updates.append(_PENDING)
+    asyncio.run(status_updates.append(_APPROVED))
+    asyncio.run(status_updates.append(_PENDING))
     monkeypatch.setattr(
         form,
         "generate_status_update_draft",
@@ -263,14 +264,14 @@ def test_blank_instructions_draft_from_the_conversation_with_the_base_prompt(
     harness.dispatch(_generate_action("   "))
 
     assert [call["instructions"] for call in generator.calls] == [INSTRUCTIONS]
-    assert store.list_for_incident(_INCIDENT).data == (_expected_fill(StatusUpdateOrigin.MODEL), _PENDING, _APPROVED)
+    assert asyncio.run(store.list_for_incident(_INCIDENT)).data == (_expected_fill(StatusUpdateOrigin.MODEL), _PENDING, _APPROVED)
 
 
 def test_the_fill_is_stored_as_a_new_draft_and_keeps_the_previous_one(harness: Harness, store: StatusUpdateStore) -> None:
     """The fill is the next DRAFT by the presser; the reviewed draft and the approved update are unchanged."""
     harness.dispatch(_generate_action(_GUIDANCE))
 
-    assert store.list_for_incident(_INCIDENT).data == (_expected_fill(), _PENDING, _APPROVED)
+    assert asyncio.run(store.list_for_incident(_INCIDENT)).data == (_expected_fill(), _PENDING, _APPROVED)
 
 
 def test_shows_generating_then_the_new_draft_form_and_posts_nothing(harness: Harness) -> None:
@@ -293,12 +294,18 @@ def test_nothing_new_carries_the_typed_values_forward_without_a_model_call(
     harness: Harness, generator: _StubGenerator, store: StatusUpdateStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With only messages from before the approved cutoff, the new draft repeats the typed values with the wording."""
-    monkeypatch.setattr(_StubReader, "read_transcript", lambda self, conversation, **kwargs: OperationResult.success(()))
+
+    async def read_nothing(
+        self: _StubReader, conversation: ConversationReference, **kwargs: Any
+    ) -> OperationResult[Sequence[TranscriptMessage]]:
+        return OperationResult.success(())
+
+    monkeypatch.setattr(_StubReader, "read_transcript", read_nothing)
 
     harness.dispatch(_generate_action(""))
 
     assert generator.calls == []
-    latest = store.latest(_INCIDENT).data
+    latest = asyncio.run(store.latest(_INCIDENT)).data
     assert latest is not None
     assert (latest.sequence, latest.origin, latest.en) == (
         _SEQUENCE + 1,
