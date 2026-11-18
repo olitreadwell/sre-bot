@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: 2026-10-09 16:43
-updated_date: '2026-11-09T19:04:00Z'
+updated_date: '2026-11-17T15:47:00Z'
 labels:
   - incident
   - features
@@ -49,6 +49,8 @@ THIS SLICE
 - [ ] #6 ruff, mypy (no new errors in touched files), lint-imports and pytest tests --ignore=tests/smoke pass
 - [ ] #7 The TASK-173 host rule (a Slack transport switched on with GOOGLE_WORKSPACE__TENANT__CUSTOMER_ID unset fails boot, server/configuration/host_configuration.py) and its tests are deleted with the legacy handlers it exists for, and decisions/configuration.md Tolerated no longer lists it (dated Changes line)
 - [ ] #8 features/incident/core/legacy_upgrade.py and features/incident/response/legacy_upgrade_job.py are deleted with the job's registration, and their app/bin/baselines/package_shape.txt entries go with them
+- [ ] #9 legacy_sre_web_client_seam (tests/integration/legacy_surface/conftest.py) and app/bin/baselines/test_seams_legacy.txt line 20 are deleted once no pin reaches a legacy /sre incident subcommand (moved from TASK-145.8.5, OQ4 2026-11-16)
+- [ ] #10 The value-scoped legacy attachment aliases (archive_channel: archive, ignore, schedule_retro) are removed, and the core roles read bridge and the job's Drive roles input (TASK-145.8.5.1, TASK-145.7.12) are deleted once a production run reports nothing pending
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -100,6 +102,8 @@ Deleting the legacy module is final for the surfaces already cut over; a revert 
 2026-11-06 (TASK-36.1.2 OQ1/OQ6, human-approved): legacy pin and cutover rules apply: decisions/migration.md recipe steps 2 and 4, decisions/transport-slack.md (legacy ids), decisions/testing.md (seams during the legacy migration); checklist in the implementation-planning skill (Legacy Surfaces). Contract task: removes the legacy id aliases, the remaining legacy_only_* tests and the seam-baseline entries for the module it deletes.
 
 2026-11-09 (human, Stack L OQ12): no longer waits on TASK-165.1 or TASK-146.3: declare invites on-call through the capability inside TASK-145.7 (146.3 delivered there); the only remnant is the read-only schedule-source adapter owned by 165.1, outside modules/incident. The dev incident commands are deleted by TASK-145.12 (OQ17).
+
+2026-11-17 (TASK-145.8.6): add to the deletion list: the retired-surface pin test_incident_create_retired_surface.py, its INVENTORY.md row, and the legacy create-folder deprecation text (incident_helper; tells users to run a create folder form that never existed).
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -126,6 +130,22 @@ created: 2026-11-09T18:37:00Z
 ---
 
 Stack L OQ assessment 2026-11-09 (OQ12, OQ17), proposed: the waits on TASK-165.1 and TASK-146.3 drop if 146.3 lands inside 145.7's L9a (declare invites through capabilities.oncall.api; the only remnant is a read-only schedule-source adapter owned by 165.1, outside modules/incident). The dev incident commands are deleted by TASK-145.12 (L11), so 'repointed or deleted' and 'decide delete or rewrite at pickup' no longer apply. Dependencies unchanged until the human rules.
+
+---
+
+created: 2026-11-16T15:51:00Z
+
+---
+
+2026-11-16 (human, TASK-145.8.4 OQ4): decisions/migration.md step 4 amended (rides with L6b): a cutover changes behaviour only as a named change of kind (a) legacy bug no pin asserts, (b) behaviour an accepted end-state ADR replaces, (c) expired deprecated form after a usage check, (d) retired surface; additions only by an explicit plan ruling. At planning, classify each behaviour change of this task by kind, pin it (test_legacy_only_* or edited pin citing the ruling) and list it in the PR body.
+
+---
+
+created: 2026-11-16T16:05:00Z
+
+---
+
+2026-11-16 (TASK-145.8.4 OQ4): delete the bare-status pointer in incident.response's status node (a bare valid status answers 'use /sre incident status update <status>').
 
 ---
 <!-- COMMENTS:END -->

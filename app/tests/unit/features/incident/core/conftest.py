@@ -17,7 +17,8 @@ def slack_error(code: str) -> SlackApiError:
 class StubSlack:
     """Read and write Web clients over a few channels, answering as the Slack Web API does.
 
-    ``channels`` maps a channel id to its ``is_archived`` and ``is_member`` flags; any
+    ``channels`` maps a channel id to its ``is_archived`` and ``is_member`` flags (and
+    ``is_private``, whose join Slack refuses with ``method_not_supported_for_channel_type``); any
     other id is ``channel_not_found``. Writes to an archived channel answer
     ``is_archived`` and writes where the bot is no member ``not_in_channel``;
     ``fail_with`` makes every call raise that Slack code instead. Posted messages get
@@ -29,7 +30,8 @@ class StubSlack:
     ``users.conversations`` lists the named channels the bot is a member of and that are
     not archived, ``page_size`` per page. ``groups`` maps a user group id to its members;
     any other id is ``no_such_subteam``. A second channel canvas is
-    ``channel_canvas_already_exists``.
+    ``channel_canvas_already_exists``. A channel's purpose is absent from ``conversations.info``
+    until ``purposes`` holds one (a set purpose is stored there).
     """
 
     def __init__(
@@ -49,15 +51,17 @@ class StubSlack:
         self.groups = dict(groups or {})
         self.page_size = page_size
         self.canvases: dict[str, str] = {}
+        self.purposes: dict[str, str] = {}
         self._created = 0
         self.reads = AsyncMock(spec=AsyncWebClient)
         self.writes = AsyncMock(spec=AsyncWebClient)
         self.reads.conversations_info.side_effect = self._info
         self.writes.chat_postMessage.side_effect = self._post
-        self.writes.conversations_setPurpose.side_effect = self._channel_write("channel")
+        self.writes.conversations_setPurpose.side_effect = self._set_purpose
         self.writes.bookmarks_add.side_effect = self._channel_write("channel_id")
         self.writes.conversations_invite.side_effect = self._invite
         self.writes.conversations_archive.side_effect = self._archive
+        self.writes.conversations_join.side_effect = self._join
         self.writes.conversations_create.side_effect = self._create
         self.writes.conversations_setTopic.side_effect = self._channel_write("channel")
         self.writes.conversations_canvases_create.side_effect = self._canvas
@@ -83,7 +87,15 @@ class StubSlack:
 
     async def _info(self, *, channel: str, **_: Any) -> dict[str, Any]:
         state = self._check(channel)
-        return {"ok": True, "channel": {"id": channel, **state}}
+        info: dict[str, Any] = {"id": channel, **state}
+        if channel in self.purposes:
+            info["purpose"] = {"value": self.purposes[channel]}
+        return {"ok": True, "channel": info}
+
+    async def _set_purpose(self, *, channel: str, purpose: str, **_: Any) -> dict[str, Any]:
+        self._writable(channel)
+        self.purposes[channel] = purpose
+        return {"ok": True}
 
     async def _post(self, *, channel: str, text: str, **_: Any) -> dict[str, Any]:
         self._writable(channel)
@@ -109,6 +121,16 @@ class StubSlack:
             raise slack_error("not_in_channel")
         state["is_archived"] = True
         return {"ok": True}
+
+    async def _join(self, *, channel: str, **_: Any) -> dict[str, Any]:
+        state = self._check(channel)
+        if state["is_archived"]:
+            raise slack_error("is_archived")
+        if state.get("is_private"):
+            raise slack_error("method_not_supported_for_channel_type")
+        already = state["is_member"]
+        state["is_member"] = True
+        return {"ok": True, **({"warning": "already_in_channel"} if already else {})}
 
     async def _create(self, *, name: str, is_private: bool = False, **_: Any) -> dict[str, Any]:
         if self.fail_with:

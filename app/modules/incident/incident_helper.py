@@ -8,37 +8,22 @@ from structlog import get_logger
 
 from features.incident.common.settings import get_incident_core_settings
 from features.incident.core.adapters import google_docs as incident_drive
-from integrations.sentinel import log_to_sentinel
 from integrations.slack import (
     channels as slack_channels,
 )
 from integrations.slack import (
     commands as slack_commands,
 )
-from integrations.slack import (
-    users as slack_users,
-)
 from modules.incident import (
-    core,
-    db_operations,
     incident_alert,
     incident_conversation,
     incident_folder,
-    incident_roles,
-    incident_status,
     information_display,
     information_update,
     schedule_retro,
 )
 
 INCIDENT_CHANNELS_PATTERN = r"^incident-\d{4}-"
-VALID_STATUS = [
-    "In Progress",
-    "Open",
-    "Ready to be Reviewed",
-    "Reviewed",
-    "Closed",
-]
 
 UPDATES_RETIRED_POINTER = (
     "`/sre incident updates` has been retired. "
@@ -60,10 +45,9 @@ Usage:
 • channels     - Manage incident channels
 • products     - Manage incident products (aka folders)
 • roles        - Manage incident roles
-• status       - Update or show incident status
+• status       - Update the incident status
 
 *Incident-level actions (no resource):*
-• create       - Create a new incident
 • close        - Close the current incident
 • list         - List incidents or resources
 • summarize    - Summarize the channel to catch up someone joining the incident
@@ -73,7 +57,6 @@ Usage:
 • show         - Show details of the current incident
 
 *Examples:*
-- `/sre incident create`
 - `/sre incident list --stale`
 - `/sre incident close`
 - `/sre incident show`
@@ -105,10 +88,9 @@ Utilisation:
 • channels     - Gérer les canaux d'incidents
 • products     - Gérer les produits d'incidents (dossiers)
 • roles        - Gérer les rôles d'incidents
-• status       - Mettre à jour ou afficher l'état d'un incident
+• status       - Mettre à jour l'état d'un incident
 
 *Actions pour l'incident (sans ressource):*
-• create       - Créer un nouvel incident
 • close        - Clore l'incident en cours
 • list         - Lister les incidents ou ressources
 • summarize    - Résumer le canal pour informer une personne rejoignant l'incident
@@ -118,7 +100,6 @@ Utilisation:
 • show         - Afficher les détails de l'incident en cours
 
 *Exemples:*
-- `/sre incident create`
 - `/sre incident list --stale`
 - `/sre incident close`
 - `/sre incident show`
@@ -152,7 +133,6 @@ def register(bot: App):
     bot.view("view_folder_metadata_modal")(incident_folder.list_folders_view)
     bot.view("add_metadata_view")(incident_folder.save_metadata)
     bot.action("delete_folder_metadata")(incident_folder.delete_folder_metadata)
-    bot.view("view_save_incident_roles")(incident_roles.save_incident_roles)
     bot.view("view_save_event")(schedule_retro.handle_schedule_retro_submit)
     bot.action("confirm_click")(schedule_retro.confirm_click)
     bot.action("user_select_action")(schedule_retro.incident_selected_users_updated)
@@ -168,8 +148,6 @@ def register(bot: App):
 def get_incident_actions() -> dict[str, Callable]:
     """Returns a dictionary mapping incident subcommands to their handler functions."""
     return {
-        "create": handle_create,
-        "close": handle_close,
         "show": handle_show,
         "help": handle_help,
         "aide": handle_help,
@@ -187,9 +165,7 @@ def get_resource_handlers():
     return {
         "channels": handle_channels,
         "product": handle_products,
-        "roles": handle_roles,
         "updates": handle_updates,
-        "status": handle_status,
     }
 
 
@@ -212,12 +188,6 @@ def handle_incident_command(
         first_arg = None
     resource_handlers = get_resource_handlers()
     incident_actions = get_incident_actions()
-    # Handle deprecated `/sre incident status <status>` command
-    if first_arg == "status" and args_list and " ".join(args_list) in VALID_STATUS:
-        respond(
-            "The `/sre incident status <status>` command is deprecated and will be discontinued after 2025-11-01. Please use `/sre incident status update <status>` instead."
-        )
-        args_list = ["update"] + args_list
 
     if first_arg in resource_handlers:
         # this is to handle if the argument is a resource
@@ -245,32 +215,6 @@ def handle_help(_client, _body, respond, _ack, args, _flags) -> None:
         respond(help_text_fr)
     else:
         respond(help_text)
-
-
-def handle_close(client, body, respond, ack, _args, _flags):
-    close_incident(client, body, ack, respond)
-
-
-def handle_create(client, body, respond, ack, args: list[str], _flags: dict):
-    """Handle create command."""
-    create_help_text = """`/sre incident create [resource] [options]`
-
-*Resources:*
-• `new [<incident_name>]` — create a new incident (upcoming feature)
-• `resources` — create resources for an existing incident (document, meet links, etc.)"""
-    try:
-        resource = args.pop(0)
-    except IndexError:
-        resource = None
-    match resource:
-        case "new":
-            respond("Upcoming feature: create a new incident.")
-            return
-        case "resources":
-            recreate_missing_incident_resources(client, body, respond, ack)
-            return
-        case _:
-            respond(create_help_text)
 
 
 def handle_show(client, body, respond, _ack, _args, _flags):
@@ -363,44 +307,6 @@ Use `/sre incident help` to see a list of commands."""
             respond(product_help_text)
 
 
-def handle_status(client, body, respond, ack, action, args, _flags):
-    """Handle the status command."""
-    status_help_text = """`/sre incident status [options] [arguments]`
-
-*Options:*
-• `show` — show the current incident status
-• `update <status>` — update the incident status to one of the valid statuses
-
-*Valid Statuses:*
-""" + ", ".join(VALID_STATUS)
-    match action:
-        case "update":
-            if args:
-                handle_update_status_command(client, body, respond, ack, args)
-            else:
-                respond("Please provide a status to update.")
-        case "show":
-            respond("Upcoming feature: show current incident status.")
-        case _:
-            respond(status_help_text)
-
-
-def handle_roles(client, body, respond, ack, action, _args, _flags):
-    """Handle the roles command."""
-    roles_help_text = """`/sre incident roles <action> [options] [arguments]`
-
-*Actions:*
-• `manage` — manage incident roles
-• `show` — show current incident roles"""
-    match action:
-        case "manage":
-            incident_roles.manage_roles(client, body, ack, respond)
-        case "show":
-            respond("Upcoming feature: show current incident roles.")
-        case _:
-            respond(roles_help_text)
-
-
 def handle_updates(client, body, respond, ack, action, _args, _flags):
     """Answer every `/sre incident updates` request with the retired-command pointer."""
     respond(UPDATES_RETIRED_POINTER)
@@ -430,91 +336,6 @@ def handle_legacy_stale(client, body, respond, ack, _args, _flags):
         "The `/sre incident stale` command is deprecated and will be discontinued after 2025-11-01. Please use `/sre incident list --stale` instead."
     )
     stale_incidents(client, body, ack)
-
-
-def close_incident(client: WebClient, body, ack, respond):
-    ack()
-    # get the current chanel id and name
-    channel_id = body["channel_id"]
-    channel_name = body["channel_name"]
-    user_id = slack_users.get_user_id_from_request(body)
-    incident_id = None
-    try:
-        incident = db_operations.get_incident_by_channel_id(channel_id)
-    except db_operations.IncidentStoreUnavailableError:
-        respond(db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE)
-        return
-    if incident:
-        incident_id = incident.get("id", {}).get("S", None)
-    # ensure the bot is actually in the channel before performing actions
-    try:
-        response = client.conversations_info(channel=channel_id)
-        channel_info = response.get("channel", None)
-        if channel_info is None or not channel_info.get("is_member", False):
-            client.conversations_join(channel=channel_id)
-    except Exception as e:
-        logger.exception("client_conversations_error", channel_id=channel_id, error=str(e))
-        return
-
-    if not channel_name.startswith("incident-"):
-        try:
-            client.chat_postEphemeral(
-                text=f"Channel {channel_name} is not an incident channel. Please use this command in an incident channel.",
-                channel=channel_id,
-                user=user_id,
-            )
-        except Exception as e:
-            logger.exception(
-                "client_post_ephemeral_error",
-                channel_id=channel_id,
-                user_id=user_id,
-                error=str(e),
-            )
-        return
-
-    incident_status.update_status(
-        client,
-        respond,
-        "Closed",
-        channel_id,
-        channel_name,
-        user_id,
-        incident_id,
-    )
-
-    # Need to post the message before the channel is archived so that the message can be delivered.
-    try:
-        client.chat_postMessage(
-            channel=channel_id,
-            text=f"<@{user_id}> has archived this channel 👋",
-        )
-    except Exception as e:
-        logger.exception(
-            "client_post_message_error",
-            channel_id=channel_id,
-            user_id=user_id,
-            error=str(e),
-        )
-
-    # archive the channel
-    try:
-        client.conversations_archive(channel=channel_id)
-        logger.info(
-            "incident_channel_archived",
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-        )
-        log_to_sentinel("incident_channel_archived", body)
-    except Exception as e:
-        logger.exception(
-            "client_conversations_archive_error",
-            channel_id=channel_id,
-            user_id=user_id,
-            error=str(e),
-        )
-        error_message = f"Could not archive the channel {channel_name} due to error: {e}"
-        respond(error_message)
 
 
 def stale_incidents(client: WebClient, body, ack: Ack):
@@ -574,42 +395,6 @@ def channel_item(channel):
     ]
 
 
-def handle_update_status_command(client: WebClient, body, respond: Respond, ack: Ack, args):
-    ack()
-    status = str.join(" ", args)
-    user_id = slack_users.get_user_id_from_request(body)
-    valid_statuses = [
-        "In Progress",
-        "Open",
-        "Ready to be Reviewed",
-        "Reviewed",
-        "Closed",
-    ]
-    if status not in valid_statuses:
-        respond("A valid status must be used with this command:\n" + ", ".join(valid_statuses))
-        return
-    try:
-        incident = db_operations.get_incident_by_channel_id(body["channel_id"])
-    except db_operations.IncidentStoreUnavailableError:
-        respond(db_operations.INCIDENT_STORE_UNAVAILABLE_MESSAGE)
-        return
-
-    if not incident:
-        respond("No incident found for this channel. Will not update status in DB record.")
-        return
-    else:
-        respond(f"Updating incident status to {status}...")
-
-        incident_status.update_status(
-            client,
-            respond,
-            status,
-            body["channel_id"],
-            body["channel_name"],
-            user_id,
-        )
-
-
 def parse_incident_datetime_string(datetime_string: str) -> str:
     pattern = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$"
 
@@ -626,93 +411,3 @@ def convert_timestamp(timestamp: str) -> str:
     except ValueError:
         datetime_str = "Unknown"
     return datetime_str
-
-
-def recreate_missing_incident_resources(client: WebClient, body: dict, respond: Respond, ack: Ack):
-    """
-    Recreate missing resources for an existing incident channel.
-
-    This command should be run from within an incident channel to detect
-    and recreate any missing resources (bookmarks, documents, DB records, etc.).
-    """
-    ack()
-
-    channel_id = body["channel_id"]
-    channel_name = body["channel_name"]
-    user_id = slack_users.get_user_id_from_request(body)
-
-    # Verify this is an incident channel
-    if not channel_name.startswith("incident-"):
-        respond("❌ This command can only be used in incident channels (channels starting with `incident-`).")
-        return
-
-    # Show initial message
-    respond("🔍 Checking for missing incident resources... This may take a moment.")
-
-    try:
-        # Call the core function to recreate missing resources
-        results = core.recreate_missing_resources(client, channel_id, channel_name, user_id)
-
-        # Build response message
-        response_blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*Incident Resource Check Complete* ✅",
-                },
-            }
-        ]
-
-        # Add success messages
-        if results["success"]:
-            success_text = "*Successfully Created/Updated:*\n" + "\n".join([f"• {item}" for item in results["success"]])
-            response_blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": success_text},
-                }
-            )
-
-        # Add skipped messages
-        if results["skipped"]:
-            skipped_text = "*Already Exists (Skipped):*\n" + "\n".join([f"• {item}" for item in results["skipped"]])
-            response_blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": skipped_text},
-                }
-            )
-
-        # Add error messages
-        if results["errors"]:
-            error_text = "*Errors Encountered:*\n" + "\n".join([f"• {item}" for item in results["errors"]])
-            response_blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": error_text},
-                }
-            )
-
-        # Post summary to channel
-        client.chat_postMessage(
-            channel=channel_id,
-            text="Incident resource check complete",
-            blocks=response_blocks,
-        )
-
-        logger.info(
-            "recreate_missing_resources_complete",
-            channel_id=channel_id,
-            success_count=len(results["success"]),
-            skipped_count=len(results["skipped"]),
-            error_count=len(results["errors"]),
-        )
-
-    except Exception as e:
-        logger.error(
-            "recreate_missing_resources_failed",
-            channel_id=channel_id,
-            error=str(e),
-        )
-        respond(f"❌ Failed to recreate resources: {str(e)}")

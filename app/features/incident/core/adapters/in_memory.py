@@ -329,6 +329,7 @@ class _StoredReport:
     folder_id: str
     sections: list[DocumentSection] = field(default_factory=list)
     placeholders: dict[str, str] = field(default_factory=dict)
+    status: IncidentStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +378,10 @@ class InMemoryIncidentReport:
     def filed_in(self, report: ReportReference) -> str:
         """Return the folder a created report was filed in."""
         return self._reports[report.vendor_id].folder_id
+
+    def status_text_of(self, report: ReportReference) -> IncidentStatus | None:
+        """Return the status last set on ``report``'s status line, ``None`` before any."""
+        return self._reports[report.vendor_id].status
 
     def placeholders_of(self, report: ReportReference) -> Mapping[str, str]:
         """Return the placeholder values applied to ``report`` so far."""
@@ -430,6 +435,16 @@ class InMemoryIncidentReport:
         if stored is None:
             return _no_such_report()
         stored.placeholders.update(values)
+        return OperationResult.success()
+
+    async def set_status_text(self, report: ReportReference, status: IncidentStatus) -> OperationResult[None]:
+        """Record the status on a known report's status line."""
+        if report.system is not WorkplaceSystem.GOOGLE:
+            return _report_unsupported(report)
+        stored = self._reports.get(report.vendor_id)
+        if stored is None:
+            return _no_such_report()
+        stored.status = status
         return OperationResult.success()
 
     async def read_sections(self, report: ReportReference) -> OperationResult[Sequence[DocumentSection]]:
@@ -499,7 +514,9 @@ class InMemoryIncidentConversation:
     """Hold Slack conversations in a dict keyed by channel id; every write is recorded for assertions.
 
     Built with the Slack tenant it stands in for and the ids of open, archived and
-    non-member conversations; any other id is not found. Posts get ``ts`` values
+    non-member conversations, and private ones the bot left (``private_non_member_ids``,
+    whose join is refused); any other id is not found. ``joined`` lists the
+    conversations a join made the bot a member of. Posts get ``ts`` values
     ``1700000000.00000<n>`` in order. ``checked`` lists the conversations whose
     writability was asked.
 
@@ -518,6 +535,7 @@ class InMemoryIncidentConversation:
         open_ids: Sequence[str] = (),
         archived_ids: Sequence[str] = (),
         non_member_ids: Sequence[str] = (),
+        private_non_member_ids: Sequence[str] = (),
         names: Mapping[str, str] | None = None,
         foreign_names: Sequence[str] = (),
         groups: Mapping[str, Sequence[str]] | None = None,
@@ -530,12 +548,15 @@ class InMemoryIncidentConversation:
             self._conversations[vendor_id] = _StoredConversation(archived=True, member=True)
         for vendor_id in non_member_ids:
             self._conversations[vendor_id] = _StoredConversation(archived=False, member=False)
+        for vendor_id in private_non_member_ids:
+            self._conversations[vendor_id] = _StoredConversation(archived=False, member=False, private=True)
         self._posted = 0
         self._created = 0
         self._names = dict(names or {})
         self._foreign_names = frozenset(foreign_names)
         self._groups = {group_id: tuple(members) for group_id, members in (groups or {}).items()}
         self.checked: list[ConversationReference] = []
+        self.joined: list[ConversationReference] = []
 
     def topic_of(self, conversation: ConversationReference) -> str | None:
         """Return the topic last set on ``conversation``."""
@@ -679,6 +700,35 @@ class InMemoryIncidentConversation:
         stored.archived = True
         return OperationResult.success()
 
+    async def join(self, conversation: ConversationReference) -> OperationResult[None]:
+        """Make the bot a member; an archived conversation, or a private one it is not in, is not writable."""
+        stored = self._known(conversation)
+        if isinstance(stored, OperationResult):
+            return stored
+        if stored.archived:
+            return _not_writable("is_archived")
+        if not stored.member and stored.private:
+            return _not_writable("method_not_supported_for_channel_type")
+        if not stored.member:
+            self.joined.append(conversation)
+        stored.member = True
+        return OperationResult.success()
+
+    def is_archived(self, conversation: ConversationReference) -> bool:
+        """Say whether ``conversation`` is archived."""
+        return self._conversations[conversation.vendor_id].archived
+
+    async def purpose(self, conversation: ConversationReference) -> OperationResult[str]:
+        """Return the purpose last set (or seeded) on the conversation; an empty string when none."""
+        stored = self._known(conversation)
+        if isinstance(stored, OperationResult):
+            return stored
+        return OperationResult.success(stored.purpose or "")
+
+    def seed_purpose(self, conversation: ConversationReference, text: str) -> None:
+        """Give ``conversation`` the purpose ``text`` without a write, as a channel created before the bot's writes has one."""
+        self._conversations[conversation.vendor_id].purpose = text
+
     async def is_writable(self, conversation: ConversationReference) -> OperationResult[bool]:
         """Answer whether the conversation is open and the bot a member."""
         stored = self._known(conversation)
@@ -788,3 +838,37 @@ class InMemoryIncidentListProjection:
         else:
             self.rows[index] = row
         return OperationResult.success(None)
+
+
+class InMemoryLegacyRolesReader:
+    """Hold legacy report roles by report vendor id; reads never write.
+
+    ``seed`` gives a report its commander and lead as the legacy ``roles manage`` left them in Drive. A report
+    with none seeded is NOT_FOUND, as a missing Drive file is; ``fail_with`` makes every read return that error
+    result instead. ``reads`` lists the reports read, in order.
+
+    TODO(TASK-145.13): delete with ``LegacyRolesReader``.
+    """
+
+    def __init__(self, *, fail_with: OperationResult[Any] | None = None) -> None:
+        self._roles: dict[str, dict[IncidentRole, str]] = {}
+        self._fail_with = fail_with
+        self.reads: list[ReportReference] = []
+
+    def seed(self, report: ReportReference, roles: Mapping[IncidentRole, str]) -> None:
+        """Give ``report`` these roles."""
+        self._roles[report.vendor_id] = dict(roles)
+
+    async def read(self, report: ReportReference) -> OperationResult[Mapping[IncidentRole, str]]:
+        """Return the seeded roles of a Google report; another system is unsupported, an unseeded report not found."""
+        self.reads.append(report)
+        if self._fail_with is not None:
+            return OperationResult.error(self._fail_with.status, self._fail_with.message or "", self._fail_with.error_code)
+        if report.system is not WorkplaceSystem.GOOGLE:
+            return OperationResult.permanent_error(
+                f"Google Drive cannot reach a report on {report.system.value}", ErrorCode.UNSUPPORTED_OPERATION
+            )
+        roles = self._roles.get(report.vendor_id)
+        if roles is None:
+            return OperationResult.error(OperationStatus.NOT_FOUND, "No such report")
+        return OperationResult.success(dict(roles))

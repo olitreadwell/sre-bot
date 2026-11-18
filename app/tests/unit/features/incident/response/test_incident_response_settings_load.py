@@ -5,8 +5,10 @@ real loader for one environment) and from the environment with monkeypatch; noth
 stubbed. The Slack ids are deployment configuration: declared empty in base.toml, set in
 production.toml only. The handbook id is non-public: declared empty in base.toml, held by no
 environment file, read only from INCIDENT_RESPONSE__HANDBOOK_ID, and kept out of the repr. The
-legacy upgrade job keys are declared in base.toml at their defaults (mode off) and set by no
-environment file; a value outside its range fails naming the key. An unknown key fails naming it.
+legacy upgrade job keys are declared in base.toml at their defaults (mode off); ci and local
+leave the job unregistered, and production.toml sets only the mode, to dry_run, so production
+reports what the upgrade would write and writes nothing. A value outside its range fails naming
+the key. An unknown key fails naming it.
 """
 
 import tomllib
@@ -23,7 +25,7 @@ from server.configuration.loader import CONFIG_DIR, load_configuration_files
 pytestmark = pytest.mark.unit
 
 _FIELDS = ("handbook_id",)
-_SLACK_IDS = ("announcement_channel_id", "security_group_id", "notify_management_group_id")
+_SLACK_IDS = ("announcement_channel_id", "security_group_id", "policy_group_id", "notify_management_group_id")
 _UPGRADE_KEYS = {"upgrade_mode": "off", "upgrade_interval_minutes": 30, "upgrade_lease_ttl_seconds": 900}
 
 
@@ -50,15 +52,31 @@ def test_base_declares_every_id_empty_and_the_upgrade_keys_at_their_defaults() -
     assert "incident" not in base
 
 
-@pytest.mark.parametrize("environment", ["ci", "local", "production"])
-def test_no_environment_file_switches_the_upgrade_job_on(environment: str) -> None:
-    """Every environment runs with the job unregistered until its run procedure sets the mode in its own file."""
+@pytest.mark.parametrize("environment", ["ci", "local"])
+def test_ci_and_local_leave_the_upgrade_job_off(environment: str) -> None:
+    """ci and local run with the job unregistered; only an environment's run procedure sets the mode in its file."""
     install_configuration_files(load_configuration_files(environment))
 
     settings = IncidentResponseSettings()
 
     assert (settings.upgrade_mode, settings.upgrade_interval_minutes, settings.upgrade_lease_ttl_seconds) == (
         UpgradeMode.OFF,
+        30,
+        900,
+    )
+
+
+def test_production_runs_the_upgrade_job_as_a_dry_run() -> None:
+    """production.toml sets the mode to dry_run, never apply, and keeps the base interval and lease.
+
+    The real production loader is used, so the assertion is on the resolved slice, not on the file text.
+    """
+    install_configuration_files(load_configuration_files("production"))
+
+    settings = IncidentResponseSettings()
+
+    assert (settings.upgrade_mode, settings.upgrade_interval_minutes, settings.upgrade_lease_ttl_seconds) == (
+        UpgradeMode.DRY_RUN,
         30,
         900,
     )
@@ -108,9 +126,15 @@ def test_production_resolves_the_slack_ids_production_ran_on() -> None:
 
     settings = IncidentResponseSettings()
 
-    assert (settings.announcement_channel_id, settings.security_group_id, settings.notify_management_group_id) == (
+    assert (
+        settings.announcement_channel_id,
+        settings.security_group_id,
+        settings.policy_group_id,
+        settings.notify_management_group_id,
+    ) == (
         "CUYR73ESX",
         "S057X3XB5FX",
+        "S0CHP1YRQNQ",
         "S0BC6L00PUG",
     )
 
@@ -122,7 +146,7 @@ def test_local_and_ci_configure_no_slack_id(environment: str) -> None:
 
     settings = IncidentResponseSettings()
 
-    assert [getattr(settings, field) for field in _SLACK_IDS] == ["", "", ""]
+    assert [getattr(settings, field) for field in _SLACK_IDS] == ["", "", "", ""]
 
 
 def test_a_prefixed_environment_variable_beats_the_files(monkeypatch: pytest.MonkeyPatch) -> None:

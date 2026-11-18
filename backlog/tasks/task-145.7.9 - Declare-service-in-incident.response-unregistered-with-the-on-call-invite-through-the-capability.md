@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-11-09T19:06:00Z'
-updated_date: '2026-11-16T17:08:00Z'
+updated_date: '2026-11-17T19:10:00Z'
 labels:
   - incident
   - features
@@ -49,6 +49,8 @@ Stack L L9a (approved program in TASK-145.7's plan, section 2; outline in the pa
 2026-11-10 (TASK-145.7.7 rulings R4-R6, decisions/incident-management.md Bindings): business features are API first; bindings are chat conversations only, zero or more per incident; declare writes the record first, then the conversation and attach_conversation, then resources, each a retriable step whose failure is reported (timeline entry once TASK-145.9) and never rolled back; the incident id is derived from the declare's idempotency key (uuid5 of the Slack request or alert id; the HTTP Idempotency-Key) so a retry reuses it and the orphan-incident residual stays theoretical; the HTTP declare route is folded in here (AC #4). Supersedes the plan's OQ9 'declare unavailable only when no working surface can be bound' and AC #1's 'a failing conversation writes nothing'. Full plan: check the size gate with the route included.
 
 2026-11-16 (TASK-146.1 rulings, human): OnCallLookup.on_call_now is async and returns OperationResult[tuple[OnCallPerson, ...]]; the declare maps an error result to inviting nobody and saying so (oncall.md:20). The reference is ScheduleReference(OPSGENIE, genie_schedule). OnCallPerson carries an email or an Account (rotations: Slack user id). Needs TASK-146.1.1 only.
+
+2026-11-17 (TASK-145.8.6 re-plan, human-approved): recreate is retired, so this task alone owns the one-conversation loop I1-I5 (comment #1 rules), placed at response/service/conversation.py with one test per rule; TASK-165.5 (AC #2) and TASK-165.11 (rebind) reuse it.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -67,6 +69,14 @@ created: 2026-11-10T21:00:00Z
 ---
 
 2026-11-10 (human-approved, TASK-145.7.6 OQ3 R1-R3): declare awaits async ports only (IncidentStore, IncidentReport, VideoCall, IncidentConversation); adapters offload blocking SDK calls, the declare service never calls to_thread. Depends on TASK-145.8.7.
+
+---
+
+created: 2026-11-17T19:10:00Z
+
+---
+
+2026-11-17 (found at the Stack L sync, TASK-145.8.5.3 session): #1853 (fba4ff8b, merged to main, not a Stack L change) added a policy-help answer to the legacy declare: production-only invite of the policy group ([incident] policy_group_id in features/incident/response/settings.py; modules/incident/core.py and incident.py; pinned in tests/modules/incident/test_incident_core.py and test_incident.py, 15 policy tests). The declare rebuild carries it (pins rewired, not dropped) or rules it a named change at planning.
 
 ---
 <!-- COMMENTS:END -->

@@ -5,7 +5,7 @@ decisions/feature-packages.md (integrations are imported from adapters/ only).
 Sections, in order:
 
 - document ids: Google-Docs-URL id extraction;
-- report edits: placeholders, revision-guarded edits and snapshots through
+- report edits: placeholders, the status line, revision-guarded edits and snapshots through
   documents().get/.batchUpdate, each owning its try/except and
   classify_google_error, exposing incident-domain operations rather than
   SDK-shaped passthroughs;
@@ -43,6 +43,7 @@ from contracts.operations import OperationResult, OperationStatus
 from contracts.operations.codes import ErrorCode
 from contracts.workplace import WorkplaceSystem
 from features.incident.common.settings import get_incident_core_settings
+from features.incident.common.vocabulary import IncidentStatus
 from features.incident.core.domain import (
     DocumentField,
     DocumentSection,
@@ -107,6 +108,21 @@ class DocumentSnapshot:
 
     content: list[dict[str, Any]]
     revision_id: str
+
+
+# The order the legacy status edit sent its replacements in; each line is rewritten independently.
+_STATUS_LINE_ORDER = (
+    IncidentStatus.IN_PROGRESS,
+    IncidentStatus.OPEN,
+    IncidentStatus.READY_TO_BE_REVIEWED,
+    IncidentStatus.REVIEWED,
+    IncidentStatus.CLOSED,
+)
+
+
+def status_line_replacements(status: IncidentStatus) -> dict[str, str]:
+    """Map the status line of every other status to the line of ``status``; a line already showing it is not a key."""
+    return {f"Status: {other.value}": f"Status: {status.value}" for other in _STATUS_LINE_ORDER if other is not status}
 
 
 def replace_placeholders(document_id: str, replacements: Mapping[str, str], match_case: bool = True) -> bool:
@@ -274,14 +290,6 @@ def _log_http_failure(event: str, file_id: str, exc: HttpError) -> None:
     )
 
 
-def list_folder_files(parent_folder_id: str) -> list[dict[str, Any]]:
-    result = _list_all(f"parents in '{parent_folder_id}' and mimeType != '{_FOLDER_MIME_TYPE}' and trashed=false", "list_files")
-    if not result.is_success:
-        _log_failure("incident_drive_list_files_failed", result)
-        return []
-    return result.data or []
-
-
 def list_child_folders(parent_folder_id: str) -> list[dict[str, Any]]:
     result = _list_all(f"parents in '{parent_folder_id}' and mimeType = '{_FOLDER_MIME_TYPE}' and trashed=false", "list_folders")
     if not result.is_success:
@@ -325,22 +333,6 @@ def create_document_from_template(name: str, parent_folder_id: str, template_id:
         _log_failure("incident_drive_create_document_failed", result)
         return None
     return result.data
-
-
-def find_document_by_channel_name(channel_name: str) -> dict[str, Any] | None:
-    # The name is not escaped, as before: a quote in a channel name fails the query.
-    result = _list_all(f"trashed=false and name='{channel_name}'", "find_files_by_name")
-    if not result.is_success:
-        _log_failure("incident_drive_find_document_failed", result)
-        return None
-
-    matches = result.data or []
-    if not matches:
-        return None
-
-    document_id = matches[0]["id"]
-    metadata = get_metadata(document_id, fields="id, name, appProperties")
-    return {"id": document_id, "appProperties": metadata.get("appProperties", {})}
 
 
 def add_metadata(file_id: str, key: str, value: str) -> dict[str, Any]:
@@ -720,6 +712,22 @@ class GoogleDocsIncidentReport:
             return OperationResult.error(
                 status=replaced.status,
                 message=replaced.message or "The placeholders could not be replaced",
+                error_code=replaced.error_code,
+                retry_after=replaced.retry_after,
+            )
+        return OperationResult.success()
+
+    async def set_status_text(self, report: ReportReference, status: IncidentStatus) -> OperationResult[None]:
+        """Rewrite the report's status line to ``status``, case-insensitive, in one Docs request run off the event loop."""
+        if report.system is not WorkplaceSystem.GOOGLE:
+            return _unsupported(report)
+        replaced = await asyncio.to_thread(
+            _replace_all_text, report.vendor_id, status_line_replacements(status), match_case=False
+        )
+        if not replaced.is_success:
+            return OperationResult.error(
+                status=replaced.status,
+                message=replaced.message or "The report status could not be set",
                 error_code=replaced.error_code,
                 retry_after=replaced.retry_after,
             )

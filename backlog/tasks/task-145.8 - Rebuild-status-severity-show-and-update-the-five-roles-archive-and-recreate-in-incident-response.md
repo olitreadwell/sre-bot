@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: 2026-10-09 16:43
-updated_date: '2026-11-10T16:52:00Z'
+updated_date: '2026-11-17T15:47:00Z'
 labels:
   - incident
   - features
@@ -48,13 +48,13 @@ RULES
 <!-- AC:BEGIN -->
 - [ ] #1 Every rebuilt command and interaction resolves its incident through find_incident_for_conversation; a write to an archived channel is skipped and reported, not failed
 - [ ] #2 Severity and the five roles are read from and written to the record; no code path writes Drive properties for roles
-- [ ] #3 Status change updates the record, the report text, the projection and the channel in that order, each failure logged and the rest continuing
+- [ ] #3 Status change writes the record first (the commit point), then the report text, the projection and the channel in that order; a failed record write stops and is reported; a failure of report, projection or channel is logged and reported, never rolls the record back, and the rest continue (decisions/incident-management.md, 2026-11-16 TASK-145.8.4 OQ2)
 - [ ] #4 The pinned behaviour of status, show, update, roles and archive passes unchanged
 - [ ] #5 Recreate replaces a reference map whole, guarded on the old channel_id scalar; show renders links through the owning adapter with the stored url as a hint
 - [ ] #6 security_incident is editable from the update modal; the flip-action decision is recorded in the plan
 - [ ] #7 Writes in the end-state shape set record_version = RECORD_VERSION from core/store.py; reopen sets open_bucket and opened_at and Closed removes them in one update; an item without record_version is never stamped by a partial update (tested)
 - [ ] #8 ruff, mypy (no new errors in touched files), lint-imports and pytest tests --ignore=tests/smoke pass
-- [ ] #9 IncidentReport gains set_status_text(ReportReference, status) in core/api.py with its Google Docs adapter and fake (parity test); the legacy status mapping in modules/incident/incident_document.py (lines 55-80 at main 5deb8406) moves into core/adapters/google_docs.py and the legacy caller is repointed or deleted
+- [x] #9 IncidentReport gains set_status_text(ReportReference, status) in core/api.py with its Google Docs adapter and fake (parity test); the legacy status mapping in modules/incident/incident_document.py (lines 55-80 at main 5deb8406) moves into core/adapters/google_docs.py and the legacy caller is repointed or deleted
 - [ ] #10 Cutover per decisions/migration.md step 4 and decisions/testing.md seams: the pins pass with assertions unchanged, their fixtures rewired to the target Protocol fakes with the matching seam-baseline entries removed; legacy_only_* tests for behaviour this task ends are deleted; modal-internal ids take the incident.<subdomain> prefix and ids on posted messages stay registered as legacy aliases; new tests pass make check-test-seams
 - [ ] #11 Each person-chosen severity change writes a timeline entry after the guarded field update (deterministic entry id; a failed entry is logged and never rolls the field back); core/store.py holds timeline_table(name) (incident_id, entry_key), the entry_key helper '<posted_at>#<entry_id>' with fixed-width ISO-8601 UTC posted_at, and a uuid4 manual entry id, each tested (moved from TASK-145.9 AC #5)
 - [ ] #12 A write onto an item without record_version upgrades it through the shared upgrade function, puts its binding and writes the change with record_version 2 in one guarded update (incident-management.md Migration rules 3-4 as amended in TASK-145.7's A1)
@@ -115,6 +115,8 @@ L0 TASK-145.7.1; L1 TASK-145.7.2; L2a TASK-145.7.3; L2b TASK-145.7.4; L3 TASK-14
 2026-11-06 (TASK-36.1.2 pins): legacy bugs pinned as is, to rule in this plan: /sre incident products answers Unknown command (dispatcher key product, help text products); archive sends incident_channel_archived to Sentinel twice (close_incident and archive_channel_action); a refused archive in a non-incident channel still sends it; re-saving roles with no roles line in the purpose leaves a doubled newline. The pins' one internal seam, legacy_sre_web_client_seam, is deleted here.
 
 2026-11-10 (TASK-145.8.1 full plan, human rulings): L3 kept whole under an approved size exception (~530 / 6 incl. the timeline store from OQ13); IncidentChanges has no retrospective link (dropped at L6a, see TASK-145.8.3 notes); close/reopen are one set_status with the bucket rules; the outline's expected_version parameter is replaced by a guard on record_version plus the read values of the changed attributes.
+
+2026-11-17 (TASK-145.8.6, human-approved): /sre incident create is retired (kind (d); 90-day usage: resources 0, new 1, bare 3). The rule 'The recreate path replaces a missing resource's reference map whole ... guarded on the old channel_id scalar' no longer applies (the surface is retired; the guard was record_version anyway). ACs #1 and #5: recreate is checked by its retirement. Reword 'archive and recreate' in the title once 145.8.5.3 and 145.8.6 land.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
