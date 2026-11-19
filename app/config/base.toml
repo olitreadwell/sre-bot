@@ -183,6 +183,9 @@ log_type = "DevSREBot"
 # a developer opts in with SCHEDULER__ENABLED=true in app/.env.
 enabled = false
 default_tier2_lease_ttl_seconds = 1800
+# A Tier-2 lease is held after a short run until this many seconds before the job's next
+# interval (never longer than its TTL), so another replica cannot run the same tick.
+lease_hold_margin_seconds = 5
 
 [notify_api_key_leak]
 channel_id = ""
@@ -205,6 +208,9 @@ status_updates_table = "sre_bot_incident_status_updates"
 bindings_table = "sre_bot_incident_bindings"
 # Most incident items a whole-table read (the legacy upgrade job) returns; past it the read fails.
 full_read_max_items = 10000
+# Most revision-guarded writes one report timeline update (the 💾 capture) makes, each from
+# a fresh read; a lost guard or an unconfirmed write is recomputed without sleeping.
+timeline_update_attempts = 3
 folder_id = ""
 report_template_id = ""
 list_sheet_id = ""
@@ -217,8 +223,13 @@ announcement_channel_id = ""
 security_group_id = ""
 policy_group_id = ""
 notify_management_group_id = ""
+# The status a declared incident starts in: Open or In Progress (organisation policy).
+initial_status = "Open"
 # Non-public: set from the environment as INCIDENT_RESPONSE__HANDBOOK_ID.
 handbook_id = ""
+# Non-public: the report placement (Drive folder) whose incidents invite the Notify management
+# group, set from the environment as INCIDENT_RESPONSE__NOTIFY_MANAGEMENT_PLACEMENT_ID.
+notify_management_placement_id = ""
 # The incident legacy upgrade job (features/incident/README.md, run procedure): off registers
 # nothing; an environment sets dry_run, then apply, in its own file. The lease is sized to the
 # longest run (one whole-table read, one guarded write per item) and stays under the interval.

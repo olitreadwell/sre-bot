@@ -30,7 +30,7 @@ schedule_lib = schedule
 
 
 class _ScheduleBackgroundJobRegistry(BackgroundJobRegistry):
-    """Adapter that binds feature jobs to the schedule library."""
+    """Adapter that binds every scheduled job, host-owned, legacy or a plugin's, to the schedule library."""
 
     def __init__(self, service_scopes: ServiceScopeOpener) -> None:
         self._service_scopes = service_scopes
@@ -48,14 +48,15 @@ class _ScheduleBackgroundJobRegistry(BackgroundJobRegistry):
         job: Callable[[], None],
         lease_ttl: timedelta | None = None,
     ) -> None:
-        job_to_run = _leased_or_plain(job_name, job, lease_ttl)
+        job_to_run, min_hold = _leased_or_plain(job_name, job, lease_ttl, every=timedelta(days=1))
         schedule_lib.every().day.at(schedule).do(safe_run(job_to_run))
         logger.debug(
-            "feature_background_job_scheduled",
+            "background_job_scheduled",
             job_name=job_name,
             cadence="daily",
             schedule=schedule,
             lease_ttl_seconds=_seconds(lease_ttl),
+            lease_min_hold_seconds=_seconds(min_hold),
         )
 
     def register_interval(
@@ -66,15 +67,16 @@ class _ScheduleBackgroundJobRegistry(BackgroundJobRegistry):
         job: Callable[[], None],
         lease_ttl: timedelta | None = None,
     ) -> None:
-        job_to_run = _leased_or_plain(job_name, job, lease_ttl)
+        job_to_run, min_hold = _leased_or_plain(job_name, job, lease_ttl, every=every)
         seconds = int(every.total_seconds())
         schedule_lib.every(seconds).seconds.do(safe_run(job_to_run))
         logger.debug(
-            "feature_background_job_scheduled",
+            "background_job_scheduled",
             job_name=job_name,
             cadence="interval",
             every_seconds=seconds,
             lease_ttl_seconds=_seconds(lease_ttl),
+            lease_min_hold_seconds=_seconds(min_hold),
         )
 
 
@@ -82,26 +84,36 @@ def _seconds(ttl: timedelta | None) -> int | None:
     return None if ttl is None else int(ttl.total_seconds())
 
 
-def _leased_or_plain(job_name: str, job: Callable[[], None], lease_ttl: timedelta | None) -> Callable[[], None]:
-    """Return the job as is (Tier-1) or wrapped in a lease named scheduler:<job_name> (Tier-2).
+def _leased_or_plain(
+    job_name: str, job: Callable[[], None], lease_ttl: timedelta | None, *, every: timedelta
+) -> tuple[Callable[[], None], timedelta | None]:
+    """Return the job as is (Tier-1) or wrapped in a lease named scheduler:<job_name> (Tier-2), with its hold.
 
     The TTL is the job's own, never the scheduler default; one under a second is
     rejected here, at registration, so a bad value fails startup instead of a run.
+    A Tier-2 lease is held after a short run for min(TTL, every - margin), the
+    margin being [scheduler] lease_hold_margin_seconds (decisions/reliability.md);
+    `every` is one day for a daily job, so its hold is its TTL. A leased interval
+    not above the margin leaves no room for a hold and is rejected here too.
     """
     if lease_ttl is None:
-        return job
+        return job, None
     ttl_seconds = int(lease_ttl.total_seconds())
     if ttl_seconds < 1:
         raise ValueError(f"lease_ttl for {job_name} must be at least one second, got {lease_ttl}")
+    margin = timedelta(seconds=get_scheduler_settings().lease_hold_margin_seconds)
+    if every <= margin:
+        raise ValueError(f"interval of leased job {job_name} must be longer than the lease hold margin {margin}, got {every}")
+    min_hold = min(timedelta(seconds=ttl_seconds), every - margin)
     lock_store = get_lease_store(ttl_seconds)
 
     def leased() -> None:
-        run_if_leased(lock_store, f"scheduler:{job_name}", job)
+        run_if_leased(lock_store, f"scheduler:{job_name}", job, min_hold=min_hold)
 
     # safe_run logs the module and name of the job it wraps.
     leased.__module__ = job.__module__
     leased.__name__ = getattr(job, "__name__", "leased_job")
-    return leased
+    return leased, min_hold
 
 
 def safe_run(job: Callable[..., Any]) -> Callable[..., None]:
@@ -123,19 +135,11 @@ def safe_run(job: Callable[..., Any]) -> Callable[..., None]:
     return wrapper
 
 
-def _tier2(name: str, job: Callable[..., None]) -> Callable[..., None]:
-    """Wrap a singleton Tier-2 job with lease acquisition/release."""
-    ttl_seconds = get_scheduler_settings().default_tier2_lease_ttl_seconds
-    lock_store = get_lease_store(ttl_seconds)
-
-    def wrapped(*args: Any, **kwargs: Any) -> None:
-        run_if_leased(lock_store, name, lambda: job(*args, **kwargs))
-
-    return wrapped
-
-
 def init(register_plugin_jobs: Callable[[BackgroundJobRegistry], None], service_scopes: ServiceScopeOpener) -> None:
     """Initialize the scheduled tasks.
+
+    Every job, host-owned, legacy or a plugin's, registers through one registry, which
+    applies the safe_run boundary and, for a Tier-2 job, the lease.
 
     Args:
         register_plugin_jobs: Called once with the scheduler registry so feature
@@ -144,25 +148,36 @@ def init(register_plugin_jobs: Callable[[BackgroundJobRegistry], None], service_
     """
     logger.debug("initializing_scheduled_tasks", module="scheduled_tasks", function="init")
 
-    schedule.every(5).minutes.do(safe_run(scheduler_heartbeat))
-    schedule.every(5).minutes.do(safe_run(integration_healthchecks))
+    registry = _ScheduleBackgroundJobRegistry(service_scopes)
+    registry.register_interval(job_name="scheduler_heartbeat", every=timedelta(minutes=5), job=scheduler_heartbeat)
+    registry.register_interval(job_name="integration_healthchecks", every=timedelta(minutes=5), job=integration_healthchecks)
 
-    # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
-    schedule.every(2).hours.do(safe_run(_tier2("scheduler:provision_aws_identity_center", provision_aws_identity_center)))
+    # Legacy Tier-2 jobs share the scheduler's default TTL until TASK-65 moves each to its feature.
+    # Each body is idempotent; the lease only avoids duplicate cross-replica runs.
+    legacy_lease_ttl = timedelta(seconds=get_scheduler_settings().default_tier2_lease_ttl_seconds)
+    registry.register_interval(
+        job_name="provision_aws_identity_center",
+        every=timedelta(hours=2),
+        job=provision_aws_identity_center,
+        lease_ttl=legacy_lease_ttl,
+    )
     # A vendor's tenant entry enables its client (decisions/configuration.md).
     if get_slack_settings().tenant is not None:
-        # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
-        schedule.every().day.at("16:00").do(
-            safe_run(_tier2("scheduler:notify_stale_incident_channels", notify_stale_incident_channels_job)),
+        registry.register_daily(
+            job_name="notify_stale_incident_channels",
+            schedule="16:00",
+            job=notify_stale_incident_channels_job,
+            lease_ttl=legacy_lease_ttl,
         )
     else:
         logger.debug("scheduled_job_skipped", job_name="notify_stale_incident_channels", reason="slack_not_configured")
-    # Tier-2 job body is idempotent; lease only avoids duplicate cross-replica runs.
-    schedule.every().day.at("00:00").do(
-        safe_run(_tier2("scheduler:spending_generate_spending_data", spending.execute_spending_data_update_job)),
+    registry.register_daily(
+        job_name="spending_generate_spending_data",
+        schedule="00:00",
+        job=spending.execute_spending_data_update_job,
+        lease_ttl=legacy_lease_ttl,
     )
 
-    registry = _ScheduleBackgroundJobRegistry(service_scopes)
     register_plugin_jobs(registry)
 
 

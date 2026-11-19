@@ -8,7 +8,12 @@ widening the shape check. A drift test compares the names in the record's
 layout table with the manifest's, so the two can only change together. The
 generator's options and templates are read from the same manifest, so the
 real one is also checked for the option each kind takes and for a template on
-every entry the generator can write.
+every entry the generator can write. The names the other bin guards read (the
+public api module, the plugin module, the adapters directory, the core and
+common kinds) are asserted on the real manifest, and a manifest that cannot
+supply them is refused by the repository check, so no guard keeps its own
+copy. The plugin module is refused unless the capability kind requires it and
+core does not declare it.
 """
 
 import re
@@ -17,13 +22,15 @@ from pathlib import Path
 
 import pytest
 
-from bin.package_layout import LAYOUT_PATH, Layout, LayoutError, load_layout
+from bin.package_layout import COMMON_KIND, CORE_KIND, LAYOUT_PATH, Layout, LayoutError, check_tool_needs, load_layout
 
 DECISION = Path(__file__).resolve().parents[4] / "decisions" / "feature-packages.md"
 TEMPLATES = LAYOUT_PATH.parent / "package_templates"
 
 MINIMAL = """
 roots = { features = "features", capabilities = "capabilities" }
+public_api = "api.py"
+plugin_module = "plugin.py"
 reserved_subdomains = ["core"]
 grows_into_package = ["service.py"]
 
@@ -55,11 +62,29 @@ CAPABILITY = """
 [kinds.capability]
 extends = "feature"
 exclude = ["service.py"]
-required = ["api.py"]
+required = ["api.py", "plugin.py"]
 optional = ["service.py"]
 
 [kinds.capability.templates]
 "api.py" = "api.tmpl"
+"plugin.py" = "plugin.tmpl"
+"""
+
+TOOL_NEEDS = """
+[options.adapters]
+entry = "adapters/"
+
+[kinds.capability]
+extends = "feature"
+required = ["api.py", "plugin.py"]
+
+[kinds.core]
+extends = "feature"
+required = ["api.py"]
+
+[kinds.common]
+required = ["__init__.py"]
+open = true
 """
 
 
@@ -116,10 +141,14 @@ class TestRealManifest:
         assert umbrella.allowed_files == {"__init__.py", "README.md"}
         assert umbrella.allowed_dirs == frozenset()
 
-    def test_a_capability_requires_only_its_init_readme_and_api(self) -> None:
-        capability = load_layout(LAYOUT_PATH).kinds["capability"]
+    def test_a_capability_requires_its_init_readme_api_and_plugin_module(self) -> None:
+        layout = load_layout(LAYOUT_PATH)
+        capability = layout.kinds["capability"]
 
-        assert capability.required == {"__init__.py", "README.md", "api.py"}
+        assert layout.plugin_module == "plugin.py"
+        assert capability.required == {"__init__.py", "README.md", "api.py", "plugin.py"}
+        assert capability.templates["plugin.py"] == "plugin_init.py.tmpl"
+        assert capability.templates["__init__.py"] == "capability_init.py.tmpl"
         assert {"service.py", "entrypoints/", "hookspecs.py", "interfaces.py", "adapters/"} <= capability.optional
 
     def test_core_may_gain_interfaces_and_adapters_but_never_entrypoints(self) -> None:
@@ -163,6 +192,15 @@ class TestRealManifest:
             "amend the record and the manifest together"
         )
 
+    def test_the_guards_read_the_public_api_adapters_and_umbrella_kernel_names(self) -> None:
+        layout = check_tool_needs(load_layout(LAYOUT_PATH))
+
+        assert layout.public_api == "api.py"
+        assert layout.plugin_module == "plugin.py"
+        assert layout.adapters_dir == "adapters"
+        assert {CORE_KIND, COMMON_KIND} <= set(layout.kinds)
+        assert layout.public_api in layout.kinds["capability"].required & layout.kinds[CORE_KIND].required
+
 
 class TestMalformedManifest:
     """A malformed manifest is refused, naming the key at fault."""
@@ -186,12 +224,13 @@ class TestMalformedManifest:
             "service.py": "service.tmpl",
             "adapters/": "",
             "api.py": "api.tmpl",
+            "plugin.py": "plugin.tmpl",
         }
 
     def test_an_inherited_required_entry_can_be_excluded_and_made_optional(self, tmp_path: Path) -> None:
         capability = _load(tmp_path, MINIMAL + CAPABILITY).kinds["capability"]
 
-        assert capability.required == {"__init__.py", "api.py"}
+        assert capability.required == {"__init__.py", "api.py", "plugin.py"}
         assert capability.optional == {"service.py", "adapters/"}
 
     @pytest.mark.parametrize(
@@ -209,6 +248,20 @@ class TestMalformedManifest:
             (lambda text: text + '\n[options.adapters]\nentry = "adapters/"\nneeds = ["store.py"]\n', "options.adapters.needs"),
             (lambda text: text + '\n[options.adapters]\nentry = "adapters/"\nflag = "a"\n', "flag"),
             (lambda text: text + '\n[kinds.feature.templates]\n"api.py" = "api.tmpl"\n', "kinds.feature.templates"),
+            (lambda text: text.replace('public_api = "api.py"\n', ""), "public_api"),
+            (lambda text: text.replace('public_api = "api.py"', 'public_api = "api/"'), "public_api"),
+            (lambda text: text + CAPABILITY.replace('"api.py", "plugin.py"', '"plugin.py"'), "kinds.capability"),
+            (lambda text: text + '\n[kinds.core]\nextends = "feature"\n', "kinds.core"),
+            (lambda text: text.replace('plugin_module = "plugin.py"\n', ""), "plugin_module"),
+            (lambda text: text.replace('plugin_module = "plugin.py"', 'plugin_module = "plugin/"'), "plugin_module"),
+            (lambda text: text + CAPABILITY.replace('"api.py", "plugin.py"', '"api.py"'), "kinds.capability"),
+            (
+                lambda text: (
+                    text.replace('optional = ["adapters/"]', 'optional = ["adapters/", "plugin.py"]')
+                    + '\n[kinds.core]\nextends = "feature"\nrequired = ["api.py"]\n'
+                ),
+                "kinds.core",
+            ),
         ],
         ids=[
             "unknown-top-level-key",
@@ -223,8 +276,39 @@ class TestMalformedManifest:
             "option-needs-unknown",
             "unknown-option-key",
             "template-for-an-undeclared-entry",
+            "missing-public-api",
+            "public-api-a-directory",
+            "capability-without-the-public-api",
+            "core-without-the-public-api",
+            "missing-plugin-module",
+            "plugin-module-a-directory",
+            "capability-without-the-plugin-module",
+            "core-with-the-plugin-module",
         ],
     )
     def test_a_malformed_manifest_is_refused(self, tmp_path: Path, edit: Callable[[str], str], message: str) -> None:
         with pytest.raises(LayoutError, match=re.escape(message)):
             _load(tmp_path, edit(MINIMAL))
+
+    def test_a_manifest_with_every_name_the_guards_read_passes_the_repository_check(self, tmp_path: Path) -> None:
+        layout = check_tool_needs(_load(tmp_path, MINIMAL + TOOL_NEEDS))
+
+        assert layout.adapters_dir == "adapters"
+
+    @pytest.mark.parametrize(
+        ("removed", "message"),
+        [
+            ('[options.adapters]\nentry = "adapters/"\n', "options.adapters"),
+            ('[kinds.capability]\nextends = "feature"\nrequired = ["api.py", "plugin.py"]\n', "kinds.capability"),
+            ('[kinds.core]\nextends = "feature"\nrequired = ["api.py"]\n', "kinds.core"),
+            ('[kinds.common]\nrequired = ["__init__.py"]\nopen = true\n', "kinds.common"),
+        ],
+        ids=["no-adapters-option", "no-capability-kind", "no-core-kind", "no-common-kind"],
+    )
+    def test_a_manifest_missing_a_name_the_guards_read_fails_the_repository_check(
+        self, tmp_path: Path, removed: str, message: str
+    ) -> None:
+        layout = _load(tmp_path, MINIMAL + TOOL_NEEDS.replace(removed, ""))
+
+        with pytest.raises(LayoutError, match=re.escape(message)):
+            check_tool_needs(layout)

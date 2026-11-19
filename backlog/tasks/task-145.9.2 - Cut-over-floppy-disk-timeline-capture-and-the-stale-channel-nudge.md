@@ -4,7 +4,7 @@ title: Cut over floppy-disk timeline capture and the stale-channel nudge
 status: To Do
 assignee: []
 created_date: '2026-11-09T19:06:00Z'
-updated_date: '2026-11-17T19:03:00Z'
+updated_date: '2026-11-18T20:52:00Z'
 labels:
   - incident
   - features
@@ -15,6 +15,7 @@ dependencies:
   - TASK-145.8.5
   - TASK-145.7.10
   - TASK-145.8.5.2
+  - TASK-64
 references:
   - decisions/incident-management.md
 parent_task_id: TASK-145.9
@@ -34,6 +35,7 @@ Stack L L10b. Reaction handlers registered by incident.response write timeline r
 - [ ] #1 The capture and nudge pins pass with assertions unchanged; captured entries keep the same key on re-capture (checks parent ACs #1, #2, #5, #7, #8)
 - [ ] #2 ruff, mypy (no new errors in touched files), lint-imports, make check-package-shape, make check-test-seams and pytest tests --ignore=tests/smoke pass
 - [ ] #3 The stale notice's ignore button moves to incident.response (moved from TASK-145.8, TASK-145.8.5 OQ3): registered with the archive_channel alias scoped to the ignore value (TASK-145.8.5.2); new notices are Block Kit with one action id per button owner (incident.response archive and ignore, incident.postmortem schedule)
+- [ ] #4 The report's timeline document read returns a classified OperationResult (a missing document is NOT_FOUND, a refused read UNAUTHORIZED, a timeout TIMEOUT) instead of collapsing every failure to DOCUMENT_UNREADABLE; the reacting user's notice is unchanged and decisions/incident-management.md's report-errors line drops the timeline exception (TASK-145.9.1 OQ4, human 2026-11-18)
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -46,6 +48,10 @@ Stack L L10b. Reaction handlers registered by incident.response write timeline r
 2026-11-16 (human, TASK-145.8.5.2 OQ7): claiming the ignore value makes the ignore branch of archive_channel_action unreachable; this task deletes that branch.
 
 2026-11-16 (human, #1858 Q1-Q5 approved; production fix shipped without a task): the legacy capture now (a) captures the exact reacted-to message through reactions.get, a thread reply included, never its parent; (b) keys report entries by the Slack message (channel + full ts from the permalink), so same-second messages are distinct and removal no longer rebuilds the entry from the current profile and text; (c) posts a bilingual ephemeral notice to the reacting user when a save or removal fails or cannot be confirmed (keys in app/locales/incident.*.yml). #1858 pins (a) and (c) in tests/integration/legacy_surface. Scope for this task: the rebuilt capture keeps (a)-(c) with those pins passing unchanged; the notice keys move into incident_response's catalogue; captured_entry_id (uuid5 over system, tenant, conversation, message id) matches the report entry identity of (b).
+
+2026-11-18 (TASK-64 split, human approved): the minimum hold is TASK-64.2; this task waits on it (through its TASK-64 dependency). Register with lease_ttl only; the hold is derived by the registry.
+
+2026-11-18 (TASK-64.2 implemented, branch task-64.2-lease-minimum-hold, In Progress awaiting PR/merge): a leased job registered with lease_ttl now holds its lease after a short run for min(lease_ttl, interval - [scheduler] lease_hold_margin_seconds), a daily job its TTL; nothing to configure. Register only after TASK-64.2 is merged.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -72,6 +78,14 @@ created: 2026-11-17T19:03:00Z
 ---
 
 2026-11-17 (human, TASK-145.8.5.3 OQ2 and OQ6): (1) the rebuilt stale notice and the ignore reply follow the new i18n.md line: a request whose payload names no locale (block actions carry none) is answered in English and French, each from its catalogue. (2) /sre dev stale (modules/dev/platforms/slack.py handle_stale_dev_command) posts its own copy of the legacy notice with archive_channel and has no other owner: this task repoints it to the rebuilt notice's renderer or deletes it, before TASK-145.13 (AC #10) removes the value-scoped aliases.
+
+---
+
+created: 2026-11-18T00:01:00Z
+
+---
+
+2026-11-18 (human): depends on TASK-64's minimum-hold lease (reliability.md, 2026-11-18) before the stale-channel nudge registers as a leased job; a short run would otherwise nudge twice, once from each replica.
 
 ---
 <!-- COMMENTS:END -->

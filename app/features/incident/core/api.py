@@ -12,7 +12,8 @@ the conversation reference they build, to the subdomain services.
 ``build_legacy_upgrade`` builds the incident legacy upgrade (``LegacyUpgrade``,
 reporting an ``UpgradeReport``) from the services its job resolves per run.
 ``IncidentReport`` works on the incident report the record references
-(``ReportReference``); ``get_incident_report`` provides the Google Docs one.
+(``ReportReference``), its timeline of captured messages included;
+``get_incident_report`` provides the Google Docs one.
 ``IncidentConversation`` writes to the incident's conversation
 (``ConversationReference``); ``get_incident_conversation`` provides the Slack one,
 and ``conversation_is_writable`` is the check every caller applies before a write.
@@ -34,6 +35,7 @@ from typing import Protocol, runtime_checkable
 
 import structlog
 
+from capabilities.oncall.api import ScheduleReference
 from contracts.configuration import SettingError
 from contracts.operations.result import OperationResult
 from contracts.records import RecordStore
@@ -45,6 +47,7 @@ from features.incident.core.adapters.google_meet import GoogleMeetVideoCall
 from features.incident.core.adapters.google_sheets import GoogleSheetsIncidentListProjection
 from features.incident.core.adapters.i18n import translate
 from features.incident.core.adapters.legacy_roles import GoogleDriveLegacyRolesReader
+from features.incident.core.adapters.legacy_schedule import GoogleDrivePlacementScheduleLookup
 from features.incident.core.adapters.slack import build_incident_conversation, build_incident_transcript_reader
 from features.incident.core.domain import (
     CONVERSATION_NAME_ATTEMPTS,
@@ -76,7 +79,7 @@ from features.incident.core.domain import (
     VideoCallReference,
     incident_conversation_names,
 )
-from features.incident.core.legacy_upgrade import LegacyUpgrade, UpgradeReport
+from features.incident.core.legacy_upgrade import LegacyUpgrade, RolesRead, UpgradeReport
 from features.incident.core.store import (
     IncidentStore,
     RecordIncidentStore,
@@ -113,6 +116,7 @@ __all__ = [
     "LegacyRolesReader",
     "LegacyUpgrade",
     "MessageReference",
+    "PlacementScheduleLookup",
     "PostmortemMeetingReference",
     "ReferenceKind",
     "ReportPlacement",
@@ -142,6 +146,7 @@ __all__ = [
     "get_incident_report",
     "get_incident_transcript_reader",
     "get_legacy_roles_reader",
+    "get_placement_schedule_lookup",
     "get_video_call",
     "incident_conversation_names",
     "read_incident_roles",
@@ -260,6 +265,18 @@ class IncidentConversation(Protocol):
         """
         ...
 
+    async def account_ids_for(
+        self, conversation: ConversationReference, emails: Sequence[str]
+    ) -> OperationResult[tuple[str, ...]]:
+        """Return the account ids of ``emails`` in the conversation's system and tenant, in order.
+
+        The ids are ready for ``invite``. An email with no account is skipped and
+        logged at info; no emails is an empty tuple without a call. Resolving an
+        email to an account is tolerated until the people capability links
+        accounts (decisions/people-and-accounts.md, TASK-83.6).
+        """
+        ...
+
     async def set_purpose(self, conversation: ConversationReference, text: str) -> OperationResult[None]:
         """Set the conversation's purpose (its description) to ``text``."""
         ...
@@ -366,6 +383,31 @@ class IncidentReport(Protocol):
         """
         ...
 
+    async def append_timeline_entry(self, report: ReportReference, entry: TimelineEntry) -> OperationResult[None]:
+        """Add a captured message to the report's timeline, in chronological order, once per message.
+
+        The report identifies an entry by its message link (for Slack, the channel and
+        the full ts of the permalink), so only a ``MESSAGE`` entry whose
+        ``source_message`` holds a url can be held; any other entry (a manual note, a
+        system kind, no link) is a PERMANENT_ERROR with ``UNSUPPORTED_OPERATION`` naming
+        the cause. A message already in the timeline is a success with no write.
+        Concurrent edits are absorbed by one bounded optimistic-concurrency recompute
+        ([incident_core] ``timeline_update_attempts`` guarded writes, each from a fresh
+        read, no sleep), never a retry. A report that cannot be read is TRANSIENT_ERROR
+        ``DOCUMENT_UNREADABLE``; one without the timeline markers ``RANGE_NOT_FOUND``;
+        other write failures are the classified results of the write.
+        """
+        ...
+
+    async def remove_timeline_entry(self, report: ReportReference, message: MessageReference) -> OperationResult[None]:
+        """Remove every timeline entry of ``message`` from the report.
+
+        The message needs its url, as for ``append_timeline_entry``; without one it is
+        ``UNSUPPORTED_OPERATION``. A message not in the timeline is a success. Failures
+        follow ``append_timeline_entry``.
+        """
+        ...
+
     def link(self, report: ReportReference) -> str | None:
         """Return the report's stored link, unformatted; ``None`` when the reference holds none."""
         ...
@@ -401,7 +443,12 @@ def build_status_update_store(records: RecordStore, settings: IncidentCoreSettin
 
 
 def build_legacy_upgrade(
-    records: RecordStore, systems: ConfiguredSystems, verifier: TenantVerifier, settings: IncidentCoreSettings
+    records: RecordStore,
+    systems: ConfiguredSystems,
+    verifier: TenantVerifier,
+    settings: IncidentCoreSettings,
+    *,
+    read_roles: RolesRead,
 ) -> LegacyUpgrade:
     """Return the incident legacy upgrade over the resolved ``RecordStore``.
 
@@ -409,7 +456,9 @@ def build_legacy_upgrade(
     services it resolved there. The incidents and bindings table names and the
     whole-table read cap come from the incident core settings; the tenants are copied from the
     configured-systems read, as for the read path's bridge, and the verifier
-    confirms the Slack one before any write.
+    confirms the Slack one before any write. ``read_roles`` reads a report's
+    legacy roles synchronously; the job edge runs ``LegacyRolesReader.read`` on
+    its run's event loop (TODO(TASK-145.13): delete with the roles step).
     """
     return LegacyUpgrade(
         records,
@@ -418,6 +467,7 @@ def build_legacy_upgrade(
         verifier,
         settings.full_read_max_items,
         bindings=bindings_table(settings.bindings_table),
+        read_roles=read_roles,
     )
 
 
@@ -526,6 +576,31 @@ class LegacyRolesReader(Protocol):
 def get_legacy_roles_reader() -> LegacyRolesReader:
     """Return the process-wide Google-Drive-backed ``LegacyRolesReader`` (TODO(TASK-145.13): delete)."""
     return GoogleDriveLegacyRolesReader()
+
+
+@runtime_checkable
+class PlacementScheduleLookup(Protocol):
+    """Interface answering the on-call schedule of a report placement, for the declare's on-call invite.
+
+    Interim: the product catalogue answers a product's ``ScheduleReference`` once TASK-165.1
+    builds it; until then the chosen placement's folder holds it (tolerated, owner TASK-165.1).
+
+    TODO(TASK-165.1): delete once the catalogue answers it.
+    """
+
+    async def schedule_for(self, placement: ReportPlacement) -> OperationResult[ScheduleReference | None]:
+        """Return the placement's schedule, ``None`` when it has none.
+
+        A placement of a system the implementation does not serve is a PERMANENT_ERROR with
+        ``UNSUPPORTED_OPERATION``; a failed read is the classified result.
+        """
+        ...
+
+
+@lru_cache(maxsize=1)
+def get_placement_schedule_lookup() -> PlacementScheduleLookup:
+    """Return the process-wide Google-Drive-backed ``PlacementScheduleLookup`` (TODO(TASK-165.1): delete)."""
+    return GoogleDrivePlacementScheduleLookup()
 
 
 async def read_incident_roles(incident: Incident, legacy: LegacyRolesReader) -> Mapping[IncidentRole, str | None]:

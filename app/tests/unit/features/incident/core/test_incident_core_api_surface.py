@@ -63,6 +63,7 @@ def test_api_exports_exactly_the_public_names() -> None:
         "LegacyRolesReader",
         "LegacyUpgrade",
         "MessageReference",
+        "PlacementScheduleLookup",
         "PostmortemMeetingReference",
         "ReferenceKind",
         "ReportPlacement",
@@ -92,6 +93,7 @@ def test_api_exports_exactly_the_public_names() -> None:
         "get_incident_report",
         "get_incident_transcript_reader",
         "get_legacy_roles_reader",
+        "get_placement_schedule_lookup",
         "get_video_call",
         "incident_conversation_names",
         "read_incident_roles",
@@ -135,7 +137,15 @@ def test_interface_signatures_carry_only_plain_and_domain_types() -> None:
     assert read.return_annotation == OperationResult[Sequence[api.TranscriptMessage]]
 
 
-_REPORT_METHODS = ("list_placements", "create_from_template", "replace_placeholders", "read_sections", "write_draft_copy")
+_REPORT_METHODS = (
+    "list_placements",
+    "create_from_template",
+    "replace_placeholders",
+    "read_sections",
+    "write_draft_copy",
+    "append_timeline_entry",
+    "remove_timeline_entry",
+)
 _READER_METHODS = ("conversation_started_at", "read_transcript")
 
 
