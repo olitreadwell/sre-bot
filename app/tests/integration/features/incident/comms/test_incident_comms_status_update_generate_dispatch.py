@@ -9,8 +9,8 @@ and fed to ``App.dispatch`` with listeners run inline; the harness sends every
 payload as user ``USER_ID``. Only edges are stubbed: ``WebClient.api_call``
 records Web API calls, and the entrypoint's ``generate_status_update_draft`` and
 ``get_draft_for_review`` are the real services over the status-update store the
-handler builds, a stub transcript reader and a stub text generator, with a fixed
-``now``; text generation is reported available. The plugin's service scopes
+handler builds, a stub transcript reader and a stub AI writer, with a fixed
+``now``; AI writing is reported available. The plugin's service scopes
 resolve an ``InMemoryRecordStore`` holding the channel's incident as a legacy
 item without a security attribute and the status updates, and Slack configured
 under one tenant, so the real incident store, legacy bridge and command check
@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 
 import features.incident.comms as comms_module
+from capabilities.ai_writing.adapters.in_memory import InMemoryAIWriter
 from contracts.operations import OperationResult
 from features.incident.comms.domain import StatusUpdateEdit
 from features.incident.comms.entrypoints.slack_views import (
@@ -59,6 +60,8 @@ from tests.factories.incident import incident_scopes, status_update_store_in
 from tests.factories.slack_bolt import TRIGGER_ID, USER_ID, Harness, harness_fixture
 
 pytestmark = pytest.mark.integration
+
+_WRITER = "capabilities.ai_writing.providers.get_ai_writer_singleton"
 
 _INCIDENT = "inc-uuid-1"
 _CHANNEL = "C0INCIDENT"
@@ -166,23 +169,27 @@ class _StubReader:
 
 
 @dataclass
-class _StubGenerator:
+class _StubWriter:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    async def summarize(
+    def is_available(self) -> bool:
+        return True
+
+    async def write(
         self,
         transcript: str,
         *,
         instructions: str | None = None,
-        max_output_tokens: int | None = None,
+        max_output_tokens: int,
+        temperature: float | None = None,
     ) -> OperationResult[str]:
         self.calls.append({"transcript": transcript, "instructions": instructions, "max_output_tokens": max_output_tokens})
         return OperationResult.success(data=json.dumps(_ANSWER))
 
 
 @pytest.fixture
-def generator() -> _StubGenerator:
-    return _StubGenerator()
+def ai_writer() -> _StubWriter:
+    return _StubWriter()
 
 
 @pytest.fixture
@@ -191,16 +198,16 @@ def records() -> InMemoryRecordStore:
 
 
 @pytest.fixture
-def store(monkeypatch: pytest.MonkeyPatch, generator: _StubGenerator, records: InMemoryRecordStore) -> StatusUpdateStore:
+def store(monkeypatch: pytest.MonkeyPatch, ai_writer: _StubWriter, records: InMemoryRecordStore) -> StatusUpdateStore:
     status_updates = status_update_store_in(records)
     asyncio.run(status_updates.append(_APPROVED))
     asyncio.run(status_updates.append(_PENDING))
     monkeypatch.setattr(
         form,
         "generate_status_update_draft",
-        partial(generate_status_update_draft, reader=_StubReader(), generator=generator, now=_NOW),
+        partial(generate_status_update_draft, reader=_StubReader(), ai_writer=ai_writer, now=_NOW),
     )
-    monkeypatch.setattr(form, "text_generation_available", lambda: True)
+    monkeypatch.setattr(_WRITER, lambda: InMemoryAIWriter(available=True))
     return status_updates
 
 
@@ -242,13 +249,11 @@ def test_draft_with_ai_is_acked(harness: Harness) -> None:
     assert response.status == 200
 
 
-def test_instructions_make_one_model_call_from_the_form_values_and_the_window(
-    harness: Harness, generator: _StubGenerator
-) -> None:
+def test_instructions_make_one_model_call_from_the_form_values_and_the_window(harness: Harness, ai_writer: _StubWriter) -> None:
     """The model gets the guidance as instructions and the responder's typed values with the transcript as input."""
     harness.dispatch(_generate_action(_GUIDANCE))
 
-    assert generator.calls == [
+    assert ai_writer.calls == [
         {
             "transcript": build_redraft_input(_EDIT, "Ada: vendor fixed the DNS\nAlertmanager: RESOLVED: 5xx"),
             "instructions": build_redraft_instructions(_GUIDANCE),
@@ -258,12 +263,12 @@ def test_instructions_make_one_model_call_from_the_form_values_and_the_window(
 
 
 def test_blank_instructions_draft_from_the_conversation_with_the_base_prompt(
-    harness: Harness, generator: _StubGenerator, store: StatusUpdateStore
+    harness: Harness, ai_writer: _StubWriter, store: StatusUpdateStore
 ) -> None:
     """Someone posted since the approved update, so blank instructions still make one model call, with the base prompt."""
     harness.dispatch(_generate_action("   "))
 
-    assert [call["instructions"] for call in generator.calls] == [INSTRUCTIONS]
+    assert [call["instructions"] for call in ai_writer.calls] == [INSTRUCTIONS]
     assert asyncio.run(store.list_for_incident(_INCIDENT)).data == (_expected_fill(StatusUpdateOrigin.MODEL), _PENDING, _APPROVED)
 
 
@@ -291,7 +296,7 @@ def test_shows_generating_then_the_new_draft_form_and_posts_nothing(harness: Har
 
 
 def test_nothing_new_carries_the_typed_values_forward_without_a_model_call(
-    harness: Harness, generator: _StubGenerator, store: StatusUpdateStore, monkeypatch: pytest.MonkeyPatch
+    harness: Harness, ai_writer: _StubWriter, store: StatusUpdateStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With only messages from before the approved cutoff, the new draft repeats the typed values with the wording."""
 
@@ -304,7 +309,7 @@ def test_nothing_new_carries_the_typed_values_forward_without_a_model_call(
 
     harness.dispatch(_generate_action(""))
 
-    assert generator.calls == []
+    assert ai_writer.calls == []
     latest = asyncio.run(store.latest(_INCIDENT)).data
     assert latest is not None
     assert (latest.sequence, latest.origin, latest.en) == (

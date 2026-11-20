@@ -195,12 +195,12 @@ class TestGathering:
     async def test_model_receives_the_current_time_and_time_stamped_lines_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The model sees now and each message's time in the summary timezone; an untimed message has no prefix."""
         summarizer = MagicMock()
-        summarizer.summarize = AsyncMock(return_value=OperationResult.success(data="ok"))
-        monkeypatch.setattr(service, "get_summarizer", lambda: summarizer)
+        summarizer.write = AsyncMock(return_value=OperationResult.success(data="ok"))
+        monkeypatch.setattr("capabilities.ai_writing.providers.get_ai_writer_singleton", lambda: summarizer)
 
         await summarize_incident_conversation(_CONVERSATION, reader=FakeTranscriptReader())
 
-        assert summarizer.summarize.await_args.args[0] == (
+        assert summarizer.write.await_args.args[0] == (
             "Current time: 2026-03-01 07:00 EST\n"
             "\n"
             "Incident channel transcript:\n"

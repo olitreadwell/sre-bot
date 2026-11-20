@@ -4,7 +4,7 @@ title: Move the report draft into incident/postmortem and delete scribe
 status: To Do
 assignee: []
 created_date: 2026-10-09 16:43
-updated_date: '2026-11-16T15:51:00Z'
+updated_date: '2026-11-19T17:29:00Z'
 labels:
   - incident
   - features
@@ -104,6 +104,8 @@ A missed import breaks the draft command at boot; the lifespan test catches it. 
 2026-11-09 (TASK-25.10 plan, open for this task's re-plan): incident.scribe declares Requirement('openai.tenant') (TASK-172; TASK-25.10.3 adds 'text_generation.model'), so scribe aborts boot without a model gateway. When this task moves scribe's draft path into incident.postmortem, the requirement must not move with it unchanged. Requiring text generation in postmortem would abort the whole postmortem plugin, its records included, in any environment without a gateway, and ci.toml would switch it off, dropping its CI boot coverage (plugins.md). Recommendation: the moved use becomes optional, like comms' drafting. It asks the capability's is_available() (TASK-25.10.2) and answers with an unavailable message otherwise, and the plugin declares no text-generation requirement. This narrows TASK-172's 'scribe requires it' to the dissolved package. It needs a human ruling at this re-plan, recorded in plugin-architecture.md and plugins.md.
 
 2026-11-09 (human): ruled. The moved text-generation use is optional: it asks is_available() (TASK-25.10.2) and answers with an unavailable message otherwise. The plugin it moves into declares no text-generation requirement. TASK-172's 'scribe requires it' holds only while scribe exists. Record it in plugin-architecture.md and plugins.md with this task's PR.
+
+2026-11-19 (human, #1877 review of TASK-25.10.2): the text-generation capability is named ai_writing: capabilities/ai_writing, Protocol AIWriter with is_available() and write(source, *, instructions, max_output_tokens=None), get_ai_writer(), error code AI_WRITING_UNAVAILABLE, log events openai_write_*. Its purpose is AI-written text only; any other AI use is a separate capability named for its purpose (plugin-architecture.md). Read 'text generation', TextGenerator and generate in this task as AI writing, AIWriter and write.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -122,6 +124,14 @@ created: 2026-11-16T15:51:00Z
 ---
 
 2026-11-16 (human, TASK-145.8.4 OQ4): decisions/migration.md step 4 amended (rides with L6b): a cutover changes behaviour only as a named change of kind (a) legacy bug no pin asserts, (b) behaviour an accepted end-state ADR replaces, (c) expired deprecated form after a usage check, (d) retired surface; additions only by an explicit plan ruling. At planning, classify each behaviour change of this task by kind, pin it (test_legacy_only_* or edited pin citing the ruling) and list it in the PR body.
+
+---
+
+created: 2026-11-19T14:28:00Z
+
+---
+
+2026-11-19 (TASK-25.10.2 Q4, human): scribe keeps its summarizer= keyword (typed against the text-generation capability's TextGenerator) through 25.10.2 to avoid churning ~52 test sites; when this task moves the function, name the parameter for its role (text_generator=).
 
 ---
 <!-- COMMENTS:END -->

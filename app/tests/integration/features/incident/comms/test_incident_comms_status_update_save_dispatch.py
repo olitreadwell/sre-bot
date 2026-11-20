@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 import features.incident.comms as comms_module
+from capabilities.ai_writing.adapters.in_memory import InMemoryAIWriter
 from contracts.operations.codes import ErrorCode
 from features.incident.comms.domain import StatusUpdateEdit
 from features.incident.comms.entrypoints.slack_views import (
@@ -51,6 +52,8 @@ from tests.factories.incident import incident_scopes, status_update_store_in
 from tests.factories.slack_bolt import TRIGGER_ID, USER_ID, Harness, harness_fixture
 
 pytestmark = pytest.mark.integration
+
+_WRITER = "capabilities.ai_writing.providers.get_ai_writer_singleton"
 
 _INCIDENT = "inc-uuid-1"
 _CHANNEL = "C0INCIDENT"
@@ -119,7 +122,7 @@ def store(monkeypatch: pytest.MonkeyPatch, records: InMemoryRecordStore) -> Stat
     status_updates = status_update_store_in(records)
     asyncio.run(status_updates.append(_PENDING))
     monkeypatch.setattr(form, "save_status_update_draft", partial(save_status_update_draft, now=_NOW))
-    monkeypatch.setattr(form, "text_generation_available", lambda: True)
+    monkeypatch.setattr(_WRITER, lambda: InMemoryAIWriter(available=True))
     return status_updates
 
 

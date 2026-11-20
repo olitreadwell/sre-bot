@@ -20,7 +20,7 @@ catalogue is not loaded in unit tests).
 
 ``TestWithTheService`` runs the real services over the status-update store the
 handler builds on an in-memory record store, an in-memory incident store that counts security
-flag reads, a stub transcript reader and a recording text generator, so the
+flag reads, a stub transcript reader and a recording AI writer, so the
 number of model calls and what reaches the model are asserted at the listener.
 Every handler runs over a fake scope opener with Slack configured.
 """
@@ -497,13 +497,11 @@ class TestFailureKeepsTheTypedValues:
             )
         ]
 
-    def test_unavailable_text_generation_keeps_the_typed_values_without_the_ai_section(
+    def test_unavailable_ai_writing_keeps_the_typed_values_without_the_ai_section(
         self, ack: MagicMock, client: MagicMock, services: _Services
     ) -> None:
-        """With the generator gone the form says AI drafting is unavailable and stops offering it."""
-        services.generate_result = OperationResult.permanent_error(
-            message="off", error_code=ErrorCode.TEXT_GENERATION_UNAVAILABLE
-        )
+        """With the ai_writer gone the form says AI drafting is unavailable and stops offering it."""
+        services.generate_result = OperationResult.permanent_error(message="off", error_code=ErrorCode.AI_WRITING_UNAVAILABLE)
 
         handle_generate_action(ack, _generate_body(), client, incident_scopes())
 
@@ -669,12 +667,20 @@ class _CountingIncidents(InMemoryIncidentStore):
         return await super().read_security_flag(incident_id)
 
 
-class _RecordingGenerator:
+class _RecordingWriter:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def summarize(
-        self, transcript: str, *, instructions: str | None = None, max_output_tokens: int | None = None
+    def is_available(self) -> bool:
+        return True
+
+    async def write(
+        self,
+        transcript: str,
+        *,
+        instructions: str | None = None,
+        max_output_tokens: int,
+        temperature: float | None = None,
     ) -> OperationResult[str]:
         self.calls.append({"transcript": transcript, "instructions": instructions})
         return OperationResult.success(data=_model_answer())
@@ -684,7 +690,7 @@ class _RecordingGenerator:
 class _World:
     records: InMemoryRecordStore
     store: StatusUpdateStore
-    generator: _RecordingGenerator
+    ai_writer: _RecordingWriter
     incidents: _CountingIncidents
 
 
@@ -700,7 +706,7 @@ def _bind(monkeypatch: pytest.MonkeyPatch, *, messages: Sequence[TranscriptMessa
     world = _World(
         records,
         status_update_store_in(records),
-        _RecordingGenerator(),
+        _RecordingWriter(),
         _CountingIncidents(security_incident=security_incident),
     )
     asyncio.run(world.store.append(_APPROVED))
@@ -714,7 +720,7 @@ def _bind(monkeypatch: pytest.MonkeyPatch, *, messages: Sequence[TranscriptMessa
             conversation,
             sequence,
             reader=_StubReader(messages),
-            generator=world.generator,
+            ai_writer=world.ai_writer,
             now=_NOW,
             **kwargs,
         )
@@ -742,7 +748,7 @@ class TestWithTheService:
 
         handle_generate_action(MagicMock(), _generate_body(""), client, incident_scopes(world.records))
 
-        assert world.generator.calls == [] and world.incidents.calls == []
+        assert world.ai_writer.calls == [] and world.incidents.calls == []
         carried = _latest(world)
         assert (carried.sequence, carried.en.current_action) == (_SEQUENCE + 1, build_no_new_information_wording().en)
         (sent,) = client.views_update.call_args_list
@@ -757,7 +763,7 @@ class TestWithTheService:
 
         handle_generate_action(MagicMock(), _generate_body(""), client, incident_scopes(world.records))
 
-        assert len(world.generator.calls) == 1
+        assert len(world.ai_writer.calls) == 1
         filled = _latest(world)
         assert (filled.sequence, filled.en.impact) == (_SEQUENCE + 1, "en impact filled")
         assert json.loads(client.views_update.call_args_list[-1].kwargs["view"]["private_metadata"])["sequence"] == (
@@ -771,7 +777,7 @@ class TestWithTheService:
 
         handle_generate_action(MagicMock(), _generate_body(_GUIDANCE), client, incident_scopes(world.records))
 
-        (model_call,) = world.generator.calls
+        (model_call,) = world.ai_writer.calls
         assert _GUIDANCE in str(model_call["instructions"])
 
     def test_a_security_incident_makes_no_model_call_until_the_box_is_checked(
@@ -782,7 +788,7 @@ class TestWithTheService:
 
         handle_generate_action(MagicMock(), _generate_body(), client, incident_scopes(world.records))
 
-        assert world.generator.calls == []
+        assert world.ai_writer.calls == []
         assert _latest(world) == _PENDING
         refused = client.views_update.call_args_list[-1].kwargs["view"]
         assert "security_confirm" in [block.get("block_id") for block in refused["blocks"]]
@@ -792,6 +798,6 @@ class TestWithTheService:
             MagicMock(), _generate_body(extra_values=_checkbox("confirmed")), client, incident_scopes(world.records)
         )
 
-        assert len(world.generator.calls) == 1
+        assert len(world.ai_writer.calls) == 1
         assert len(world.incidents.calls) == reads_before
         client.chat_postMessage.assert_not_called()

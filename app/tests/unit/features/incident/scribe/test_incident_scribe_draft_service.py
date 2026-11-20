@@ -38,7 +38,7 @@ _REPORT = ReportReference(system=WorkplaceSystem.GOOGLE, tenant="C0GOOGLE", vend
 
 
 class _StubSummarizer:
-    """Minimal ``Summarizer`` stub capturing what it receives."""
+    """Minimal ``AIWriter`` stub capturing what it receives."""
 
     def __init__(self, result: OperationResult[str]) -> None:
         self._result = result
@@ -47,12 +47,16 @@ class _StubSummarizer:
         self.received_max_output_tokens: int | None = None
         self.calls = 0
 
-    async def summarize(
+    def is_available(self) -> bool:
+        return True
+
+    async def write(
         self,
         transcript: str,
         *,
         instructions: str | None = None,
-        max_output_tokens: int | None = None,
+        max_output_tokens: int,
+        temperature: float | None = None,
     ) -> OperationResult[str]:
         self.calls += 1
         self.received_payload = transcript

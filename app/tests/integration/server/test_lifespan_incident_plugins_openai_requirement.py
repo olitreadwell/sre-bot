@@ -5,9 +5,10 @@ core services, security, the directory, the Slack provider, translation and feat
 registration are stubbed, since requirements are resolved before any of them. The
 ci files configure no tenant. With incident.scribe enabled (the
 configuration's disabled set replaced by the access plugins and the other plugins that declare requirements) startup must stop
-before the lifespan yields, naming each tenant and incident document id scribe declares: it has no fallback. With the ci
-files as they are (scribe off, comms on) startup must reach the yield and comms must
-report text generation unavailable, its designed fallback.
+before the lifespan yields, naming each tenant, the [ai_writing] model and each incident document id scribe
+declares: it has no fallback. With the ci
+files as they are (scribe off, comms on) startup must reach the yield and the AI writing
+capability must report itself unavailable, comms' designed fallback.
 """
 
 import dataclasses
@@ -19,7 +20,9 @@ import pytest
 from fastapi import FastAPI
 from structlog.testing import capture_logs
 
-from features.incident.comms.providers import get_status_update_text_generator, text_generation_available
+from capabilities.ai_writing.api import get_ai_writer
+from capabilities.ai_writing.providers import get_ai_writer_singleton
+from capabilities.ai_writing.settings import get_ai_writing_settings
 from integrations.openai import get_openai_settings
 from server.configuration import load_host_configuration
 from server.lifespan import build_lifespan
@@ -36,11 +39,13 @@ OTHER_REQUIRING_PLUGINS = frozenset({"incident.response", "oncall_sync", "rant"}
 def _fresh_plugin_manager() -> Iterator[None]:
     get_plugin_manager.cache_clear()
     get_openai_settings.cache_clear()
-    get_status_update_text_generator.cache_clear()
+    get_ai_writing_settings.cache_clear()
+    get_ai_writer_singleton.cache_clear()
     yield
     get_plugin_manager.cache_clear()
     get_openai_settings.cache_clear()
-    get_status_update_text_generator.cache_clear()
+    get_ai_writing_settings.cache_clear()
+    get_ai_writer_singleton.cache_clear()
 
 
 def _stub_startup(stack: ExitStack) -> None:
@@ -68,6 +73,7 @@ async def test_lifespan_aborts_naming_every_tenant_scribe_lacks_when_it_is_enabl
     failures = [event for event in events if event["event"] == "plugin_boot_failed"]
     assert [(event["plugin"], event["setting"]) for event in failures] == [
         ("incident.scribe", "openai.tenant"),
+        ("incident.scribe", "ai_writing.model"),
         ("incident.scribe", "slack.tenant"),
         ("incident.scribe", "google_workspace.tenant"),
         ("incident.scribe", "incident_core.folder_id"),
@@ -75,14 +81,14 @@ async def test_lifespan_aborts_naming_every_tenant_scribe_lacks_when_it_is_enabl
     ]
 
 
-async def test_lifespan_boots_with_comms_reporting_text_generation_unavailable_when_scribe_is_off() -> None:
+async def test_lifespan_boots_with_comms_reporting_ai_writing_unavailable_when_scribe_is_off() -> None:
     configuration = load_host_configuration()
 
     with ExitStack() as stack:
         _stub_startup(stack)
         async with build_lifespan(configuration)(FastAPI()):
             registered = {get_plugin_manager().get_name(plugin) for plugin, _ in get_plugin_manager().list_plugin_distinfo()}
-            available = text_generation_available()
+            available = get_ai_writer().is_available()
 
     assert "incident.scribe" in configuration.disabled_plugins
     assert "incident.comms" in registered
